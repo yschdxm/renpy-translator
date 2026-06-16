@@ -3,6 +3,7 @@
 import os
 import sys
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from nicegui import ui
 
 # 添加当前目录到Python路径
@@ -34,6 +35,7 @@ class TranslatorUI:
         self.translate_queue = {}  # {table_type: {index: status}}
         self.max_concurrent = 5  # 最大并发数
         self.current_translating = 0  # 当前正在翻译的数量
+        self.executor = ThreadPoolExecutor(max_workers=5)  # 线程池
 
         # UI组件引用
         self.project_list = None
@@ -86,7 +88,8 @@ class TranslatorUI:
             model_names = [c.name for c in self.config_manager.load_all_configs()]
             new_model = ui.select(options=model_names, label='AI模型', value=model_names[0] if model_names else None)
 
-            ui.button('➕ 创建项目', on_click=lambda: self._create_project(
+            # 创建按钮（添加引用以便禁用）
+            self.create_btn = ui.button('➕ 创建项目', on_click=lambda: self._create_project(
                 new_name.value, new_game_dir.value, new_model.value
             )).classes('w-full')
 
@@ -95,14 +98,19 @@ class TranslatorUI:
         # 标签页
         with ui.tabs() as tabs:
             tab_name = ui.tab('人名翻译', icon='person')
+            tab_analysis = ui.tab('人物分析', icon='psychology')
             tab_ui = ui.tab('UI翻译', icon='web')
             tab_dialogue = ui.tab('对话翻译', icon='chat')
             tab_config = ui.tab('模型配置', icon='settings')
 
-        with ui.tab_panels(tabs, value='对话翻译').classes('w-full'):
+        with ui.tab_panels(tabs, value='人名翻译').classes('w-full'):
             # 人名翻译
             with ui.tab_panel('人名翻译'):
                 self._create_name_panel()
+
+            # 人物分析
+            with ui.tab_panel('人物分析'):
+                self._create_analysis_panel()
 
             # UI翻译
             with ui.tab_panel('UI翻译'):
@@ -171,6 +179,61 @@ class TranslatorUI:
 
         # 分页状态
         self.name_current_page = 0
+
+    def _create_analysis_panel(self):
+        """创建人物分析面板"""
+        # 状态栏
+        with ui.row().classes('w-full items-center gap-2'):
+            self.analysis_stats = ui.label('请先完成人名翻译').classes('text-subtitle1')
+            ui.space()
+            self.analyze_all_btn = ui.button('🤖 分析所有角色', color='primary',
+                on_click=self._analyze_all_characters)
+            self.analyze_btn = ui.button('🔄 刷新', on_click=self._refresh_analysis)
+
+        ui.separator()
+
+        # 角色分析表格
+        self.analysis_table = ui.table(
+            columns=[
+                {'name': 'name', 'label': '角色名', 'field': 'name'},
+                {'name': 'lines_count', 'label': '台词数', 'field': 'lines_count'},
+                {'name': 'status', 'label': '状态', 'field': 'status'},
+                {'name': 'action', 'label': '操作', 'field': 'action'},
+            ],
+            rows=[],
+            row_key='name'
+        ).classes('w-full')
+
+        # 自定义状态单元格
+        self.analysis_table.add_slot('body-cell-status', '''
+            <q-td :props="props">
+                <q-chip :color="props.row.status === '已完成' ? 'green' : (props.row.status === '分析中' ? 'orange' : 'grey')"
+                    text-color="white" dense size="sm">
+                    {{ props.row.status }}
+                </q-chip>
+            </q-td>
+        ''')
+
+        # 自定义操作单元格
+        self.analysis_table.add_slot('body-cell-action', '''
+            <q-td :props="props">
+                <q-btn flat dense color="primary" label="分析"
+                    :disable="props.row.status === '分析中'"
+                    @click="$parent.$emit('analyze_character', props.row)" />
+                <q-btn flat dense color="secondary" label="查看"
+                    :disable="props.row.status !== '已完成'"
+                    @click="$parent.$emit('view_character', props.row)" />
+            </q-td>
+        ''')
+
+        # 监听事件
+        self.analysis_table.on('analyze_character', self._on_analyze_character)
+        self.analysis_table.on('view_character', self._on_view_character)
+
+        # 日志
+        ui.separator()
+        ui.label('分析日志').classes('text-subtitle1')
+        self.analysis_log = ui.log().classes('w-full h-48')
 
     def _create_ui_panel(self):
         """创建UI翻译面板"""
@@ -294,12 +357,15 @@ class TranslatorUI:
                 <q-btn flat dense color="primary" label="AI翻译"
                     :disable="props.row.status === '翻译中' || props.row.status === '排队中'"
                     @click="$parent.$emit('translate_dialogue', props.row)" />
+                <q-btn flat dense color="secondary" label="上下文"
+                    @click="$parent.$emit('show_context', props.row)" />
             </q-td>
         ''')
 
         # 监听事件
         self.dialogue_table.on('update:dialogue', self._on_dialogue_update)
         self.dialogue_table.on('translate_dialogue', self._on_dialogue_translate)
+        self.dialogue_table.on('show_context', self._on_show_context)
 
         # 日志
         self.dialogue_log = ui.log().classes('w-full h-32')
@@ -327,7 +393,9 @@ class TranslatorUI:
 
             with ui.row().classes('gap-2'):
                 self.config_max_tokens = ui.number(label='最大输出Token数', value=4096, min=1)
-                self.config_context = ui.number(label='上下文行数', value=3, min=0)
+                self.config_context = ui.number(label='翻译上下文行数', value=3, min=0)
+                self.config_max_context = ui.number(label='模型最大上下文(K)', value=8, min=1,
+                    placeholder='如8=8K, 32=32K, 128=128K')
 
             with ui.row().classes('gap-2'):
                 ui.button('💾 保存配置', color='primary', on_click=self._save_config_form)
@@ -360,31 +428,71 @@ class TranslatorUI:
             ui.notify('请填写完整信息', type='warning')
             return
 
-        try:
-            # 创建项目
-            project = self.project_manager.create_project(name, game_dir, model or '')
+        # 禁用创建按钮
+        self.create_btn.disable()
+        self.create_btn.text = '创建中...'
+        ui.notify('正在创建项目，请稍候...', type='info', timeout=2000)
 
-            # 解析游戏
-            ui.notify('正在解析游戏...', type='info')
+        # 存储创建状态
+        self._creating_project = {
+            'done': False,
+            'success': False,
+            'message': '',
+            'name': name,
+            'game_dir': game_dir,
+            'model': model
+        }
+
+        # 在线程池中执行
+        self.executor.submit(self._create_project_thread, name, game_dir, model)
+
+        # 启动定时器检查状态
+        ui.timer(0.5, self._check_project_creation, once=True)
+
+    def _create_project_thread(self, name, game_dir, model):
+        """在线程池中创建项目"""
+        try:
+            project = self.project_manager.create_project(name, game_dir, model or '')
             result = self.parser.parse_directory(game_dir, extract_rpa=True, decompile_rpyc=True)
 
-            # 保存解析结果
             project.dialogues = [self._dialogue_to_dict(d) for d in result['dialogues']]
             project.ui_texts = [self._dialogue_to_dict(d) for d in result['ui_texts']]
             project.characters = [self._character_to_dict(c) for c in result['characters']]
 
-            # 初始化人名词典
             for char in result['characters']:
                 if char.name not in project.char_dict:
                     project.char_dict[char.name] = char.name
 
             self.project_manager.save_project(project)
 
-            ui.notify(f'项目创建成功！共 {len(project.dialogues)} 条对话', type='positive')
-            self._refresh_project_list()
+            self._creating_project['success'] = True
+            self._creating_project['message'] = f'项目创建成功！共 {len(project.dialogues)} 条对话'
 
         except Exception as e:
-            ui.notify(f'创建失败: {str(e)}', type='negative')
+            self._creating_project['success'] = False
+            self._creating_project['message'] = f'创建失败: {str(e)}'
+
+        finally:
+            self._creating_project['done'] = True
+
+    def _check_project_creation(self):
+        """检查项目创建状态"""
+        if not hasattr(self, '_creating_project') or not self._creating_project['done']:
+            # 还没完成，继续检查
+            if hasattr(self, '_creating_project') and not self._creating_project['done']:
+                ui.timer(0.5, self._check_project_creation, once=True)
+            return
+
+        # 完成，更新UI
+        if self._creating_project['success']:
+            ui.notify(self._creating_project['message'], type='positive')
+            self._refresh_project_list()
+        else:
+            ui.notify(self._creating_project['message'], type='negative')
+
+        # 恢复按钮
+        self.create_btn.enable()
+        self.create_btn.text = '➕ 创建项目'
 
     def _open_project(self, name):
         """打开项目"""
@@ -404,17 +512,19 @@ class TranslatorUI:
 
         # 更新所有面板
         self._name_refresh()
+        self._refresh_analysis()
         self._ui_refresh()
         self._dialogue_refresh()
         self.status_label.text = f'当前项目: {name}'
 
         ui.notify(f'已打开项目: {name}', type='positive')
 
-    def _save_project(self):
+    def _save_project(self, show_notify=True):
         """保存项目"""
         if not self.current_project:
-            ui.notify('未打开项目', type='warning')
-            return
+            if show_notify:
+                ui.notify('未打开项目', type='warning')
+            return False
 
         # 更新位置
         filtered = self._get_filtered_dialogues()
@@ -426,10 +536,16 @@ class TranslatorUI:
                 'line': dialogue.get('line_number', 0)
             }
 
-        if self.project_manager.save_project(self.current_project):
-            ui.notify('项目已保存', type='positive')
-        else:
-            ui.notify('保存失败', type='negative')
+        success = self.project_manager.save_project(self.current_project)
+
+        # 只在主线程且需要时显示通知
+        if show_notify:
+            if success:
+                ui.notify('项目已保存', type='positive')
+            else:
+                ui.notify('保存失败', type='negative')
+
+        return success
 
     # ========== 翻译操作 ==========
 
@@ -626,18 +742,16 @@ class TranslatorUI:
             self._process_next_in_queue()
 
     def _do_name_translate(self, queue_item):
-        """执行人名翻译"""
+        """执行人名翻译（线程池中执行）"""
         row = queue_item['row']
         try:
             prompt = f"将以下人名翻译成中文，只返回中文名，不要解释：{row['original']}"
             translated = self.translator.translate_text(text=prompt)
             translated = translated.strip().replace('"', '').replace("'", '')
             self.current_project.char_dict[row['original']] = translated
-            self._save_project()
-            self._name_refresh()
             return True
         except Exception as e:
-            ui.notify(f'翻译失败: {str(e)}', type='negative')
+            print(f'翻译失败: {e}')
             return False
 
     def _update_queue_status(self):
@@ -649,7 +763,7 @@ class TranslatorUI:
             self.queue_status.text = f'队列状态: {translating}个翻译中, {queued}个排队'
 
     def _process_next_in_queue(self):
-        """处理队列中的下一个任务"""
+        """处理队列中的下一个任务（异步）"""
         # 检查是否达到并发上限
         if self.current_translating >= self.max_concurrent:
             return
@@ -668,29 +782,146 @@ class TranslatorUI:
         self.current_translating += 1
         self.translate_queue[next_key]['status'] = '翻译中'
         self._update_queue_status()
+        self._refresh_current_table()  # 立即刷新UI
 
-        # 根据类型执行翻译
-        queue_item = self.translate_queue[next_key]
+        # 异步执行翻译
+        asyncio.create_task(self._async_translate(next_key))
+
+    def _refresh_current_table(self):
+        """刷新当前显示的表格"""
+        # 根据队列中的任务类型刷新对应的表格
+        types_in_queue = set(item['type'] for item in self.translate_queue.values())
+        if 'name' in types_in_queue:
+            self._name_refresh()
+        if 'ui' in types_in_queue:
+            self._ui_refresh()
+        if 'dialogue' in types_in_queue:
+            self._dialogue_refresh()
+        # 如果队列为空，刷新所有表格
+        if not self.translate_queue:
+            self._name_refresh()
+            self._ui_refresh()
+            self._dialogue_refresh()
+
+    async def _async_translate(self, key):
+        """异步执行翻译任务"""
+        queue_item = self.translate_queue.get(key)
+        if not queue_item:
+            self.current_translating -= 1
+            return
+
+        loop = asyncio.get_event_loop()
         try:
+            # 在线程池中执行翻译（避免阻塞事件循环）
             if queue_item['type'] == 'name':
-                success = self._do_name_translate(queue_item)
+                success = await loop.run_in_executor(
+                    self.executor, self._do_name_translate, queue_item
+                )
             elif queue_item['type'] == 'ui':
-                success = self._do_ui_translate(queue_item)
+                success = await loop.run_in_executor(
+                    self.executor, self._do_ui_translate, queue_item
+                )
             elif queue_item['type'] == 'dialogue':
-                success = self._do_dialogue_translate(queue_item)
+                success = await loop.run_in_executor(
+                    self.executor, self._do_dialogue_translate, queue_item
+                )
             else:
                 success = False
+
+            # 翻译成功后保存项目（不显示通知，避免异步UI问题）
+            if success:
+                self._save_project(show_notify=False)
+
         except Exception as e:
-            ui.notify(f'翻译失败: {str(e)}', type='negative')
+            print(f'翻译失败: {str(e)}')
             success = False
 
+        # 标记为完成并刷新UI
+        if key in self.translate_queue:
+            self.translate_queue[key]['status'] = '完成'
+            self._refresh_current_table()
+
+        # 短暂延迟后移除（让用户看到完成状态）
+        await asyncio.sleep(0.5)
+
         # 移除已完成的任务
-        del self.translate_queue[next_key]
+        if key in self.translate_queue:
+            del self.translate_queue[key]
         self.current_translating -= 1
         self._update_queue_status()
+        self._refresh_current_table()
 
         # 处理下一个
         self._process_next_in_queue()
+
+    async def _async_batch_translate(self, translate_type, items):
+        """异步批量翻译"""
+        total = len(items)
+        success = 0
+        stopped = False
+
+        loop = asyncio.get_event_loop()
+
+        for i, item in enumerate(items):
+            try:
+                # 在线程池中执行翻译
+                if translate_type == 'ui':
+                    translated = await loop.run_in_executor(
+                        self.executor,
+                        lambda t=item['original_text']: self.translator.translate_text(text=t)
+                    )
+                elif translate_type == 'dialogue':
+                    translated = await loop.run_in_executor(
+                        self.executor,
+                        lambda t=item['original_text'], c=item.get('character', ''),
+                               cb=item.get('context_before', []), ca=item.get('context_after', []):
+                            self.translator.translate_text(
+                                text=t, character=c,
+                                context_before=cb, context_after=ca,
+                                character_dict=self.current_project.char_dict
+                            )
+                    )
+                else:
+                    continue
+
+                item['translated_text'] = translated
+                item['is_translated'] = True
+                success += 1
+
+                # 每翻译一条就刷新UI
+                if translate_type == 'ui':
+                    self._ui_refresh()
+                elif translate_type == 'dialogue':
+                    self._dialogue_refresh()
+
+                # 更新进度显示
+                if hasattr(self, 'queue_status'):
+                    self.queue_status.text = f'批量翻译: {success}/{total}'
+
+            except Exception as e:
+                stopped = True
+                # 不在线程池中调用ui.notify，只记录错误
+                print(f'❌ 翻译失败: {e}')
+                break
+
+        # 保存项目
+        self._save_project()
+
+        # 刷新UI
+        if translate_type == 'ui':
+            self._ui_refresh()
+        elif translate_type == 'dialogue':
+            self._dialogue_refresh()
+
+        # 显示结果通知
+        if stopped:
+            ui.notify(f'翻译已停止！成功: {success}/{total}', type='warning')
+        else:
+            ui.notify(f'批量翻译完成！成功: {success}/{total}', type='positive')
+
+        # 重置状态
+        if hasattr(self, 'queue_status'):
+            self.queue_status.text = '队列状态: 空闲'
 
     def _name_refresh(self):
         """刷新人名表格"""
@@ -698,7 +929,8 @@ class TranslatorUI:
             return
 
         char_dict = self.current_project.char_dict
-        items = list(char_dict.items())
+        # 过滤掉 __profiles__ 等特殊键
+        items = [(k, v) for k, v in char_dict.items() if not k.startswith('__')]
         total = len(items)
 
         page_size = int(self.name_page_size.value)
@@ -795,7 +1027,7 @@ class TranslatorUI:
                 self._process_next_in_queue()
 
     def _do_ui_translate(self, queue_item):
-        """执行UI翻译"""
+        """执行UI翻译（线程池中执行）"""
         idx = queue_item['idx']
         if 0 <= idx < len(self.current_project.ui_texts):
             item = self.current_project.ui_texts[idx]
@@ -803,11 +1035,9 @@ class TranslatorUI:
                 translated = self.translator.translate_text(text=item['original_text'])
                 item['translated_text'] = translated
                 item['is_translated'] = True
-                self._save_project()
-                self._ui_refresh()
                 return True
             except Exception as e:
-                ui.notify(f'翻译失败: {str(e)}', type='negative')
+                print(f'翻译失败: {e}')
                 return False
         return False
 
@@ -878,7 +1108,7 @@ class TranslatorUI:
         self._ui_refresh()
 
     def _ui_translate_page(self):
-        """翻译当前页UI"""
+        """翻译当前页UI（异步）"""
         if not self.current_project:
             ui.notify('请先打开项目', type='warning')
             return
@@ -896,30 +1126,8 @@ class TranslatorUI:
             ui.notify('当前页已全部翻译', type='info')
             return
 
-        total = len(to_translate)
-        success = 0
-        stopped = False
-
-        with self.ui_log:
-            for i, item in enumerate(to_translate):
-                try:
-                    translated = self.translator.translate_text(text=item['original_text'])
-                    item['translated_text'] = translated
-                    item['is_translated'] = True
-                    success += 1
-                except Exception as e:
-                    print(f'❌ 翻译失败: {e}')
-                    ui.notify(f'API错误，翻译已停止: {str(e)}', type='negative')
-                    stopped = True
-                    break
-
-        self._save_project()
-        self._ui_refresh()
-
-        if stopped:
-            ui.notify(f'翻译已停止！成功: {success}/{total}', type='warning')
-        else:
-            ui.notify(f'本页翻译完成！成功: {success}/{total}', type='positive')
+        # 异步执行批量翻译
+        asyncio.create_task(self._async_batch_translate('ui', to_translate))
 
     # ========== 对话翻译 ==========
 
@@ -958,8 +1166,63 @@ class TranslatorUI:
                 self._update_queue_status()
                 self._process_next_in_queue()
 
+    def _on_show_context(self, e):
+        """显示上下文对话框（从对话列表动态计算）"""
+        row = e.args
+        if not row or not self.current_project:
+            return
+
+        idx = row['action']
+        dialogues = self.current_project.dialogues
+
+        if 0 <= idx < len(dialogues):
+            current_item = dialogues[idx]
+            current_text = current_item.get('original_text', '')
+            current_char = current_item.get('character', '') or '旁白'
+
+            # 从当前项目的模型配置获取上下文行数
+            context_lines = 5  # 默认值
+            if self.current_project.model_config_name:
+                config = self.config_manager.get_config_by_name(self.current_project.model_config_name)
+                if config:
+                    context_lines = config.context_lines
+
+            # 从对话列表动态计算上下文
+            context_before = dialogues[max(0, idx - context_lines):idx]
+            context_after = dialogues[idx + 1:idx + 1 + context_lines]
+
+            # 创建对话框
+            with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl'):
+                ui.label(f'📖 上下文（前后各{context_lines}句）').classes('text-h6')
+
+                # 前文
+                if context_before:
+                    ui.label('前文:').classes('text-subtitle2 text-grey')
+                    for item in context_before:
+                        char = item.get('character', '') or '旁白'
+                        text = item.get('original_text', '')
+                        ui.label(f'  【{char}】{text}').classes('text-body2')
+
+                # 当前行（高亮）
+                ui.separator()
+                ui.label(f'>>> 【{current_char}】{current_text} <<<').classes('text-body1 text-primary font-bold text-h6')
+
+                # 后文
+                if context_after:
+                    ui.separator()
+                    ui.label('后文:').classes('text-subtitle2 text-grey')
+                    for item in context_after:
+                        char = item.get('character', '') or '旁白'
+                        text = item.get('original_text', '')
+                        ui.label(f'  【{char}】{text}').classes('text-body2')
+
+                # 关闭按钮
+                ui.button('关闭', on_click=dialog.close).classes('mt-4')
+
+            dialog.open()
+
     def _do_dialogue_translate(self, queue_item):
-        """执行对话翻译"""
+        """执行对话翻译（线程池中执行）"""
         idx = queue_item['idx']
         if 0 <= idx < len(self.current_project.dialogues):
             item = self.current_project.dialogues[idx]
@@ -973,11 +1236,9 @@ class TranslatorUI:
                 )
                 item['translated_text'] = translated
                 item['is_translated'] = True
-                self._save_project()
-                self._dialogue_refresh()
                 return True
             except Exception as e:
-                ui.notify(f'翻译失败: {str(e)}', type='negative')
+                print(f'翻译失败: {e}')
                 return False
         return False
 
@@ -1069,13 +1330,40 @@ class TranslatorUI:
             self.dialogue_current_page = max(0, page)
         self._dialogue_refresh()
 
+    def _check_dialogue_prerequisites(self):
+        """检查对话翻译的前置条件"""
+        if not self.current_project:
+            return False, '请先打开项目'
+
+        # 检查人名翻译
+        char_dict = self.current_project.char_dict
+        untranslated_names = [k for k, v in char_dict.items()
+                            if k != '__profiles__' and (not v or v == k)]
+        if untranslated_names:
+            return False, f'请先完成人名翻译（还有 {len(untranslated_names)} 个未翻译）'
+
+        # 检查人物分析
+        profiles = char_dict.get('__profiles__', {})
+        characters = self.current_project.characters
+        unanalyzed = [c['name'] for c in characters if c.get('name') and c['name'] not in profiles]
+        if unanalyzed:
+            return False, f'请先完成人物分析（还有 {len(unanalyzed)} 个未分析）'
+
+        return True, ''
+
     def _dialogue_translate_page(self):
-        """翻译当前页对话"""
+        """翻译当前页对话（异步）"""
         if not self.current_project:
             ui.notify('请先打开项目', type='warning')
             return
         if not self.translator:
             ui.notify('请先配置翻译器', type='warning')
+            return
+
+        # 检查前置条件
+        ok, msg = self._check_dialogue_prerequisites()
+        if not ok:
+            ui.notify(msg, type='warning')
             return
 
         page_size = int(self.dialogue_page_size.value)
@@ -1088,37 +1376,363 @@ class TranslatorUI:
             ui.notify('当前页已全部翻译', type='info')
             return
 
-        total = len(to_translate)
-        success = 0
-        stopped = False
+        # 异步执行批量翻译
+        asyncio.create_task(self._async_batch_translate('dialogue', to_translate))
 
-        with self.dialogue_log:
-            for i, item in enumerate(to_translate):
-                try:
-                    translated = self.translator.translate_text(
-                        text=item['original_text'],
-                        character=item.get('character', ''),
-                        context_before=item.get('context_before', []),
-                        context_after=item.get('context_after', []),
-                        character_dict=self.current_project.char_dict
-                    )
-                    item['translated_text'] = translated
-                    item['is_translated'] = True
+    # ========== 人物分析 ==========
+
+    def _refresh_analysis(self):
+        """刷新人物分析表格"""
+        if not self.current_project:
+            return
+
+        # 获取角色列表（使用字典的键去重）
+        char_dict = self.current_project.char_dict
+        dialogues = self.current_project.dialogues
+        char_profiles = char_dict.get('__profiles__', {})
+
+        # 从字典获取角色名（已去重），排除 __profiles__
+        unique_names = [k for k in char_dict.keys() if k != '__profiles__']
+
+        rows = []
+        for name in unique_names:
+            if not name:
+                continue
+
+            # 统计该角色的台词数
+            lines_count = sum(1 for d in dialogues if d.get('character', '') == name)
+
+            # 检查分析状态
+            status = '未分析'
+            if name in char_profiles:
+                status = '已完成'
+
+            rows.append({
+                'name': name,
+                'lines_count': lines_count,
+                'status': status,
+                'action': name
+            })
+
+        self.analysis_table.rows = rows
+        analyzed = sum(1 for r in rows if r['status'] == '已完成')
+        self.analysis_stats.text = f'📊 共 {len(rows)} 个角色，已分析 {analyzed} 个'
+
+    def _on_analyze_character(self, e):
+        """分析单个角色"""
+        row = e.args
+        if not row or not self.translator:
+            ui.notify('请先配置翻译器', type='warning')
+            return
+
+        name = row['name']
+        asyncio.create_task(self._async_analyze_character(name))
+
+    def _on_view_character(self, e):
+        """查看角色分析结果"""
+        row = e.args
+        if not row:
+            return
+
+        name = row['name']
+        char_profiles = self.current_project.char_dict.get('__profiles__', {})
+
+        if name not in char_profiles:
+            ui.notify('该角色尚未分析', type='warning')
+            return
+
+        profile = char_profiles[name]
+
+        # 创建对话框显示角色特征
+        with ui.dialog() as dialog, ui.card().classes('w-full max-w-2xl'):
+            ui.label(f'👤 {name} - 人物特征').classes('text-h6')
+            ui.separator()
+
+            # 显示各个维度
+            for key, value in profile.items():
+                if value:
+                    ui.label(f'【{key}】').classes('text-subtitle2 text-primary')
+                    ui.label(value).classes('text-body2 pl-4 mb-2')
+
+            ui.button('关闭', on_click=dialog.close).classes('mt-4')
+
+        dialog.open()
+
+    def _analyze_all_characters(self):
+        """分析所有角色"""
+        if not self.current_project:
+            ui.notify('请先打开项目', type='warning')
+            return
+        if not self.translator:
+            ui.notify('请先配置翻译器', type='warning')
+            return
+
+        asyncio.create_task(self._async_analyze_all_characters())
+
+    async def _async_analyze_all_characters(self):
+        """异步分析所有角色"""
+        characters = self.current_project.characters
+        total = len(characters)
+        success = 0
+
+        self.analyze_all_btn.disable()
+        self.analyze_all_btn.text = '分析中...'
+
+        with self.analysis_log:
+            for i, char in enumerate(characters):
+                name = char.get('name', '')
+                if not name:
+                    continue
+
+                # 跳过已分析的
+                char_profiles = self.current_project.char_dict.get('__profiles__', {})
+                if name in char_profiles:
+                    print(f'⏭️ {name} 已分析，跳过')
                     success += 1
-                    print(f'✅ [{success}/{total}] {item["original_text"][:30]}...')
-                except Exception as e:
-                    print(f'❌ 翻译失败: {e}')
-                    ui.notify(f'API错误，翻译已停止: {str(e)}', type='negative')
-                    stopped = True
+                    continue
+
+                print(f'🤖 [{i+1}/{total}] 正在分析 {name}...')
+                success_flag, result_or_error = await self._do_analyze_character(name)
+                if success_flag:
+                    success += 1
+                    print(f'✅ {name} 分析完成')
+                else:
+                    print(f'❌ {name} 分析失败: {result_or_error}')
+
+                self._refresh_analysis()
+
+        self.analyze_all_btn.enable()
+        self.analyze_all_btn.text = '🤖 分析所有角色'
+        ui.notify(f'分析完成！成功: {success}/{total}', type='positive')
+
+    async def _async_analyze_character(self, name):
+        """异步分析单个角色"""
+        self.analyze_btn.disable()
+
+        with self.analysis_log:
+            print(f'🤖 正在分析 {name}...')
+            success_flag, result_or_error = await self._do_analyze_character(name)
+            if success_flag:
+                print(f'✅ {name} 分析完成')
+                ui.notify(f'{name} 分析完成', type='positive')
+            else:
+                print(f'❌ {name} 分析失败: {result_or_error}')
+                ui.notify(f'{name} 分析失败: {result_or_error}', type='negative')
+
+            self._refresh_analysis()
+
+        self.analyze_btn.enable()
+
+    async def _do_analyze_character(self, name):
+        """执行角色分析，返回 (success, result_or_error)"""
+        loop = asyncio.get_event_loop()
+
+        try:
+            # 获取该角色的所有台词
+            dialogues = self.current_project.dialogues
+            char_lines = [d['original_text'] for d in dialogues if d.get('character', '') == name]
+
+            if not char_lines:
+                return False, '该角色没有台词'
+
+            # 获取模型配置
+            max_context = 8  # 默认8K
+            if self.current_project.model_config_name:
+                config = self.config_manager.get_config_by_name(self.current_project.model_config_name)
+                if config:
+                    max_context = getattr(config, 'max_context', 8)
+
+            # 计算每批处理的台词数（大约每条台词50 token）
+            tokens_per_line = 50
+            available_tokens = (max_context * 1024) - 2000  # 预留2000给系统提示
+            batch_size = max(10, available_tokens // tokens_per_line // 3)  # 分3批处理
+
+            # 分批处理台词
+            batches = [char_lines[i:i+batch_size] for i in range(0, len(char_lines), batch_size)]
+
+            # 如果只有一批，直接分析
+            if len(batches) == 1:
+                profile = await loop.run_in_executor(
+                    self.executor,
+                    lambda: self._analyze_single_batch(name, batches[0], is_final=True)
+                )
+                if profile is None:
+                    return False, 'AI分析返回空结果'
+            else:
+                # 多批处理：先分批总结，再合并
+                summaries = []
+                for i, batch in enumerate(batches):
+                    summary = await loop.run_in_executor(
+                        self.executor,
+                        lambda b=batch, idx=i: self._analyze_single_batch(
+                            name, b, is_final=False, batch_num=idx+1
+                        )
+                    )
+                    if summary:
+                        summaries.append(summary)
+                    else:
+                        return False, f'第{i+1}批分析失败'
+
+                # 合并总结
+                if summaries:
+                    profile = await loop.run_in_executor(
+                        self.executor,
+                        lambda: self._merge_summaries(name, summaries)
+                    )
+                else:
+                    return False, '所有批次分析都失败'
+
+            # 保存分析结果
+            if profile and isinstance(profile, dict):
+                if '__profiles__' not in self.current_project.char_dict:
+                    self.current_project.char_dict['__profiles__'] = {}
+                self.current_project.char_dict['__profiles__'][name] = profile
+                self._save_project()
+                return True, profile
+
+            if not profile:
+                return False, 'AI返回的结果为空，可能是提示词被误解为翻译任务'
+            return False, f'解析结果失败，期望dict，实际返回: {type(profile)}'
+
+        except Exception as e:
+            import traceback
+            error_msg = f'{str(e)}\n{traceback.format_exc()}'
+            print(f'分析失败: {error_msg}')
+            return False, str(e)
+
+    def _parse_profile_text(self, text):
+        """解析人物特征文本为字典"""
+        profile = {}
+        current_key = None
+        current_value = []
+
+        print(f'[解析] 原始文本:\n{text[:500]}...')  # 调试日志
+
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+
+            # 检查是否是新的维度
+            found_key = False
+            for key in ['性格特点', '外貌特征', '说话风格', '行为习惯', '人物关系', '背景故事', '角色定位', '翻译建议']:
+                if line.startswith(key + '：') or line.startswith(key + ':'):
+                    if current_key:
+                        profile[current_key] = '\n'.join(current_value).strip()
+                    current_key = key
+                    value_part = line.split('：', 1)[-1].split(':', 1)[-1].strip()
+                    current_value = [value_part] if value_part else []
+                    found_key = True
+                    print(f'[解析] 找到维度: {key}, 值: {value_part}')  # 调试日志
                     break
 
-        self._save_project()
-        self._dialogue_refresh()
+            if not found_key and current_key:
+                current_value.append(line)
 
-        if stopped:
-            ui.notify(f'翻译已停止！成功: {success}/{total}', type='warning')
+        # 保存最后一个维度
+        if current_key:
+            profile[current_key] = '\n'.join(current_value).strip()
+
+        print(f'[解析] 最终结果: {profile}')  # 调试日志
+        return profile
+
+    def _analyze_single_batch(self, name, lines, is_final=False, batch_num=0):
+        """分析单批台词"""
+        lines_text = '\n'.join([f'"{line}"' for line in lines[:50]])  # 最多50条，加引号强调是台词
+
+        if is_final:
+            prompt = f"""【任务类型：文本分析，不是翻译】
+
+我需要你分析以下游戏角色 "{name}" 的台词，总结该角色的人物特征。
+
+以下是该角色的台词（请勿翻译，只需分析）：
+{lines_text}
+
+请严格按照以下格式输出分析结果（每个维度一段话，没有信息的维度写"未知"）：
+
+性格特点：（该角色的性格是什么）
+外貌特征：（从台词推断的外貌信息）
+说话风格：（该角色说话有什么特点）
+行为习惯：（该角色的行为模式）
+人物关系：（该角色与其他角色的关系）
+背景故事：（从台词推断的背景）
+角色定位：（该角色在故事中的作用）
+翻译建议：（翻译该角色台词时应注意什么）"""
         else:
-            ui.notify(f'本页翻译完成！成功: {success}/{total}', type='positive')
+            prompt = f"""【任务类型：文本分析，不是翻译】
+
+我需要你分析游戏角色 "{name}" 的以下台词（第{batch_num}批），总结该角色的特点。
+
+台词（请勿翻译，只需分析）：
+{lines_text}
+
+请简要总结该角色在这批台词中展现的特点（性格、说话风格、关系等）。"""
+
+        try:
+            result = self.translator.translate_text(text=prompt)
+
+            # 如果是最终分析，解析为字典
+            if is_final:
+                return self._parse_profile_text(result)
+            else:
+                return result  # 返回原始文本用于后续合并
+
+        except Exception as e:
+            print(f'分析失败: {e}')
+            return None
+
+    def _merge_summaries(self, name, summaries):
+        """合并多个总结为最终人物特征"""
+        summaries_text = '\n\n'.join([f'总结{i+1}：\n{s}' for i, s in enumerate(summaries)])
+
+        prompt = f"""根据以下对角色 "{name}" 的多段分析总结，生成一个完整的人物特征报告。
+
+分段总结：
+{summaries_text}
+
+请按以下格式输出完整的人物特征：
+
+性格特点：
+外貌特征：
+说话风格：
+行为习惯：
+人物关系：
+背景故事：
+角色定位：
+翻译建议："""
+
+        try:
+            result = self.translator.translate_text(text=prompt)
+            # 解析结果为字典
+            profile = {}
+            current_key = None
+            current_value = []
+
+            for line in result.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+
+                # 检查是否是新的维度
+                for key in ['性格特点', '外貌特征', '说话风格', '行为习惯', '人物关系', '背景故事', '角色定位', '翻译建议']:
+                    if line.startswith(key + '：') or line.startswith(key + ':'):
+                        if current_key:
+                            profile[current_key] = '\n'.join(current_value).strip()
+                        current_key = key
+                        current_value = [line.split('：', 1)[-1].split(':', 1)[-1].strip()]
+                        break
+                else:
+                    if current_key:
+                        current_value.append(line)
+
+            if current_key:
+                profile[current_key] = '\n'.join(current_value).strip()
+
+            return profile
+
+        except Exception as e:
+            print(f'合并总结失败: {e}')
+            return {}
 
     # ========== 模型配置 ==========
 
@@ -1151,7 +1765,8 @@ class TranslatorUI:
             model=self.config_model.value,
             temperature=float(self.config_temp.value),
             max_tokens=int(self.config_max_tokens.value),
-            context_lines=int(self.config_context.value)
+            context_lines=int(self.config_context.value),
+            max_context=int(self.config_max_context.value or 8)
         )
 
         # 检查是否已存在
@@ -1180,6 +1795,7 @@ class TranslatorUI:
         self.config_temp.value = config.temperature
         self.config_max_tokens.value = config.max_tokens
         self.config_context.value = config.context_lines
+        self.config_max_context.value = getattr(config, 'max_context', 8)
 
         ui.notify(f'已加载配置: {name}', type='info')
 
@@ -1235,9 +1851,7 @@ class TranslatorUI:
             'character': d.character,
             'original_text': d.original_text,
             'translated_text': d.translated_text,
-            'is_translated': d.is_translated,
-            'context_before': d.context_before or [],
-            'context_after': d.context_after or []
+            'is_translated': d.is_translated
         }
 
     def _character_to_dict(self, c):

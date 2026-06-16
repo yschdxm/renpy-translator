@@ -22,14 +22,6 @@ class DialogueLine:
     original_text: str
     translated_text: str = ""
     is_translated: bool = False
-    context_before: List[str] = None  # 前文上下文
-    context_after: List[str] = None   # 后文上下文
-
-    def __post_init__(self):
-        if self.context_before is None:
-            self.context_before = []
-        if self.context_after is None:
-            self.context_after = []
 
 
 @dataclass
@@ -101,9 +93,8 @@ class RenpyParser:
                         self.characters[var_name] = char_info
         return characters
 
-    def extract_dialogue(self, content: str, file_path: str,
-                        context_lines: int = 3) -> List[DialogueLine]:
-        """从脚本中提取对话文本"""
+    def extract_dialogue(self, content: str, file_path: str) -> List[DialogueLine]:
+        """从脚本中提取对话文本（上下文将在显示时动态计算）"""
         lines = content.split('\n')
         dialogues = []
 
@@ -133,37 +124,11 @@ class RenpyParser:
                     if not text.strip():
                         break
 
-                    # 获取上下文（只提取对话行，跳过代码）
-                    context_before = []
-                    context_after = []
-
-                    # 提取前文对话
-                    for i in range(max(0, line_num - context_lines - 1), line_num - 1):
-                        ctx_line = lines[i].strip()
-                        if ctx_line and not ctx_line.startswith('#'):
-                            # 检查是否是对话行
-                            for ctx_pattern in self.DIALOGUE_PATTERNS[:2]:
-                                if re.match(ctx_pattern, ctx_line):
-                                    context_before.append(ctx_line)
-                                    break
-
-                    # 提取后文对话
-                    for i in range(line_num, min(len(lines), line_num + context_lines)):
-                        ctx_line = lines[i].strip()
-                        if ctx_line and not ctx_line.startswith('#'):
-                            # 检查是否是对话行
-                            for ctx_pattern in self.DIALOGUE_PATTERNS[:2]:
-                                if re.match(ctx_pattern, ctx_line):
-                                    context_after.append(ctx_line)
-                                    break
-
                     dialogue = DialogueLine(
                         file_path=file_path,
                         line_number=line_num,
                         character=char_name,
-                        original_text=text,
-                        context_before=context_before[-context_lines:],
-                        context_after=context_after[:context_lines]
+                        original_text=text
                     )
                     dialogues.append(dialogue)
                     break

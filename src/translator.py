@@ -39,7 +39,7 @@ class AITranslator:
         self.config = config
         self._init_client()
 
-    def _build_system_prompt(self, character_dict: Dict[str, str] = None) -> str:
+    def _build_system_prompt(self, character_dict: Dict[str, str] = None, character: str = "") -> str:
         """构建系统提示词"""
         prompt = """你是一位资深的文学翻译家，专注于视觉小说和游戏的中文本地化。你的翻译风格追求"信达雅"——忠实原意、表达通顺、文辞优美。
 
@@ -67,14 +67,6 @@ class AITranslator:
 - 情感表达要细腻，善用语气词（呢、啊、呀、嘛等）
 - 避免生硬的翻译腔，如"的"字滥用、被动句式
 
-角色语言风格参考：
-- 活泼角色：用轻快、俏皮的语言，可用网络流行语
-- 冷酷角色：用简洁、有力的短句，少用语气词
-- 温柔角色：用温和、细腻的措辞
-- 痞气/坏坏角色：用口语化、带点调侃的语气
-- 成熟角色：用稳重、得体的表达
-- 旁白：用有画面感的描述性语言
-
 人名处理：
 - 使用用户提供的翻译词典中的人名
 - 如果词典中没有，保留原文人名
@@ -84,12 +76,24 @@ class AITranslator:
 - 如果原文包含换行符\\n，翻译后也保留
 - 保留原文的引号格式"""
 
-        # 添加人名词典
+        # 添加人名词典和角色特征
         if character_dict:
+            # 人名词典
             dict_text = "\n\n人名翻译词典：\n"
             for en_name, cn_name in character_dict.items():
-                dict_text += f"- {en_name} → {cn_name}\n"
+                if en_name != '__profiles__':  # 跳过特殊键
+                    dict_text += f"- {en_name} → {cn_name}\n"
             prompt += dict_text
+
+            # 当前角色的特征
+            profiles = character_dict.get('__profiles__', {})
+            if character and character in profiles:
+                profile = profiles[character]
+                prompt += f"\n\n当前说话角色 [{character}] 的人物特征：\n"
+                for key, value in profile.items():
+                    if value:
+                        prompt += f"- {key}：{value}\n"
+                prompt += "\n请根据该角色的特点进行翻译，保持其说话风格和性格特征。"
 
         return prompt
 
@@ -123,6 +127,34 @@ class AITranslator:
         prompt += "\n\n请翻译【请翻译以下文本】中的内容，追求信达雅的翻译质量："
         return prompt
 
+    def analyze_text(self, prompt: str) -> str:
+        """分析文本（不使用翻译系统提示词）"""
+        if not self.client:
+            raise ValueError("请先配置API Key")
+
+        if not prompt.strip():
+            return ""
+
+        # 分析任务使用简单的系统提示词
+        system_prompt = "你是一个专业的文本分析师。请按照用户的要求进行分析，直接输出分析结果，不要添加额外的解释。"
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                timeout=self.config.timeout
+            )
+
+            return response.choices[0].message.content.strip()
+
+        except Exception as e:
+            raise Exception(f"分析失败: {str(e)}")
+
     def translate_text(self, text: str, character: str = "",
                       context_before: List[str] = None,
                       context_after: List[str] = None,
@@ -134,7 +166,7 @@ class AITranslator:
         if not text.strip():
             return ""
 
-        system_prompt = self._build_system_prompt(character_dict)
+        system_prompt = self._build_system_prompt(character_dict, character)
         user_prompt = self._build_user_prompt(
             text, character, context_before, context_after
         )
