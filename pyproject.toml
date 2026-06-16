@@ -1,0 +1,10 @@
+[project]
+name = "renpy-translator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=6.18.0",
+    "openai>=2.41.1",
+]
