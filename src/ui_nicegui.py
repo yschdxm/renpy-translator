@@ -88,133 +88,188 @@ class TranslatorUI:
         """创建主内容区"""
         # 标签页
         with ui.tabs() as tabs:
-            tab_translate = ui.tab('翻译', icon='translate')
-            tab_batch = ui.tab('批量', icon='speed')
-            tab_dict = ui.tab('词典', icon='dictionary')
-            tab_config = ui.tab('配置', icon='settings')
+            tab_name = ui.tab('人名翻译', icon='person')
+            tab_ui = ui.tab('UI翻译', icon='web')
+            tab_dialogue = ui.tab('对话翻译', icon='chat')
+            tab_config = ui.tab('模型配置', icon='settings')
 
-        with ui.tab_panels(tabs, value='翻译').classes('w-full'):
-            # 翻译工作台
-            with ui.tab_panel('翻译'):
-                self._create_translate_panel()
+        with ui.tab_panels(tabs, value='对话翻译').classes('w-full'):
+            # 人名翻译
+            with ui.tab_panel('人名翻译'):
+                self._create_name_panel()
 
-            # 批量翻译
-            with ui.tab_panel('批量'):
-                self._create_batch_panel()
+            # UI翻译
+            with ui.tab_panel('UI翻译'):
+                self._create_ui_panel()
 
-            # 人名词典
-            with ui.tab_panel('词典'):
-                self._create_dict_panel()
+            # 对话翻译
+            with ui.tab_panel('对话翻译'):
+                self._create_dialogue_panel()
 
             # 模型配置
-            with ui.tab_panel('配置'):
+            with ui.tab_panel('模型配置'):
                 self._create_config_panel()
 
-    def _create_translate_panel(self):
-        """创建翻译工作台"""
-        # 进度显示
-        self.progress_label = ui.label('请先打开项目').classes('text-subtitle1')
+    def _create_name_panel(self):
+        """创建人名翻译面板"""
+        # 统计和分页
+        with ui.row().classes('w-full items-center gap-2'):
+            self.name_stats = ui.label('请先打开项目').classes('text-subtitle1')
+            ui.space()
+            self.name_page_size = ui.number(label='每页', value=50, min=10).classes('w-24')
+            ui.button('⏮', on_click=lambda: self._name_goto_page(0)).props('flat dense')
+            ui.button('◀', on_click=lambda: self._name_prev_page()).props('flat dense')
+            self.name_page_label = ui.label('第 1 页')
+            ui.button('▶', on_click=lambda: self._name_next_page()).props('flat dense')
+            ui.button('⏭', on_click=lambda: self._name_goto_page(-1)).props('flat dense')
+            ui.button('🔄 刷新', on_click=self._name_refresh)
 
-        # 筛选栏
+        # 人名表格
+        self.name_table = ui.table(
+            columns=[
+                {'name': 'index', 'label': '#', 'field': 'index', 'sortable': True},
+                {'name': 'original', 'label': '原文人名', 'field': 'original'},
+                {'name': 'translated', 'label': '中文名', 'field': 'translated'},
+                {'name': 'action', 'label': '操作', 'field': 'action'},
+            ],
+            rows=[],
+            row_key='index'
+        ).classes('w-full')
+
+        # 自定义单元格
+        self.name_table.add_slot('body-cell-translated', '''
+            <q-td :props="props">
+                <q-input v-model="props.row.translated" dense @change="$parent.$emit('update:name', props.row)" />
+            </q-td>
+        ''')
+        self.name_table.add_slot('body-cell-action', '''
+            <q-td :props="props">
+                <q-btn flat dense color="primary" label="AI翻译" @click="$parent.$emit('translate_name', props.row)" />
+            </q-td>
+        ''')
+
+        # 监听事件
+        self.name_table.on('update:name', self._on_name_update)
+        self.name_table.on('translate_name', self._on_name_translate)
+
+        # 分页状态
+        self.name_current_page = 0
+
+    def _create_ui_panel(self):
+        """创建UI翻译面板"""
+        # 统计和分页
+        with ui.row().classes('w-full items-center gap-2'):
+            self.ui_stats = ui.label('请先打开项目').classes('text-subtitle1')
+            ui.space()
+            self.ui_page_size = ui.number(label='每页', value=50, min=10).classes('w-24')
+            ui.button('⏮', on_click=lambda: self._ui_goto_page(0)).props('flat dense')
+            ui.button('◀', on_click=lambda: self._ui_prev_page()).props('flat dense')
+            self.ui_page_label = ui.label('第 1 页')
+            ui.button('▶', on_click=lambda: self._ui_next_page()).props('flat dense')
+            ui.button('⏭', on_click=lambda: self._ui_goto_page(-1)).props('flat dense')
+            ui.button('🚀 翻译本页', color='primary', on_click=self._ui_translate_page)
+            ui.button('🔄 刷新', on_click=self._ui_refresh)
+
+        # UI表格
+        self.ui_table = ui.table(
+            columns=[
+                {'name': 'index', 'label': '#', 'field': 'index', 'sortable': True},
+                {'name': 'original', 'label': '原文', 'field': 'original'},
+                {'name': 'translated', 'label': '译文', 'field': 'translated'},
+                {'name': 'action', 'label': '操作', 'field': 'action'},
+            ],
+            rows=[],
+            row_key='index'
+        ).classes('w-full')
+
+        # 自定义单元格
+        self.ui_table.add_slot('body-cell-translated', '''
+            <q-td :props="props">
+                <q-input v-model="props.row.translated" dense @change="$parent.$emit('update:ui', props.row)" />
+            </q-td>
+        ''')
+        self.ui_table.add_slot('body-cell-action', '''
+            <q-td :props="props">
+                <q-btn flat dense color="primary" label="AI翻译" @click="$parent.$emit('translate_ui', props.row)" />
+            </q-td>
+        ''')
+
+        # 监听事件
+        self.ui_table.on('update:ui', self._on_ui_update)
+        self.ui_table.on('translate_ui', self._on_ui_translate)
+
+        # 日志
+        self.ui_log = ui.log().classes('w-full h-32')
+        self.ui_current_page = 0
+
+    def _create_dialogue_panel(self):
+        """创建对话翻译面板"""
+        # 统计和分页
+        with ui.row().classes('w-full items-center gap-2'):
+            self.dialogue_stats = ui.label('请先打开项目').classes('text-subtitle1')
+            ui.space()
+            self.dialogue_page_size = ui.number(label='每页', value=30, min=10).classes('w-24')
+            ui.button('⏮', on_click=lambda: self._dialogue_goto_page(0)).props('flat dense')
+            ui.button('◀', on_click=lambda: self._dialogue_prev_page()).props('flat dense')
+            self.dialogue_page_label = ui.label('第 1 页')
+            ui.button('▶', on_click=lambda: self._dialogue_next_page()).props('flat dense')
+            ui.button('⏭', on_click=lambda: self._dialogue_goto_page(-1)).props('flat dense')
+            ui.button('🚀 翻译本页', color='primary', on_click=self._dialogue_translate_page)
+            ui.button('💾 保存', on_click=self._save_project)
+            ui.button('🔄 刷新', on_click=self._dialogue_refresh)
+
+        # 筛选
         with ui.row().classes('w-full gap-2'):
-            search = ui.input(label='搜索', placeholder='搜索原文/译文').classes('flex-1')
-            filter_mode = ui.select(
+            self.dialogue_search = ui.input(label='搜索', placeholder='搜索原文/译文').classes('flex-1')
+            self.dialogue_filter = ui.select(
                 options={'all': '全部', 'untranslated': '未翻译', 'translated': '已翻译'},
                 label='筛选', value='all'
             )
-            filter_char = ui.input(label='角色', placeholder='角色名')
-            ui.button('🔍', on_click=lambda: self._apply_filter(
-                search.value, filter_mode.value, filter_char.value
-            ))
-
-        ui.separator()
-
-        # 对话预览卡片
-        with ui.card().classes('w-full'):
-            self.dialogue_preview = ui.markdown('暂无对话')
-
-        # 翻译输入
-        with ui.card().classes('w-full'):
-            self.translation_input = ui.textarea(
-                label='翻译输入（留空则AI翻译）',
-                placeholder='输入手动翻译...'
-            ).classes('w-full')
-
-            # 操作按钮
-            with ui.row().classes('w-full gap-2'):
-                ui.button('⏮ 第一句', on_click=lambda: self._navigate('first'))
-                ui.button('⬅ 上一句', on_click=lambda: self._navigate('prev'))
-                ui.button('➡ 下一句', on_click=lambda: self._navigate('next'))
-                ui.button('⏭ 最后', on_click=lambda: self._navigate('last'))
-
-            with ui.row().classes('w-full gap-2'):
-                ui.button('🤖 AI翻译', color='primary', on_click=self._ai_translate)
-                ui.button('✏️ 手动翻译', on_click=self._manual_translate)
-                ui.button('💾 保存', on_click=self._save_project)
-
-    def _create_batch_panel(self):
-        """创建批量翻译面板"""
-        ui.label('⚡ 批量翻译').classes('text-h5')
-
-        # 统计信息
-        self.batch_stats = ui.label('请先打开项目').classes('text-subtitle1')
-
-        # 分页控件
-        with ui.row().classes('w-full items-center gap-2'):
-            self.batch_page_size = ui.number(label='每页条数', value=50, min=10, max=200).classes('w-32')
-            ui.button('⏮', on_click=lambda: self._batch_goto_page(0)).props('flat')
-            ui.button('◀', on_click=lambda: self._batch_prev_page()).props('flat')
-            self.batch_page_label = ui.label('第 1 页')
-            ui.button('▶', on_click=lambda: self._batch_next_page()).props('flat')
-            ui.button('⏭', on_click=lambda: self._batch_goto_page(-1)).props('flat')
-            ui.space()
-            ui.button('🚀 翻译本页', color='primary', on_click=self._batch_translate_page)
-            ui.button('🔄 刷新', on_click=self._batch_refresh)
-
-        ui.separator()
+            self.dialogue_char_filter = ui.input(label='角色', placeholder='角色名')
+            ui.button('🔍', on_click=self._dialogue_apply_filter)
 
         # 对话表格
-        self.batch_table = ui.table(
+        self.dialogue_table = ui.table(
             columns=[
                 {'name': 'index', 'label': '#', 'field': 'index', 'sortable': True},
                 {'name': 'character', 'label': '角色', 'field': 'character', 'sortable': True},
-                {'name': 'original', 'label': '原文', 'field': 'original', 'style': 'max-width: 400px; white-space: normal;'},
-                {'name': 'translated', 'label': '译文', 'field': 'translated', 'style': 'max-width: 400px; white-space: normal;'},
-                {'name': 'status', 'label': '状态', 'field': 'status', 'sortable': True},
+                {'name': 'original', 'label': '原文', 'field': 'original'},
+                {'name': 'translated', 'label': '译文', 'field': 'translated'},
+                {'name': 'action', 'label': '操作', 'field': 'action'},
             ],
             rows=[],
-            row_key='index',
-            pagination=0
+            row_key='index'
         ).classes('w-full')
 
-        # 状态日志
-        ui.separator()
-        ui.label('翻译日志').classes('text-subtitle1')
-        self.batch_log = ui.log().classes('w-full h-48')
+        # 自定义单元格
+        self.dialogue_table.add_slot('body-cell-translated', '''
+            <q-td :props="props">
+                <q-input v-model="props.row.translated" dense type="textarea" autogrow
+                    @change="$parent.$emit('update:dialogue', props.row)" />
+            </q-td>
+        ''')
+        self.dialogue_table.add_slot('body-cell-action', '''
+            <q-td :props="props">
+                <q-btn flat dense color="primary" label="AI翻译" @click="$parent.$emit('translate_dialogue', props.row)" />
+            </q-td>
+        ''')
 
-        # 分页状态
-        self.batch_current_page = 0
+        # 监听事件
+        self.dialogue_table.on('update:dialogue', self._on_dialogue_update)
+        self.dialogue_table.on('translate_dialogue', self._on_dialogue_translate)
 
-    def _create_dict_panel(self):
-        """创建人名词典面板"""
-        ui.label('👤 人名词典').classes('text-h5')
-
-        with ui.card().classes('w-full'):
-            self.dict_editor = ui.textarea(
-                label='人名词典（格式：英文名 → 中文名）',
-                placeholder='Eileen → 艾琳\nLucy → 露西'
-            ).classes('w-full h-64')
-
-            with ui.row().classes('gap-2'):
-                ui.button('📂 加载', on_click=self._load_dict)
-                ui.button('💾 保存', color='primary', on_click=self._save_dict)
+        # 日志
+        self.dialogue_log = ui.log().classes('w-full h-32')
+        self.dialogue_current_page = 0
+        self.dialogue_filter_mode = 'all'
+        self.dialogue_search_text = ''
+        self.dialogue_char_text = ''
 
     def _create_config_panel(self):
         """创建模型配置面板"""
-        ui.label('⚙️ 模型配置').classes('text-h5')
-
         # 配置表单
         with ui.card().classes('w-full'):
+            ui.label('编辑配置').classes('text-h6')
             self.config_name_input = ui.input(label='配置名称', placeholder='GPT-4')
             self.config_api_base = ui.input(label='API地址', value='https://api.openai.com/v1')
             self.config_api_key = ui.input(label='API Key', password=True)
@@ -225,12 +280,11 @@ class TranslatorUI:
                 self.config_temp = ui.slider(min=0, max=2, value=0.3, step=0.1).classes('flex-1')
                 self.temp_label = ui.label('0.3')
 
-            # 绑定slider值到label
             self.config_temp.on_value_change(lambda e: self.temp_label.set_text(str(e.value)))
 
             with ui.row().classes('gap-2'):
-                self.config_max_tokens = ui.number(label='最大Token', value=1000, min=100, max=4000)
-                self.config_context = ui.number(label='上下文行数', value=3, min=0, max=10)
+                self.config_max_tokens = ui.number(label='最大输出Token数', value=4096, min=1)
+                self.config_context = ui.number(label='上下文行数', value=3, min=0)
 
             with ui.row().classes('gap-2'):
                 ui.button('💾 保存配置', color='primary', on_click=self._save_config_form)
@@ -297,17 +351,18 @@ class TranslatorUI:
             return
 
         self.current_project = project
-        self.current_index = project.last_position.get('index', 0)
-        self.batch_current_page = 0
+        self.name_current_page = 0
+        self.ui_current_page = 0
+        self.dialogue_current_page = 0
 
         # 初始化翻译器
         if project.model_config_name:
             self._init_translator(project.model_config_name)
 
-        # 更新UI
-        self._update_progress()
-        self._update_preview()
-        self._batch_refresh()
+        # 更新所有面板
+        self._name_refresh()
+        self._ui_refresh()
+        self._dialogue_refresh()
         self.status_label.text = f'当前项目: {name}'
 
         ui.notify(f'已打开项目: {name}', type='positive')
@@ -495,169 +550,389 @@ class TranslatorUI:
 
         ui.notify('翻译已保存', type='positive')
 
-    def _batch_refresh(self):
-        """刷新批量翻译表格"""
+    # ========== 人名翻译 ==========
+
+    def _on_name_update(self, e):
+        """人名输入框更新 - 自动保存"""
+        row = e.args
+        if row and self.current_project:
+            self.current_project.char_dict[row['original']] = row['translated']
+            self._save_project()
+
+    def _on_name_translate(self, e):
+        """AI翻译人名"""
+        row = e.args
+        if not self.translator:
+            ui.notify('请先配置翻译器', type='warning')
+            return
+        if row and self.current_project:
+            try:
+                # 构建提示词，让人名翻译更有语境
+                prompt = f"将以下人名翻译成中文，只返回中文名，不要解释：{row['original']}"
+                translated = self.translator.translate_text(text=prompt)
+                # 清理翻译结果，只保留名字
+                translated = translated.strip().replace('"', '').replace("'", '')
+                self.current_project.char_dict[row['original']] = translated
+                self._save_project()
+                self._name_refresh()
+                ui.notify(f'翻译完成: {row["original"]} → {translated}', type='positive')
+            except Exception as e:
+                ui.notify(f'翻译失败: {str(e)}', type='negative')
+
+    def _name_refresh(self):
+        """刷新人名表格"""
         if not self.current_project:
-            ui.notify('请先打开项目', type='warning')
             return
 
-        dialogues = self.current_project.dialogues
-        total = len(dialogues)
-        translated = sum(1 for d in dialogues if d.get('is_translated', False))
-        untranslated = total - translated
+        char_dict = self.current_project.char_dict
+        items = list(char_dict.items())
+        total = len(items)
 
-        # 更新统计
-        self.batch_stats.text = f'📊 总计: {total} | ✅ 已翻译: {translated} | ❌ 未翻译: {untranslated}'
-
-        # 计算分页
-        page_size = int(self.batch_page_size.value)
+        page_size = int(self.name_page_size.value)
         total_pages = (total + page_size - 1) // page_size if total > 0 else 1
-        self.batch_current_page = min(self.batch_current_page, total_pages - 1)
+        self.name_current_page = min(self.name_current_page, total_pages - 1)
 
-        # 获取当前页数据
-        start = self.batch_current_page * page_size
+        start = self.name_current_page * page_size
         end = min(start + page_size, total)
-        page_dialogues = dialogues[start:end]
+        page_items = items[start:end]
 
-        # 更新表格
         rows = []
-        for i, d in enumerate(page_dialogues):
-            status = '✅' if d.get('is_translated', False) else '❌'
+        for i, (en, cn) in enumerate(page_items):
             rows.append({
                 'index': start + i + 1,
-                'character': d.get('character', '') or '旁白',
-                'original': d.get('original_text', '')[:100] + ('...' if len(d.get('original_text', '')) > 100 else ''),
-                'translated': d.get('translated_text', '')[:100] + ('...' if len(d.get('translated_text', '')) > 100 else ''),
-                'status': status
+                'original': en,
+                'translated': cn,
+                'action': en  # 存储原始key用于操作
             })
 
-        self.batch_table.rows = rows
-        self.batch_page_label.text = f'第 {self.batch_current_page + 1} / {total_pages} 页'
+        self.name_table.rows = rows
+        self.name_stats.text = f'📊 共 {total} 个人名'
+        self.name_page_label.text = f'第 {self.name_current_page + 1} / {total_pages} 页'
 
-    def _batch_prev_page(self):
-        """上一页"""
-        if self.batch_current_page > 0:
-            self.batch_current_page -= 1
-            self._batch_refresh()
+    def _name_prev_page(self):
+        if self.name_current_page > 0:
+            self.name_current_page -= 1
+            self._name_refresh()
 
-    def _batch_next_page(self):
-        """下一页"""
+    def _name_next_page(self):
         if not self.current_project:
             return
-
-        page_size = int(self.batch_page_size.value)
-        total = len(self.current_project.dialogues)
+        page_size = int(self.name_page_size.value)
+        total = len(self.current_project.char_dict)
         total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+        if self.name_current_page < total_pages - 1:
+            self.name_current_page += 1
+            self._name_refresh()
 
-        if self.batch_current_page < total_pages - 1:
-            self.batch_current_page += 1
-            self._batch_refresh()
+    def _name_goto_page(self, page):
+        if not self.current_project:
+            return
+        if page == -1:
+            page_size = int(self.name_page_size.value)
+            total = len(self.current_project.char_dict)
+            self.name_current_page = (total + page_size - 1) // page_size - 1 if total > 0 else 0
+        else:
+            self.name_current_page = max(0, page)
+        self._name_refresh()
 
-    def _batch_goto_page(self, page):
-        """跳转到指定页"""
+    # ========== UI翻译 ==========
+
+    def _on_ui_update(self, e):
+        """UI译文输入框更新 - 自动保存"""
+        row = e.args
+        if row and self.current_project:
+            idx = row['action']
+            if 0 <= idx < len(self.current_project.ui_texts):
+                self.current_project.ui_texts[idx]['translated_text'] = row['translated']
+                self.current_project.ui_texts[idx]['is_translated'] = True
+                self._save_project()
+
+    def _on_ui_translate(self, e):
+        """AI翻译单条UI"""
+        row = e.args
+        if not self.translator:
+            ui.notify('请先配置翻译器', type='warning')
+            return
+        if row and self.current_project:
+            idx = row['action']
+            if 0 <= idx < len(self.current_project.ui_texts):
+                item = self.current_project.ui_texts[idx]
+                try:
+                    translated = self.translator.translate_text(text=item['original_text'])
+                    item['translated_text'] = translated
+                    item['is_translated'] = True
+                    self._save_project()
+                    self._ui_refresh()
+                    ui.notify('翻译完成', type='positive')
+                except Exception as e:
+                    ui.notify(f'翻译失败: {str(e)}', type='negative')
+
+    def _ui_refresh(self):
+        """刷新UI表格"""
         if not self.current_project:
             return
 
+        items = self.current_project.ui_texts
+        total = len(items)
+        translated = sum(1 for d in items if d.get('is_translated', False))
+
+        page_size = int(self.ui_page_size.value)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+        self.ui_current_page = min(self.ui_current_page, total_pages - 1)
+
+        start = self.ui_current_page * page_size
+        end = min(start + page_size, total)
+        page_items = items[start:end]
+
+        rows = []
+        for i, d in enumerate(page_items):
+            rows.append({
+                'index': start + i + 1,
+                'original': d.get('original_text', ''),
+                'translated': d.get('translated_text', ''),
+                'action': start + i  # 存储索引用于操作
+            })
+
+        self.ui_table.rows = rows
+        self.ui_stats.text = f'📊 总计: {total} | ✅ 已翻译: {translated}'
+        self.ui_page_label.text = f'第 {self.ui_current_page + 1} / {total_pages} 页'
+
+    def _ui_prev_page(self):
+        if self.ui_current_page > 0:
+            self.ui_current_page -= 1
+            self._ui_refresh()
+
+    def _ui_next_page(self):
+        if not self.current_project:
+            return
+        page_size = int(self.ui_page_size.value)
+        total = len(self.current_project.ui_texts)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+        if self.ui_current_page < total_pages - 1:
+            self.ui_current_page += 1
+            self._ui_refresh()
+
+    def _ui_goto_page(self, page):
+        if not self.current_project:
+            return
         if page == -1:
-            # 跳转到最后一页
-            page_size = int(self.batch_page_size.value)
-            total = len(self.current_project.dialogues)
-            self.batch_current_page = (total + page_size - 1) // page_size - 1 if total > 0 else 0
+            page_size = int(self.ui_page_size.value)
+            total = len(self.current_project.ui_texts)
+            self.ui_current_page = (total + page_size - 1) // page_size - 1 if total > 0 else 0
         else:
-            self.batch_current_page = max(0, page)
+            self.ui_current_page = max(0, page)
+        self._ui_refresh()
 
-        self._batch_refresh()
-
-    def _batch_translate_page(self):
-        """翻译当前页"""
+    def _ui_translate_page(self):
+        """翻译当前页UI"""
         if not self.current_project:
             ui.notify('请先打开项目', type='warning')
             return
-
         if not self.translator:
             ui.notify('请先配置翻译器', type='warning')
             return
 
-        # 获取当前页未翻译的对话
-        page_size = int(self.batch_page_size.value)
-        start = self.batch_current_page * page_size
-        end = min(start + page_size, len(self.current_project.dialogues))
-        page_dialogues = self.current_project.dialogues[start:end]
+        page_size = int(self.ui_page_size.value)
+        start = self.ui_current_page * page_size
+        end = min(start + page_size, len(self.current_project.ui_texts))
+        page_items = self.current_project.ui_texts[start:end]
 
-        to_translate = [d for d in page_dialogues if not d.get('is_translated', False)]
+        to_translate = [d for d in page_items if not d.get('is_translated', False)]
         if not to_translate:
-            ui.notify('当前页所有对话已翻译', type='info')
+            ui.notify('当前页已全部翻译', type='info')
             return
 
         total = len(to_translate)
         success = 0
         stopped = False
 
-        with self.batch_log:
-            print(f'开始翻译第 {self.batch_current_page + 1} 页，共 {total} 条未翻译')
-
-            for i, dialogue in enumerate(to_translate):
+        with self.ui_log:
+            for i, item in enumerate(to_translate):
                 try:
-                    translated = self.translator.translate_text(
-                        text=dialogue['original_text'],
-                        character=dialogue.get('character', ''),
-                        context_before=dialogue.get('context_before', []),
-                        context_after=dialogue.get('context_after', []),
-                        character_dict=self.current_project.char_dict
-                    )
-                    dialogue['translated_text'] = translated
-                    dialogue['is_translated'] = True
+                    translated = self.translator.translate_text(text=item['original_text'])
+                    item['translated_text'] = translated
+                    item['is_translated'] = True
                     success += 1
-                    print(f'✅ [{success}/{total}] {dialogue["original_text"][:30]}...')
-
                 except Exception as e:
-                    error_msg = str(e)
-                    print(f'❌ 翻译失败: {error_msg}')
-                    ui.notify(f'API错误，翻译已停止: {error_msg}', type='negative')
+                    print(f'❌ 翻译失败: {e}')
+                    ui.notify(f'API错误，翻译已停止: {str(e)}', type='negative')
                     stopped = True
                     break
 
-        # 保存项目
         self._save_project()
-        self._batch_refresh()
-        self._update_progress()
+        self._ui_refresh()
 
         if stopped:
-            ui.notify(f'翻译已停止！成功: {success}/{total}，请检查API配置后重试', type='warning')
+            ui.notify(f'翻译已停止！成功: {success}/{total}', type='warning')
         else:
             ui.notify(f'本页翻译完成！成功: {success}/{total}', type='positive')
 
-    # ========== 人名词典 ==========
+    # ========== 对话翻译 ==========
 
-    def _load_dict(self):
-        """加载人名词典"""
+    def _on_dialogue_update(self, e):
+        """对话译文输入框更新 - 自动保存"""
+        row = e.args
+        if row and self.current_project:
+            idx = row['action']
+            if 0 <= idx < len(self.current_project.dialogues):
+                self.current_project.dialogues[idx]['translated_text'] = row['translated']
+                self.current_project.dialogues[idx]['is_translated'] = True
+                self._save_project()
+
+    def _on_dialogue_translate(self, e):
+        """AI翻译单条对话"""
+        row = e.args
+        if not self.translator:
+            ui.notify('请先配置翻译器', type='warning')
+            return
+        if row and self.current_project:
+            idx = row['action']
+            if 0 <= idx < len(self.current_project.dialogues):
+                item = self.current_project.dialogues[idx]
+                try:
+                    translated = self.translator.translate_text(
+                        text=item['original_text'],
+                        character=item.get('character', ''),
+                        context_before=item.get('context_before', []),
+                        context_after=item.get('context_after', []),
+                        character_dict=self.current_project.char_dict
+                    )
+                    item['translated_text'] = translated
+                    item['is_translated'] = True
+                    self._save_project()
+                    self._dialogue_refresh()
+                    ui.notify('翻译完成', type='positive')
+                except Exception as e:
+                    ui.notify(f'翻译失败: {str(e)}', type='negative')
+
+    def _dialogue_refresh(self):
+        """刷新对话表格"""
+        if not self.current_project:
+            return
+
+        dialogues = self.current_project.dialogues
+
+        # 应用筛选
+        if self.dialogue_filter_mode == 'untranslated':
+            dialogues = [d for d in dialogues if not d.get('is_translated', False)]
+        elif self.dialogue_filter_mode == 'translated':
+            dialogues = [d for d in dialogues if d.get('is_translated', False)]
+
+        if self.dialogue_search_text:
+            s = self.dialogue_search_text.lower()
+            dialogues = [d for d in dialogues if s in d.get('original_text', '').lower() or s in d.get('translated_text', '').lower()]
+
+        if self.dialogue_char_text:
+            dialogues = [d for d in dialogues if d.get('character', '') == self.dialogue_char_text]
+
+        total = len(dialogues)
+        translated = sum(1 for d in dialogues if d.get('is_translated', False))
+
+        page_size = int(self.dialogue_page_size.value)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+        self.dialogue_current_page = min(self.dialogue_current_page, total_pages - 1)
+
+        start = self.dialogue_current_page * page_size
+        end = min(start + page_size, total)
+        page_items = dialogues[start:end]
+
+        rows = []
+        for i, d in enumerate(page_items):
+            rows.append({
+                'index': start + i + 1,
+                'character': d.get('character', '') or '旁白',
+                'original': d.get('original_text', ''),
+                'translated': d.get('translated_text', ''),
+                'action': start + i
+            })
+
+        self.dialogue_table.rows = rows
+        self.dialogue_stats.text = f'📊 总计: {total} | ✅ 已翻译: {translated}'
+        self.dialogue_page_label.text = f'第 {self.dialogue_current_page + 1} / {total_pages} 页'
+
+    def _dialogue_apply_filter(self):
+        self.dialogue_search_text = self.dialogue_search.value
+        self.dialogue_filter_mode = self.dialogue_filter.value
+        self.dialogue_char_text = self.dialogue_char_filter.value
+        self.dialogue_current_page = 0
+        self._dialogue_refresh()
+
+    def _dialogue_prev_page(self):
+        if self.dialogue_current_page > 0:
+            self.dialogue_current_page -= 1
+            self._dialogue_refresh()
+
+    def _dialogue_next_page(self):
+        if not self.current_project:
+            return
+        page_size = int(self.dialogue_page_size.value)
+        total = len(self.current_project.dialogues)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+        if self.dialogue_current_page < total_pages - 1:
+            self.dialogue_current_page += 1
+            self._dialogue_refresh()
+
+    def _dialogue_goto_page(self, page):
+        if not self.current_project:
+            return
+        if page == -1:
+            page_size = int(self.dialogue_page_size.value)
+            total = len(self.current_project.dialogues)
+            self.dialogue_current_page = (total + page_size - 1) // page_size - 1 if total > 0 else 0
+        else:
+            self.dialogue_current_page = max(0, page)
+        self._dialogue_refresh()
+
+    def _dialogue_translate_page(self):
+        """翻译当前页对话"""
         if not self.current_project:
             ui.notify('请先打开项目', type='warning')
             return
-
-        lines = []
-        for en, cn in sorted(self.current_project.char_dict.items()):
-            lines.append(f'{en} → {cn}')
-        self.dict_editor.value = '\n'.join(lines)
-
-    def _save_dict(self):
-        """保存人名词典"""
-        if not self.current_project:
-            ui.notify('请先打开项目', type='warning')
+        if not self.translator:
+            ui.notify('请先配置翻译器', type='warning')
             return
 
-        new_dict = {}
-        for line in self.dict_editor.value.strip().split('\n'):
-            if '→' in line:
-                parts = line.split('→')
-                en_name = parts[0].strip()
-                cn_name = parts[1].strip()
-                if en_name and cn_name:
-                    new_dict[en_name] = cn_name
+        page_size = int(self.dialogue_page_size.value)
+        start = self.dialogue_current_page * page_size
+        end = min(start + page_size, len(self.current_project.dialogues))
+        page_items = self.current_project.dialogues[start:end]
 
-        self.current_project.char_dict = new_dict
+        to_translate = [d for d in page_items if not d.get('is_translated', False)]
+        if not to_translate:
+            ui.notify('当前页已全部翻译', type='info')
+            return
+
+        total = len(to_translate)
+        success = 0
+        stopped = False
+
+        with self.dialogue_log:
+            for i, item in enumerate(to_translate):
+                try:
+                    translated = self.translator.translate_text(
+                        text=item['original_text'],
+                        character=item.get('character', ''),
+                        context_before=item.get('context_before', []),
+                        context_after=item.get('context_after', []),
+                        character_dict=self.current_project.char_dict
+                    )
+                    item['translated_text'] = translated
+                    item['is_translated'] = True
+                    success += 1
+                    print(f'✅ [{success}/{total}] {item["original_text"][:30]}...')
+                except Exception as e:
+                    print(f'❌ 翻译失败: {e}')
+                    ui.notify(f'API错误，翻译已停止: {str(e)}', type='negative')
+                    stopped = True
+                    break
+
         self._save_project()
-        ui.notify(f'已保存 {len(new_dict)} 条记录', type='positive')
+        self._dialogue_refresh()
+
+        if stopped:
+            ui.notify(f'翻译已停止！成功: {success}/{total}', type='warning')
+        else:
+            ui.notify(f'本页翻译完成！成功: {success}/{total}', type='positive')
 
     # ========== 模型配置 ==========
 
@@ -745,7 +1020,7 @@ class TranslatorUI:
         self.config_api_key.value = ''
         self.config_model.value = ''
         self.config_temp.value = 0.3
-        self.config_max_tokens.value = 1000
+        self.config_max_tokens.value = 4096
         self.config_context.value = 3
 
     def _init_translator(self, config_name):
