@@ -2,6 +2,7 @@
 
 import os
 import sys
+import asyncio
 from nicegui import ui
 
 # 添加当前目录到Python路径
@@ -28,6 +29,11 @@ class TranslatorUI:
         self.current_index = 0
         self.filter_mode = "all"
         self.search_text = ""
+
+        # 翻译队列
+        self.translate_queue = {}  # {table_type: {index: status}}
+        self.max_concurrent = 5  # 最大并发数
+        self.current_translating = 0  # 当前正在翻译的数量
 
         # UI组件引用
         self.project_list = None
@@ -130,6 +136,7 @@ class TranslatorUI:
                 {'name': 'index', 'label': '#', 'field': 'index', 'sortable': True},
                 {'name': 'original', 'label': '原文人名', 'field': 'original'},
                 {'name': 'translated', 'label': '中文名', 'field': 'translated'},
+                {'name': 'status', 'label': '状态', 'field': 'status'},
                 {'name': 'action', 'label': '操作', 'field': 'action'},
             ],
             rows=[],
@@ -142,9 +149,19 @@ class TranslatorUI:
                 <q-input v-model="props.row.translated" dense @change="$parent.$emit('update:name', props.row)" />
             </q-td>
         ''')
+        self.name_table.add_slot('body-cell-status', '''
+            <q-td :props="props">
+                <q-chip :color="props.row.status === '翻译中' ? 'orange' : (props.row.status === '完成' ? 'green' : 'grey')"
+                    text-color="white" dense size="sm">
+                    {{ props.row.status }}
+                </q-chip>
+            </q-td>
+        ''')
         self.name_table.add_slot('body-cell-action', '''
             <q-td :props="props">
-                <q-btn flat dense color="primary" label="AI翻译" @click="$parent.$emit('translate_name', props.row)" />
+                <q-btn flat dense color="primary" label="AI翻译"
+                    :disable="props.row.status === '翻译中' || props.row.status === '排队中'"
+                    @click="$parent.$emit('translate_name', props.row)" />
             </q-td>
         ''')
 
@@ -176,6 +193,7 @@ class TranslatorUI:
                 {'name': 'index', 'label': '#', 'field': 'index', 'sortable': True},
                 {'name': 'original', 'label': '原文', 'field': 'original'},
                 {'name': 'translated', 'label': '译文', 'field': 'translated'},
+                {'name': 'status', 'label': '状态', 'field': 'status'},
                 {'name': 'action', 'label': '操作', 'field': 'action'},
             ],
             rows=[],
@@ -188,9 +206,19 @@ class TranslatorUI:
                 <q-input v-model="props.row.translated" dense @change="$parent.$emit('update:ui', props.row)" />
             </q-td>
         ''')
+        self.ui_table.add_slot('body-cell-status', '''
+            <q-td :props="props">
+                <q-chip :color="props.row.status === '翻译中' ? 'orange' : (props.row.status === '完成' ? 'green' : 'grey')"
+                    text-color="white" dense size="sm">
+                    {{ props.row.status }}
+                </q-chip>
+            </q-td>
+        ''')
         self.ui_table.add_slot('body-cell-action', '''
             <q-td :props="props">
-                <q-btn flat dense color="primary" label="AI翻译" @click="$parent.$emit('translate_ui', props.row)" />
+                <q-btn flat dense color="primary" label="AI翻译"
+                    :disable="props.row.status === '翻译中' || props.row.status === '排队中'"
+                    @click="$parent.$emit('translate_ui', props.row)" />
             </q-td>
         ''')
 
@@ -215,7 +243,6 @@ class TranslatorUI:
             ui.button('▶', on_click=lambda: self._dialogue_next_page()).props('flat dense')
             ui.button('⏭', on_click=lambda: self._dialogue_goto_page(-1)).props('flat dense')
             ui.button('🚀 翻译本页', color='primary', on_click=self._dialogue_translate_page)
-            ui.button('💾 保存', on_click=self._save_project)
             ui.button('🔄 刷新', on_click=self._dialogue_refresh)
 
         # 筛选
@@ -228,6 +255,11 @@ class TranslatorUI:
             self.dialogue_char_filter = ui.input(label='角色', placeholder='角色名')
             ui.button('🔍', on_click=self._dialogue_apply_filter)
 
+        # 队列状态
+        with ui.row().classes('w-full items-center gap-2'):
+            self.queue_status = ui.label('队列状态: 空闲').classes('text-caption')
+            self.queue_progress = ui.linear_progress(value=0, show_value=False).classes('flex-1')
+
         # 对话表格
         self.dialogue_table = ui.table(
             columns=[
@@ -235,6 +267,7 @@ class TranslatorUI:
                 {'name': 'character', 'label': '角色', 'field': 'character', 'sortable': True},
                 {'name': 'original', 'label': '原文', 'field': 'original'},
                 {'name': 'translated', 'label': '译文', 'field': 'translated'},
+                {'name': 'status', 'label': '状态', 'field': 'status'},
                 {'name': 'action', 'label': '操作', 'field': 'action'},
             ],
             rows=[],
@@ -248,9 +281,19 @@ class TranslatorUI:
                     @change="$parent.$emit('update:dialogue', props.row)" />
             </q-td>
         ''')
+        self.dialogue_table.add_slot('body-cell-status', '''
+            <q-td :props="props">
+                <q-chip :color="props.row.status === '翻译中' ? 'orange' : (props.row.status === '完成' ? 'green' : 'grey')"
+                    text-color="white" dense size="sm">
+                    {{ props.row.status }}
+                </q-chip>
+            </q-td>
+        ''')
         self.dialogue_table.add_slot('body-cell-action', '''
             <q-td :props="props">
-                <q-btn flat dense color="primary" label="AI翻译" @click="$parent.$emit('translate_dialogue', props.row)" />
+                <q-btn flat dense color="primary" label="AI翻译"
+                    :disable="props.row.status === '翻译中' || props.row.status === '排队中'"
+                    @click="$parent.$emit('translate_dialogue', props.row)" />
             </q-td>
         ''')
 
@@ -560,24 +603,94 @@ class TranslatorUI:
             self._save_project()
 
     def _on_name_translate(self, e):
-        """AI翻译人名"""
+        """AI翻译人名 - 加入队列"""
         row = e.args
         if not self.translator:
             ui.notify('请先配置翻译器', type='warning')
             return
         if row and self.current_project:
-            try:
-                # 构建提示词，让人名翻译更有语境
-                prompt = f"将以下人名翻译成中文，只返回中文名，不要解释：{row['original']}"
-                translated = self.translator.translate_text(text=prompt)
-                # 清理翻译结果，只保留名字
-                translated = translated.strip().replace('"', '').replace("'", '')
-                self.current_project.char_dict[row['original']] = translated
-                self._save_project()
-                self._name_refresh()
-                ui.notify(f'翻译完成: {row["original"]} → {translated}', type='positive')
-            except Exception as e:
-                ui.notify(f'翻译失败: {str(e)}', type='negative')
+            # 生成唯一key
+            key = f"name_{row['original']}"
+            if key in self.translate_queue:
+                ui.notify('该条目已在队列中', type='warning')
+                return
+
+            # 加入队列
+            self.translate_queue[key] = {
+                'type': 'name',
+                'row': row,
+                'original': row['original'],
+                'status': '排队中'
+            }
+            self._update_queue_status()
+            self._process_next_in_queue()
+
+    def _do_name_translate(self, queue_item):
+        """执行人名翻译"""
+        row = queue_item['row']
+        try:
+            prompt = f"将以下人名翻译成中文，只返回中文名，不要解释：{row['original']}"
+            translated = self.translator.translate_text(text=prompt)
+            translated = translated.strip().replace('"', '').replace("'", '')
+            self.current_project.char_dict[row['original']] = translated
+            self._save_project()
+            self._name_refresh()
+            return True
+        except Exception as e:
+            ui.notify(f'翻译失败: {str(e)}', type='negative')
+            return False
+
+    def _update_queue_status(self):
+        """更新队列状态显示"""
+        if hasattr(self, 'queue_status'):
+            total = len(self.translate_queue)
+            translating = sum(1 for v in self.translate_queue.values() if v['status'] == '翻译中')
+            queued = sum(1 for v in self.translate_queue.values() if v['status'] == '排队中')
+            self.queue_status.text = f'队列状态: {translating}个翻译中, {queued}个排队'
+
+    def _process_next_in_queue(self):
+        """处理队列中的下一个任务"""
+        # 检查是否达到并发上限
+        if self.current_translating >= self.max_concurrent:
+            return
+
+        # 找到下一个排队中的任务
+        next_key = None
+        for key, item in self.translate_queue.items():
+            if item['status'] == '排队中':
+                next_key = key
+                break
+
+        if not next_key:
+            return
+
+        # 开始翻译
+        self.current_translating += 1
+        self.translate_queue[next_key]['status'] = '翻译中'
+        self._update_queue_status()
+
+        # 根据类型执行翻译
+        queue_item = self.translate_queue[next_key]
+        try:
+            if queue_item['type'] == 'name':
+                success = self._do_name_translate(queue_item)
+            elif queue_item['type'] == 'ui':
+                success = self._do_ui_translate(queue_item)
+            elif queue_item['type'] == 'dialogue':
+                success = self._do_dialogue_translate(queue_item)
+            else:
+                success = False
+        except Exception as e:
+            ui.notify(f'翻译失败: {str(e)}', type='negative')
+            success = False
+
+        # 移除已完成的任务
+        del self.translate_queue[next_key]
+        self.current_translating -= 1
+        self._update_queue_status()
+
+        # 处理下一个
+        self._process_next_in_queue()
 
     def _name_refresh(self):
         """刷新人名表格"""
@@ -598,10 +711,19 @@ class TranslatorUI:
 
         rows = []
         for i, (en, cn) in enumerate(page_items):
+            # 检查队列状态
+            key = f"name_{en}"
+            status = '待翻译'
+            if key in self.translate_queue:
+                status = self.translate_queue[key]['status']
+            elif cn and cn != en:
+                status = '完成'
+
             rows.append({
                 'index': start + i + 1,
                 'original': en,
                 'translated': cn,
+                'status': status,
                 'action': en  # 存储原始key用于操作
             })
 
@@ -648,7 +770,7 @@ class TranslatorUI:
                 self._save_project()
 
     def _on_ui_translate(self, e):
-        """AI翻译单条UI"""
+        """AI翻译单条UI - 加入队列"""
         row = e.args
         if not self.translator:
             ui.notify('请先配置翻译器', type='warning')
@@ -656,16 +778,38 @@ class TranslatorUI:
         if row and self.current_project:
             idx = row['action']
             if 0 <= idx < len(self.current_project.ui_texts):
-                item = self.current_project.ui_texts[idx]
-                try:
-                    translated = self.translator.translate_text(text=item['original_text'])
-                    item['translated_text'] = translated
-                    item['is_translated'] = True
-                    self._save_project()
-                    self._ui_refresh()
-                    ui.notify('翻译完成', type='positive')
-                except Exception as e:
-                    ui.notify(f'翻译失败: {str(e)}', type='negative')
+                # 生成唯一key
+                key = f"ui_{idx}"
+                if key in self.translate_queue:
+                    ui.notify('该条目已在队列中', type='warning')
+                    return
+
+                # 加入队列
+                self.translate_queue[key] = {
+                    'type': 'ui',
+                    'idx': idx,
+                    'original': self.current_project.ui_texts[idx]['original_text'],
+                    'status': '排队中'
+                }
+                self._update_queue_status()
+                self._process_next_in_queue()
+
+    def _do_ui_translate(self, queue_item):
+        """执行UI翻译"""
+        idx = queue_item['idx']
+        if 0 <= idx < len(self.current_project.ui_texts):
+            item = self.current_project.ui_texts[idx]
+            try:
+                translated = self.translator.translate_text(text=item['original_text'])
+                item['translated_text'] = translated
+                item['is_translated'] = True
+                self._save_project()
+                self._ui_refresh()
+                return True
+            except Exception as e:
+                ui.notify(f'翻译失败: {str(e)}', type='negative')
+                return False
+        return False
 
     def _ui_refresh(self):
         """刷新UI表格"""
@@ -686,11 +830,21 @@ class TranslatorUI:
 
         rows = []
         for i, d in enumerate(page_items):
+            idx = start + i
+            # 检查队列状态
+            key = f"ui_{idx}"
+            status = '待翻译'
+            if key in self.translate_queue:
+                status = self.translate_queue[key]['status']
+            elif d.get('is_translated', False):
+                status = '完成'
+
             rows.append({
-                'index': start + i + 1,
+                'index': idx + 1,
                 'original': d.get('original_text', ''),
                 'translated': d.get('translated_text', ''),
-                'action': start + i  # 存储索引用于操作
+                'status': status,
+                'action': idx  # 存储索引用于操作
             })
 
         self.ui_table.rows = rows
@@ -780,7 +934,7 @@ class TranslatorUI:
                 self._save_project()
 
     def _on_dialogue_translate(self, e):
-        """AI翻译单条对话"""
+        """AI翻译单条对话 - 加入队列"""
         row = e.args
         if not self.translator:
             ui.notify('请先配置翻译器', type='warning')
@@ -788,22 +942,44 @@ class TranslatorUI:
         if row and self.current_project:
             idx = row['action']
             if 0 <= idx < len(self.current_project.dialogues):
-                item = self.current_project.dialogues[idx]
-                try:
-                    translated = self.translator.translate_text(
-                        text=item['original_text'],
-                        character=item.get('character', ''),
-                        context_before=item.get('context_before', []),
-                        context_after=item.get('context_after', []),
-                        character_dict=self.current_project.char_dict
-                    )
-                    item['translated_text'] = translated
-                    item['is_translated'] = True
-                    self._save_project()
-                    self._dialogue_refresh()
-                    ui.notify('翻译完成', type='positive')
-                except Exception as e:
-                    ui.notify(f'翻译失败: {str(e)}', type='negative')
+                # 生成唯一key
+                key = f"dialogue_{idx}"
+                if key in self.translate_queue:
+                    ui.notify('该条目已在队列中', type='warning')
+                    return
+
+                # 加入队列
+                self.translate_queue[key] = {
+                    'type': 'dialogue',
+                    'idx': idx,
+                    'original': self.current_project.dialogues[idx]['original_text'],
+                    'status': '排队中'
+                }
+                self._update_queue_status()
+                self._process_next_in_queue()
+
+    def _do_dialogue_translate(self, queue_item):
+        """执行对话翻译"""
+        idx = queue_item['idx']
+        if 0 <= idx < len(self.current_project.dialogues):
+            item = self.current_project.dialogues[idx]
+            try:
+                translated = self.translator.translate_text(
+                    text=item['original_text'],
+                    character=item.get('character', ''),
+                    context_before=item.get('context_before', []),
+                    context_after=item.get('context_after', []),
+                    character_dict=self.current_project.char_dict
+                )
+                item['translated_text'] = translated
+                item['is_translated'] = True
+                self._save_project()
+                self._dialogue_refresh()
+                return True
+            except Exception as e:
+                ui.notify(f'翻译失败: {str(e)}', type='negative')
+                return False
+        return False
 
     def _dialogue_refresh(self):
         """刷新对话表格"""
@@ -838,12 +1014,22 @@ class TranslatorUI:
 
         rows = []
         for i, d in enumerate(page_items):
+            idx = start + i
+            # 检查队列状态
+            key = f"dialogue_{idx}"
+            status = '待翻译'
+            if key in self.translate_queue:
+                status = self.translate_queue[key]['status']
+            elif d.get('is_translated', False):
+                status = '完成'
+
             rows.append({
-                'index': start + i + 1,
+                'index': idx + 1,
                 'character': d.get('character', '') or '旁白',
                 'original': d.get('original_text', ''),
                 'translated': d.get('translated_text', ''),
-                'action': start + i
+                'status': status,
+                'action': idx
             })
 
         self.dialogue_table.rows = rows
