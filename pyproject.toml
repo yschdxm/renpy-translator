@@ -6,5 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "gradio>=6.18.0",
+    "nicegui>=3.13.0",
     "openai>=2.41.1",
 ]

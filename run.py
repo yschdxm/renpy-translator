@@ -1,4 +1,4 @@
-"""启动Ren'Py翻译工具"""
+"""启动Ren'Py翻译工具 - NiceGUI版本"""
 
 import sys
 import os
@@ -11,17 +11,19 @@ if sys.platform == "win32":
 # 添加源代码目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
-from main import create_ui
+from nicegui import ui
+from ui_nicegui import create_app
 
-if __name__ == "__main__":
-    print("启动Ren'Py游戏翻译工具...")
-    print("请确保已配置API接口")
-    print("访问地址: http://localhost:7860")
+# 创建应用
+create_app()
 
-    demo = create_ui()
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        share=False,
-        inbrowser=True,
-    )
+print("启动Ren'Py游戏翻译工具...")
+print("访问地址: http://localhost:8088")
+
+# 启动（不要放在 main guard 里）
+ui.run(
+    title="Ren'Py翻译工具",
+    port=8088,
+    language="zh-CN",
+    dark=True,
+)
