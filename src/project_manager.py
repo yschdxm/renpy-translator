@@ -16,21 +16,21 @@ class ProjectInfo:
     model_config_name: str
     total_dialogues: int = 0
     translated_dialogues: int = 0
-    total_ui_texts: int = 0
-    translated_ui: int = 0
+    total_strings: int = 0
+    translated_strings: int = 0
     updated_at: str = ""
 
     @property
     def progress_percent(self) -> float:
-        total = self.total_dialogues + self.total_ui_texts
-        translated = self.translated_dialogues + self.translated_ui
+        total = self.total_dialogues + self.total_strings
+        translated = self.translated_dialogues + self.translated_strings
         if total == 0:
             return 0
         return round(translated / total * 100, 1)
 
     @property
     def progress_text(self) -> str:
-        return f"{self.translated_dialogues}/{self.total_dialogues} 对话, {self.translated_ui}/{self.total_ui_texts} UI ({self.progress_percent}%)"
+        return f"{self.translated_dialogues}/{self.total_dialogues} 对话, {self.translated_strings}/{self.total_strings} 字符串 ({self.progress_percent}%)"
 
 
 @dataclass
@@ -39,6 +39,7 @@ class Project:
     name: str
     game_dir: str
     model_config_name: str = ""
+    work_dir: str = ""  # 工作目录路径
     dialogues: List[Dict[str, Any]] = field(default_factory=list)
     ui_texts: List[Dict[str, Any]] = field(default_factory=list)
     characters: List[Dict[str, Any]] = field(default_factory=list)
@@ -50,12 +51,12 @@ class Project:
     def get_stats(self) -> Dict[str, int]:
         """获取统计信息"""
         translated_dialogues = sum(1 for d in self.dialogues if d.get('is_translated', False))
-        translated_ui = sum(1 for u in self.ui_texts if u.get('is_translated', False))
+        translated_strings = sum(1 for u in self.ui_texts if u.get('is_translated', False))
         return {
             "total_dialogues": len(self.dialogues),
             "translated_dialogues": translated_dialogues,
-            "total_ui_texts": len(self.ui_texts),
-            "translated_ui": translated_ui,
+            "total_strings": len(self.ui_texts),
+            "translated_strings": translated_strings,
             "total_characters": len(self.characters)
         }
 
@@ -101,8 +102,8 @@ class ProjectManager:
                             model_config_name=data.get('model_config_name', ''),
                             total_dialogues=stats.get('total_dialogues', 0),
                             translated_dialogues=stats.get('translated_dialogues', 0),
-                            total_ui_texts=stats.get('total_ui_texts', 0),
-                            translated_ui=stats.get('translated_ui', 0),
+                            total_strings=stats.get('total_strings', 0),
+                            translated_strings=stats.get('translated_strings', 0),
                             updated_at=data.get('updated_at', '')
                         ))
                     except Exception as e:
@@ -242,8 +243,8 @@ class ProjectManager:
                 model_config_name=data.get('model_config_name', ''),
                 total_dialogues=stats.get('total_dialogues', 0),
                 translated_dialogues=stats.get('translated_dialogues', 0),
-                total_ui_texts=stats.get('total_ui_texts', 0),
-                translated_ui=stats.get('translated_ui', 0),
+                total_strings=stats.get('total_strings', 0),
+                translated_strings=stats.get('translated_strings', 0),
                 updated_at=data.get('updated_at', '')
             )
 

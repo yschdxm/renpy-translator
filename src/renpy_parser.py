@@ -45,6 +45,23 @@ class RenpyParser:
         r'^(\w+)\s+"((?:[^"\\]|\\.)*?)"\s+nvl_narrator',
     ]
 
+    # 代码关键字（这些不是角色名）
+    CODE_KEYWORDS = {
+        'textbutton', 'text', 'label', 'hbox', 'vbox', 'frame', 'bar', 'button',
+        'image', 'show', 'hide', 'scene', 'play', 'stop', 'queue', 'voice',
+        'with', 'pause', 'jump', 'call', 'return', 'menu', 'if', 'elif', 'else',
+        'while', 'for', 'pass', 'init', 'default', 'define', 'transform',
+        'screen', 'style', 'python', 'call', 'jump', 'return', 'menu',
+        'nvl', 'nvl_clear', 'nvl_narrator', 'nvl_mode', 'nvl_function',
+    }
+
+    # 变量占位符模式
+    VARIABLE_PATTERNS = [
+        r'^\[.*\]$',  # [variable]
+        r'^\{.*\}$',  # {variable}
+        r'^\$.*',     # $python_code
+    ]
+
     # 角色定义模式
     CHARACTER_PATTERNS = [
         # define e = Character("Eileen")
@@ -113,6 +130,11 @@ class RenpyParser:
                         # 角色对话
                         char_var = match.group(1)
                         text = match.group(2)
+
+                        # 过滤掉代码关键字
+                        if char_var.lower() in self.CODE_KEYWORDS:
+                            break
+
                         char_name = self.characters.get(char_var, CharacterInfo(char_var, char_var)).name
                     else:
                         # 旁白
@@ -122,6 +144,19 @@ class RenpyParser:
 
                     # 跳过空文本
                     if not text.strip():
+                        break
+
+                    # 过滤掉变量占位符
+                    is_variable = False
+                    for vp in self.VARIABLE_PATTERNS:
+                        if re.match(vp, text.strip()):
+                            is_variable = True
+                            break
+                    if is_variable:
+                        break
+
+                    # 过滤掉包含代码的文本
+                    if any(code in text for code in ['config.', 'gui.', 'style_', 'action ', 'Function(', 'Preference(']):
                         break
 
                     dialogue = DialogueLine(
@@ -174,15 +209,21 @@ class RenpyParser:
             with open(file_path, 'r', encoding='gbk', errors='ignore') as f:
                 content = f.read()
 
-        # 提取角色
+        # 判断是否是配置文件（screens.rpy, gui.rpy, options.rpy等）
+        file_name = Path(file_path).name.lower()
+        is_config_file = file_name in ['screens.rpy', 'gui.rpy', 'options.rpy', 'common.rpy']
+
+        # 提取角色（所有文件都需要）
         characters = self.extract_characters(content, file_path)
 
-        # 提取对话
-        dialogues = self.extract_dialogue(content, file_path)
+        # 提取对话（配置文件不提取对话）
+        dialogues = []
+        if not is_config_file:
+            dialogues = self.extract_dialogue(content, file_path)
 
-        # 提取UI文字（仅对screens.rpy等界面文件）
+        # 提取UI文字（配置文件或用户要求时提取）
         ui_texts = []
-        if extract_ui or 'screens.rpy' in file_path or 'gui.rpy' in file_path:
+        if extract_ui or is_config_file:
             ui_texts = self.extract_ui_text(content, file_path)
 
         return {
@@ -222,11 +263,24 @@ class RenpyParser:
         all_ui_texts = []
         extracted_files = 0
 
-        # 需要排除的目录（引擎和库文件）
-        exclude_dirs = {'renpy', 'lib', 'saves', 'cache', 'audio', 'images', 'fonts',
-                       'video1', 'video2', 'video3', 'video_demo', 'tl'}
+        # 需要排除的目录（通用规则）
+        # 1. Ren'Py 引擎目录
+        # 2. 资源目录（音频、图片、视频、字体）
+        # 3. 缓存和临时目录
+        # 4. 翻译目录
+        exclude_dirs = {
+            'renpy',           # Ren'Py 引擎
+            'lib',             # 库文件
+            'saves',           # 存档
+            'cache',           # 缓存
+            'tl',              # 翻译目录
+            'audio', 'sound',  # 音频
+            'images', 'image', # 图片
+            'fonts', 'font',   # 字体
+            'video', 'movies', # 视频
+        }
 
-        # 自动解包.rpa文件（解包到工作目录）
+        # 自动解包.rpa文件（解包到 game/ 目录）
         if extract_rpa:
             rpa_files = list(game_path.glob('*.rpa')) + list((game_path / 'game').glob('*.rpa'))
             if rpa_files:
@@ -234,9 +288,9 @@ class RenpyParser:
                 extractor = RPAExtractor()
                 for rpa_file in rpa_files:
                     try:
-                        # 解包到工作目录
-                        output_dir = work_path / 'game' / rpa_file.stem
-                        print(f"解包到: {output_dir}")
+                        # 解包到 game/ 目录（rpa 内部已有目录结构）
+                        output_dir = game_path / 'game'
+                        print(f"解包 {rpa_file.name} 到: {output_dir}")
                         extracted = extractor.extract_rpa(str(rpa_file), str(output_dir))
                         if extracted:
                             print(f"成功解包 {len(extracted)} 个文件")
@@ -349,7 +403,7 @@ class RenpyParser:
 
         # 尝试使用unrpyc反编译
         try:
-            # 方法1: 使用unrpyc命令行工具
+            # 使用unrpyc命令行工具
             result = subprocess.run(
                 ['unrpyc', str(rpyc_path)],
                 capture_output=True,
@@ -360,51 +414,6 @@ class RenpyParser:
                 return str(rpy_path)
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
-
-        # 方法2: 使用Python直接解析（简化版）
-        try:
-            with open(rpyc_path, 'rb') as f:
-                data = f.read()
-
-            # 检查文件头
-            if data[:4] != b'RENP':
-                return None
-
-            # 提取Python版本信息
-            version = struct.unpack('<I', data[4:8])[0]
-
-            # 简单的文本提取（用于基本对话）
-            # 注意：这是一个简化的实现，可能不适用于所有情况
-            text_data = data[8:]
-
-            # 尝试提取UTF-8字符串
-            strings = []
-            current = b''
-            for byte in text_data:
-                if 32 <= byte <= 126 or byte >= 192:  # 可打印字符或UTF-8开始
-                    current += bytes([byte])
-                else:
-                    if len(current) > 5:  # 只保留较长的字符串
-                        try:
-                            s = current.decode('utf-8', errors='ignore')
-                            if s.strip():
-                                strings.append(s)
-                        except:
-                            pass
-                    current = b''
-
-            # 生成.rpy文件
-            if strings:
-                with open(rpy_path, 'w', encoding='utf-8') as f:
-                    f.write("# 从.rpyc文件自动提取\n")
-                    f.write("# 注意：这是简化提取，可能不完整\n\n")
-                    for s in strings:
-                        if any(c in s for c in ['"', "'", '(', ')', '=']):
-                            f.write(f"{s}\n")
-                return str(rpy_path)
-
-        except Exception as e:
-            print(f"反编译失败: {e}")
 
         return None
 

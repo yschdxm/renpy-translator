@@ -20,6 +20,7 @@ class ModelConfig:
     context_lines: int = 3
     timeout: int = 30
     max_context: int = 8  # 模型最大上下文（单位K）
+    sdk_path: str = ""  # Ren'Py SDK 路径
 
 
 class ConfigManager:

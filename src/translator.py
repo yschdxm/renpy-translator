@@ -194,13 +194,20 @@ class AITranslator:
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=50,
+                max_tokens=self.config.max_tokens,
                 timeout=self.config.timeout
             )
 
-            result = response.choices[0].message.content.strip()
-            # 清理结果，只保留名字
-            result = result.replace('"', '').replace("'", '').replace('。', '')
+            if debug:
+                print(f'[人名翻译] 响应: {response}')
+
+            result = response.choices[0].message.content
+            if result:
+                result = result.strip()
+                # 清理结果，只保留名字
+                result = result.replace('"', '').replace("'", '').replace('。', '')
+            else:
+                result = ''
 
             if debug:
                 print(f'[人名翻译] 翻译结果: {result}')
@@ -208,6 +215,8 @@ class AITranslator:
             return result
 
         except Exception as e:
+            if debug:
+                print(f'[人名翻译] 异常: {e}')
             raise Exception(f"人名翻译失败: {str(e)}")
 
     def translate_ui(self, text: str, debug: bool = False) -> str:
@@ -218,15 +227,23 @@ class AITranslator:
         if not text.strip():
             return ""
 
-        system_prompt = """你是一个游戏UI翻译专家。请将游戏界面文字翻译成简体中文。
+        system_prompt = """你是一个游戏字符串翻译专家。请将以下内容翻译成简体中文。
 
-要求：
-- 简洁明了，符合中文UI习惯
-- 按钮文字要简短
+这些字符串可能包含：
+- 菜单选项（如 "Start Game"、"Load Game"）
+- 按钮文字（如 "OK"、"Cancel"、"Back"）
+- 提示文字（如 "Are you sure?"、"Saving..."）
+- 任务描述（如 "Go to the market"、"Talk to the guard"）
+- 物品名称（如 "Health Potion"、"Sword"）
+
+翻译要求：
+- 简洁明了，符合中文游戏用语习惯
+- 按钮和菜单文字要简短
 - 保持专业术语的一致性
+- 保留原意但可以适当本地化
 - 只返回翻译结果，不要解释"""
 
-        user_prompt = f"请翻译以下游戏界面文字：\n{text}"
+        user_prompt = f"请翻译：\n{text}"
 
         # 打印提示词到日志
         if debug:
@@ -244,7 +261,7 @@ class AITranslator:
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=200,
+                max_tokens=self.config.max_tokens,
                 timeout=self.config.timeout
             )
 
