@@ -930,12 +930,6 @@ class TranslatorUI:
         elif translate_type == 'dialogue':
             self._dialogue_refresh()
 
-        # 显示结果通知
-        if stopped:
-            ui.notify(f'翻译已停止！成功: {success}/{total}', type='warning')
-        else:
-            ui.notify(f'批量翻译完成！成功: {success}/{total}', type='positive')
-
         # 重置状态
         if hasattr(self, 'queue_status'):
             self.queue_status.text = '队列状态: 空闲'
