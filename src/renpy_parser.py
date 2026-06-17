@@ -195,11 +195,28 @@ class RenpyParser:
     def parse_directory(self, game_dir: str,
                        include_ui: bool = False,
                        extract_rpa: bool = True,
-                       decompile_rpyc: bool = True) -> dict:
-        """解析整个游戏目录"""
+                       decompile_rpyc: bool = True,
+                       work_dir: str = None) -> dict:
+        """解析整个游戏目录
+
+        Args:
+            game_dir: 游戏目录路径
+            include_ui: 是否包含UI文字
+            extract_rpa: 是否解包rpa文件
+            decompile_rpyc: 是否反编译rpyc文件
+            work_dir: 工作目录（用于存放临时文件，不修改原游戏）
+        """
         from rpa_extractor import RPAExtractor
 
         game_path = Path(game_dir)
+
+        # 如果指定了工作目录，使用工作目录；否则使用游戏目录
+        if work_dir:
+            work_path = Path(work_dir)
+            work_path.mkdir(parents=True, exist_ok=True)
+        else:
+            work_path = game_path
+
         all_characters = []
         all_dialogues = []
         all_ui_texts = []
@@ -209,7 +226,7 @@ class RenpyParser:
         exclude_dirs = {'renpy', 'lib', 'saves', 'cache', 'audio', 'images', 'fonts',
                        'video1', 'video2', 'video3', 'video_demo', 'tl'}
 
-        # 自动解包.rpa文件
+        # 自动解包.rpa文件（解包到工作目录）
         if extract_rpa:
             rpa_files = list(game_path.glob('*.rpa')) + list((game_path / 'game').glob('*.rpa'))
             if rpa_files:
@@ -217,7 +234,8 @@ class RenpyParser:
                 extractor = RPAExtractor()
                 for rpa_file in rpa_files:
                     try:
-                        output_dir = game_path / 'game' / rpa_file.stem
+                        # 解包到工作目录
+                        output_dir = work_path / 'game' / rpa_file.stem
                         print(f"解包到: {output_dir}")
                         extracted = extractor.extract_rpa(str(rpa_file), str(output_dir))
                         if extracted:
@@ -228,31 +246,53 @@ class RenpyParser:
                     except Exception as e:
                         print(f"解包 {rpa_file.name} 失败: {e}")
 
-        # 自动反编译.rpyc文件
+        # 自动反编译.rpyc文件（反编译到工作目录）
         if decompile_rpyc:
-            rpyc_files = list((game_path / 'game').rglob('*.rpyc'))
+            # 先检查工作目录中的rpyc文件
+            rpyc_files = list((work_path / 'game').rglob('*.rpyc'))
+            # 也检查原游戏目录中的rpyc文件
+            rpyc_files.extend(list((game_path / 'game').rglob('*.rpyc')))
+            # 去重
+            rpyc_files = list(set(rpyc_files))
+
             if rpyc_files:
                 print(f"找到 {len(rpyc_files)} 个.rpyc文件，正在反编译...")
                 for rpyc_file in rpyc_files:
                     try:
-                        self._decompile_rpyc(str(rpyc_file))
+                        # 反编译到工作目录
+                        self._decompile_rpyc(str(rpyc_file), str(work_path))
                     except Exception as e:
                         print(f"反编译 {rpyc_file.name} 失败: {e}")
 
-        # 查找所有.rpy文件
+        # 查找所有.rpy文件（优先使用工作目录中的文件）
+        rpy_files = []
+
+        # 先搜索工作目录
+        work_game_subdir = work_path / 'game'
+        if work_game_subdir.exists():
+            for rpy_file in work_game_subdir.rglob('*.rpy'):
+                parts = rpy_file.relative_to(work_path).parts
+                if any(part in exclude_dirs for part in parts):
+                    continue
+                rpy_files.append(rpy_file)
+
+        # 再搜索原游戏目录（排除已在工作目录中找到的文件）
         game_subdir = game_path / 'game'
         if game_subdir.exists():
-            search_path = game_subdir
-        else:
-            search_path = game_path
+            for rpy_file in game_subdir.rglob('*.rpy'):
+                # 检查是否已存在于工作目录
+                if work_path != game_path:
+                    try:
+                        relative = rpy_file.relative_to(game_path)
+                        if (work_path / relative).exists():
+                            continue
+                    except:
+                        pass
 
-        rpy_files = []
-        for rpy_file in search_path.rglob('*.rpy'):
-            # 检查是否在排除目录中
-            parts = rpy_file.relative_to(game_path).parts
-            if any(part in exclude_dirs for part in parts):
-                continue
-            rpy_files.append(rpy_file)
+                parts = rpy_file.relative_to(game_path).parts
+                if any(part in exclude_dirs for part in parts):
+                    continue
+                rpy_files.append(rpy_file)
 
         print(f"找到 {len(rpy_files)} 个.rpy文件")
 
@@ -272,10 +312,36 @@ class RenpyParser:
             'extracted_rpa': extracted_files
         }
 
-    def _decompile_rpyc(self, rpyc_path: str) -> Optional[str]:
-        """反编译.rpyc文件为.rpy"""
+    def _decompile_rpyc(self, rpyc_path: str, output_dir: str = None) -> Optional[str]:
+        """反编译.rpyc文件为.rpy
+
+        Args:
+            rpyc_path: rpyc文件路径
+            output_dir: 输出目录（如果指定，将rpy文件输出到该目录）
+        """
         rpyc_path = Path(rpyc_path)
-        rpy_path = rpyc_path.with_suffix('.rpy')
+
+        # 确定输出路径
+        if output_dir:
+            output_path = Path(output_dir)
+            # 保持相对路径结构
+            try:
+                # 尝试从游戏目录计算相对路径
+                # 假设rpyc_path包含game目录
+                parts = rpyc_path.parts
+                if 'game' in parts:
+                    game_idx = parts.index('game')
+                    relative = Path(*parts[game_idx:])
+                    rpy_path = output_path / relative.with_suffix('.rpy')
+                else:
+                    rpy_path = output_path / 'game' / rpyc_path.with_suffix('.rpy').name
+            except:
+                rpy_path = output_path / rpyc_path.with_suffix('.rpy').name
+        else:
+            rpy_path = rpyc_path.with_suffix('.rpy')
+
+        # 确保输出目录存在
+        rpy_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 如果.rpy文件已存在，跳过
         if rpy_path.exists():

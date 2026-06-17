@@ -3,6 +3,7 @@
 import os
 import sys
 import asyncio
+from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
 from nicegui import ui
 
@@ -101,6 +102,7 @@ class TranslatorUI:
             tab_analysis = ui.tab('人物分析', icon='psychology')
             tab_ui = ui.tab('UI翻译', icon='web')
             tab_dialogue = ui.tab('对话翻译', icon='chat')
+            tab_export = ui.tab('导出游戏', icon='folder_zip')
             tab_config = ui.tab('模型配置', icon='settings')
 
         with ui.tab_panels(tabs, value='人名翻译').classes('w-full'):
@@ -119,6 +121,10 @@ class TranslatorUI:
             # 对话翻译
             with ui.tab_panel('对话翻译'):
                 self._create_dialogue_panel()
+
+            # 导出游戏
+            with ui.tab_panel('导出游戏'):
+                self._create_export_panel()
 
             # 模型配置
             with ui.tab_panel('模型配置'):
@@ -453,7 +459,16 @@ class TranslatorUI:
         """在线程池中创建项目"""
         try:
             project = self.project_manager.create_project(name, game_dir, model or '')
-            result = self.parser.parse_directory(game_dir, extract_rpa=True, decompile_rpyc=True)
+
+            # 创建工作目录（在项目目录中）
+            work_dir = str(self.project_manager._get_project_dir(name) / 'work')
+
+            result = self.parser.parse_directory(
+                game_dir,
+                extract_rpa=True,
+                decompile_rpyc=True,
+                work_dir=work_dir
+            )
 
             project.dialogues = [self._dialogue_to_dict(d) for d in result['dialogues']]
             project.ui_texts = [self._dialogue_to_dict(d) for d in result['ui_texts']]
@@ -515,6 +530,7 @@ class TranslatorUI:
         self._refresh_analysis()
         self._ui_refresh()
         self._dialogue_refresh()
+        self._refresh_export_stats()
         self.status_label.text = f'当前项目: {name}'
 
         ui.notify(f'已打开项目: {name}', type='positive')
@@ -744,14 +760,15 @@ class TranslatorUI:
     def _do_name_translate(self, queue_item):
         """执行人名翻译（线程池中执行）"""
         row = queue_item['row']
+        prompt = f"将以下人名翻译成中文，只返回中文名，不要解释：{row['original']}"
         try:
-            prompt = f"将以下人名翻译成中文，只返回中文名，不要解释：{row['original']}"
             translated = self.translator.translate_text(text=prompt)
             translated = translated.strip().replace('"', '').replace("'", '')
             self.current_project.char_dict[row['original']] = translated
             return True
         except Exception as e:
-            print(f'翻译失败: {e}')
+            print(f'❌ 人名翻译失败: {e}')
+            print(f'📝 提示词: {prompt}')
             return False
 
     def _update_queue_status(self):
@@ -904,8 +921,8 @@ class TranslatorUI:
                 print(f'❌ 翻译失败: {e}')
                 break
 
-        # 保存项目
-        self._save_project()
+        # 保存项目（异步任务中不显示通知）
+        self._save_project(show_notify=False)
 
         # 刷新UI
         if translate_type == 'ui':
@@ -948,7 +965,7 @@ class TranslatorUI:
             status = '待翻译'
             if key in self.translate_queue:
                 status = self.translate_queue[key]['status']
-            elif cn and cn != en:
+            elif cn and cn.strip():  # 只判断是否有文字，不判断是否与原文相同
                 status = '完成'
 
             rows.append({
@@ -1031,13 +1048,15 @@ class TranslatorUI:
         idx = queue_item['idx']
         if 0 <= idx < len(self.current_project.ui_texts):
             item = self.current_project.ui_texts[idx]
+            prompt = item['original_text']
             try:
-                translated = self.translator.translate_text(text=item['original_text'])
+                translated = self.translator.translate_text(text=prompt)
                 item['translated_text'] = translated
                 item['is_translated'] = True
                 return True
             except Exception as e:
-                print(f'翻译失败: {e}')
+                print(f'❌ UI翻译失败: {e}')
+                print(f'📝 原文: {prompt}')
                 return False
         return False
 
@@ -1226,10 +1245,12 @@ class TranslatorUI:
         idx = queue_item['idx']
         if 0 <= idx < len(self.current_project.dialogues):
             item = self.current_project.dialogues[idx]
+            prompt_text = item['original_text']
+            character = item.get('character', '')
             try:
                 translated = self.translator.translate_text(
-                    text=item['original_text'],
-                    character=item.get('character', ''),
+                    text=prompt_text,
+                    character=character,
                     context_before=item.get('context_before', []),
                     context_after=item.get('context_after', []),
                     character_dict=self.current_project.char_dict
@@ -1238,7 +1259,9 @@ class TranslatorUI:
                 item['is_translated'] = True
                 return True
             except Exception as e:
-                print(f'翻译失败: {e}')
+                print(f'❌ 对话翻译失败: {e}')
+                print(f'📝 角色: {character}')
+                print(f'📝 原文: {prompt_text}')
                 return False
         return False
 
@@ -1335,10 +1358,10 @@ class TranslatorUI:
         if not self.current_project:
             return False, '请先打开项目'
 
-        # 检查人名翻译
+        # 检查人名翻译（只判断是否有文字，不判断是否与原文相同）
         char_dict = self.current_project.char_dict
         untranslated_names = [k for k, v in char_dict.items()
-                            if k != '__profiles__' and (not v or v == k)]
+                            if k != '__profiles__' and (not v or not v.strip())]
         if untranslated_names:
             return False, f'请先完成人名翻译（还有 {len(untranslated_names)} 个未翻译）'
 
@@ -1378,6 +1401,616 @@ class TranslatorUI:
 
         # 异步执行批量翻译
         asyncio.create_task(self._async_batch_translate('dialogue', to_translate))
+
+    # ========== 导出游戏 ==========
+
+    def _create_export_panel(self):
+        """创建导出游戏面板"""
+        ui.label('📦 导出翻译后的游戏').classes('text-h5')
+        ui.label('将翻译后的游戏导出为独立目录，可直接运行，不影响原版游戏').classes('text-body1 text-grey')
+
+        ui.separator()
+
+        # 统计信息
+        with ui.card().classes('w-full'):
+            self.export_stats = ui.label('请先打开项目').classes('text-subtitle1')
+
+            # 翻译进度统计
+            with ui.row().classes('gap-8'):
+                self.export_dialogue_stats = ui.label('对话翻译: -').classes('text-body1')
+                self.export_ui_stats = ui.label('UI翻译: -').classes('text-body1')
+                self.export_name_stats = ui.label('人名翻译: -').classes('text-body1')
+
+        ui.separator()
+
+        # 导出选项
+        with ui.card().classes('w-full'):
+            ui.label('导出选项').classes('text-h6')
+
+            self.export_include_ui = ui.checkbox('包含UI翻译', value=True)
+            self.export_include_dialogue = ui.checkbox('包含对话翻译', value=True)
+
+        ui.separator()
+
+        # 导出按钮
+        with ui.row().classes('gap-2'):
+            self.export_btn = ui.button('📦 开始导出', color='positive',
+                on_click=self._export_game).classes('px-8')
+            ui.button('🔄 刷新统计', on_click=self._refresh_export_stats)
+
+        # 导出日志
+        ui.separator()
+        ui.label('导出日志').classes('text-subtitle1')
+        self.export_log = ui.log().classes('w-full h-64')
+
+    def _refresh_export_stats(self):
+        """刷新导出统计"""
+        if not self.current_project:
+            return
+
+        dialogues = self.current_project.dialogues
+        ui_texts = self.current_project.ui_texts
+        char_dict = self.current_project.char_dict
+
+        # 对话翻译统计
+        dialogue_total = len(dialogues)
+        dialogue_translated = sum(1 for d in dialogues if d.get('is_translated', False))
+        self.export_dialogue_stats.text = f'对话翻译: {dialogue_translated}/{dialogue_total}'
+
+        # UI翻译统计
+        ui_total = len(ui_texts)
+        ui_translated = sum(1 for u in ui_texts if u.get('is_translated', False))
+        self.export_ui_stats.text = f'UI翻译: {ui_translated}/{ui_total}'
+
+        # 人名翻译统计
+        name_total = len([k for k in char_dict.keys() if not k.startswith('__')])
+        name_translated = len([k for k, v in char_dict.items()
+                              if not k.startswith('__') and v and v.strip()])
+        self.export_name_stats.text = f'人名翻译: {name_translated}/{name_total}'
+
+        # 总体状态
+        total = dialogue_total + ui_total + name_total
+        translated = dialogue_translated + ui_translated + name_translated
+        percent = (translated / total * 100) if total > 0 else 0
+
+        self.export_stats.text = f'📊 总体进度: {translated}/{total} ({percent:.1f}%)'
+
+    def _export_game(self):
+        """导出翻译后的游戏"""
+        if not self.current_project:
+            ui.notify('请先打开项目', type='warning')
+            return
+
+        # 检查是否有翻译内容
+        translated_count = sum(1 for d in self.current_project.dialogues if d.get('is_translated', False))
+        if translated_count == 0:
+            ui.notify('没有已翻译的内容可导出', type='warning')
+            return
+
+        # 禁用按钮
+        self.export_btn.disable()
+        self.export_btn.text = '导出中...'
+
+        # 异步执行导出
+        asyncio.create_task(self._async_export_game())
+
+    async def _async_export_game(self):
+        """异步导出游戏"""
+        loop = asyncio.get_event_loop()
+        log_queue = Queue()  # 线程安全队列
+
+        try:
+            # 清空日志
+            self.export_log.clear()
+            self.export_log.push('开始导出游戏...')
+
+            # 启动定时器处理日志队列
+            async def process_log_queue():
+                while True:
+                    # 非阻塞地获取日志
+                    try:
+                        msg = log_queue.get_nowait()
+                        if msg == '__DONE__':
+                            break
+                        self.export_log.push(msg)
+                    except:
+                        pass
+                    await asyncio.sleep(0.1)  # 每100ms检查一次
+
+            # 启动日志处理任务
+            log_task = asyncio.create_task(process_log_queue())
+
+            # 在线程池中执行导出
+            result = await loop.run_in_executor(
+                self.executor,
+                lambda: self._export_game_thread(log_queue)
+            )
+
+            # 等待日志处理完成
+            await log_task
+
+            if result['success']:
+                self.export_log.push('')
+                self.export_log.push('✅ 导出完成！')
+            else:
+                self.export_log.push(f'❌ 导出失败: {result["message"]}')
+
+        except Exception as e:
+            self.export_log.push(f'❌ 导出异常: {str(e)}')
+
+        finally:
+            # 恢复按钮
+            self.export_btn.enable()
+            self.export_btn.text = '📦 开始导出'
+
+    def _export_game_thread(self, log_queue=None):
+        """在线程池中执行导出"""
+        import shutil
+        from pathlib import Path
+        import re
+
+        def log(msg):
+            """输出日志到队列"""
+            if log_queue:
+                log_queue.put(msg)
+
+        try:
+            game_dir = Path(self.current_project.game_dir)
+            project_name = self.current_project.name
+
+            log(f'📁 原版游戏目录: {game_dir}')
+
+            # 统计翻译数量
+            total_dialogues = len(self.current_project.dialogues)
+            translated_dialogues = sum(1 for d in self.current_project.dialogues if d.get('is_translated', False))
+            log(f'📊 翻译进度: {translated_dialogues}/{total_dialogues}')
+
+            # 创建导出目录名
+            export_dir = game_dir.parent / f"{game_dir.name}_zh"
+
+            # 如果导出目录已存在，添加数字后缀
+            if export_dir.exists():
+                i = 1
+                while export_dir.exists():
+                    export_dir = game_dir.parent / f"{game_dir.name}_zh_{i}"
+                    i += 1
+
+            log(f'📦 导出目录: {export_dir}')
+
+            # 复制游戏目录
+            log('⏳ 正在复制游戏目录...')
+            shutil.copytree(game_dir, export_dir)
+            log('✅ 游戏目录复制完成')
+
+            # 创建翻译目录
+            tl_dir = export_dir / "game" / "tl" / "chinese"
+            tl_dir.mkdir(parents=True, exist_ok=True)
+            log(f'📂 翻译目录: {tl_dir}')
+
+            # 按文件分组翻译（排除配置文件）
+            config_files = {'gui.rpy', 'screens.rpy', 'options.rpy', 'gui.rpyc', 'screens.rpyc', 'options.rpyc'}
+            file_translations = {}
+            for d in self.current_project.dialogues:
+                if d.get('is_translated', False) and d.get('translated_text'):
+                    fp = d.get('file_path', '')
+                    # 排除配置文件
+                    if Path(fp).name in config_files:
+                        continue
+                    if fp not in file_translations:
+                        file_translations[fp] = []
+                    file_translations[fp].append(d)
+
+            log(f'📝 需要处理的文件数: {len(file_translations)}')
+            log('')
+
+            # 生成翻译文件（使用Ren'Py标准格式）
+            translated_files = 0
+
+            # 按源文件分组生成翻译文件
+            for file_path, dialogues in file_translations.items():
+                try:
+                    original_file = Path(file_path)
+                    log(f'处理文件: {original_file.name}')
+
+                    # 计算相对路径
+                    relative_path = None
+                    try:
+                        relative_path = original_file.relative_to(game_dir)
+                    except ValueError:
+                        parts = original_file.parts
+                        if 'game' in parts:
+                            game_idx = parts.index('game')
+                            relative_path = Path(*parts[game_idx:])
+                        else:
+                            log(f'  ⚠️ 路径处理失败')
+                            continue
+
+                    # 生成翻译文件内容（Ren'Py标准格式）
+                    tl_content = []
+                    tl_content.append(f'# Translation file for {relative_path}\n')
+                    tl_content.append(f'# Generated by Ren\'Py Translator\n\n')
+
+                    # 按行号排序对话
+                    sorted_dialogues = sorted(dialogues, key=lambda d: d.get('line_number', 0))
+
+                    for d in sorted_dialogues:
+                        original_text = d.get('original_text', '').replace('"', '\\"')
+                        translated_text = d.get('translated_text', '').replace('"', '\\"')
+                        line_number = d.get('line_number', 0)
+                        character = d.get('character', '')
+
+                        if not original_text or not translated_text:
+                            continue
+
+                        # 生成翻译块（Ren'Py格式）
+                        tl_content.append(f'translate chinese {relative_path.stem}_{line_number}:\n')
+                        tl_content.append(f'    # {relative_path}:{line_number}\n')
+                        if character:
+                            tl_content.append(f'    # {character}\n')
+                        tl_content.append(f'    old "{original_text}"\n')
+                        tl_content.append(f'    new "{translated_text}"\n\n')
+
+                    # 写入翻译文件
+                    tl_file = tl_dir / relative_path.with_suffix('.rpy')
+                    tl_file.parent.mkdir(parents=True, exist_ok=True)
+
+                    with open(tl_file, 'w', encoding='utf-8') as f:
+                        f.writelines(tl_content)
+
+                    translated_files += 1
+                    log(f'✅ {relative_path} ({len(dialogues)}条)')
+
+                except Exception as e:
+                    log(f'❌ {Path(file_path).name}: {e}')
+
+            # 添加语言选择界面
+            log('📝 添加语言选择界面...')
+            self._add_language_selector(export_dir, log)
+
+            # 添加中文字体支持
+            log('📝 添加中文字体支持...')
+            self._add_chinese_font_support(export_dir, log)
+
+            # 配置gui.rpy使用中文字体
+            log('📝 配置中文字体...')
+            self._configure_chinese_font(export_dir, log)
+
+            # 添加UI文字翻译
+            log('📝 添加UI翻译...')
+            self._add_ui_translations(export_dir, log)
+
+            log('')
+            log('========== 导出完成 ==========')
+            log(f'📁 导出目录: {export_dir}')
+            log(f'📄 翻译文件数: {translated_files}')
+            log(f'💬 翻译对话数: {sum(len(d) for d in file_translations.values())}')
+
+            # 发送完成信号
+            if log_queue:
+                log_queue.put('__DONE__')
+
+            return {
+                'success': True,
+                'message': f'导出目录: {export_dir}\n翻译文件数: {translated_files}\n翻译对话数: {sum(len(d) for d in file_translations.values())}'
+            }
+
+        except Exception as e:
+            log(f'❌ 导出异常: {str(e)}')
+            # 发送完成信号
+            if log_queue:
+                log_queue.put('__DONE__')
+            return {
+                'success': False,
+                'message': str(e)
+            }
+
+    def _add_language_selector(self, export_dir, log):
+        """添加语言选择界面（在preferences屏幕中）"""
+        from pathlib import Path
+        import shutil
+
+        # 1. 先从工作目录或原游戏目录找到原始的screens.rpy
+        work_dir = self.project_manager._get_project_dir(self.current_project.name) / 'work'
+        game_dir = Path(self.current_project.game_dir)
+
+        # 查找原始screens.rpy
+        source_file = None
+        possible_sources = [
+            work_dir / 'game' / 'scripts' / 'screens.rpy',
+            work_dir / 'game' / 'screens.rpy',
+            game_dir / 'game' / 'scripts' / 'screens.rpy',
+            game_dir / 'game' / 'screens.rpy',
+        ]
+
+        for path in possible_sources:
+            if path.exists():
+                source_file = path
+                break
+
+        if not source_file:
+            log('  ❌ 找不到原始screens.rpy，无法添加语言选择')
+            return
+
+        log(f'  找到原始screens.rpy: {source_file}')
+
+        # 2. 复制到导出目录（覆盖已有的，确保是原始版本）
+        target_file = export_dir / 'game' / 'scripts' / 'screens.rpy'
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target_file)
+        log(f'  已复制到导出目录: {target_file}')
+
+        # 3. 读取导出目录中的文件
+        with open(target_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # 4. 检查是否已有语言选择
+        if 'Language("chinese")' in content:
+            log('  ✅ 语言选择已存在')
+            return
+
+        # 5. 找到 "null height (4 * gui.pref_spacing)" 这一行
+        # 这是第一个hbox结束的标志，在它之前插入语言选择
+        target_line = '            null height (4 * gui.pref_spacing)'
+
+        if target_line not in content:
+            log('  ⚠️ 未找到合适的插入位置')
+            return
+
+        # 6. 构建语言选择代码
+        language_block = '''            vbox:
+                style_prefix "radio"
+                label _("Language")
+                textbutton "English" action Language(None)
+                textbutton "中文" action Language("chinese")
+
+'''
+
+        # 7. 在目标行之前插入语言选择
+        content = content.replace(target_line, language_block + target_line)
+
+        # 8. 写入修改后的文件
+        with open(target_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        log('  ✅ 已在preferences中添加语言选择')
+
+        # 检查是否已有语言选择
+        if 'Language("chinese")' in content:
+            log('  ✅ 语言选择界面已存在')
+            return
+
+        # 在preferences屏幕中添加语言选择
+        if 'screen preferences():' in content:
+            # 在文件末尾添加语言选择屏幕
+            language_screen = """
+
+# 语言选择屏幕（由翻译工具添加）
+screen language_selector():
+    tag menu
+    use preferences
+    vbox:
+        style_prefix "radio"
+        xalign 0.5
+        yalign 0.5
+        spacing 20
+        label _("Language")
+        textbutton "English" action Language(None)
+        textbutton "中文" action Language("chinese")
+"""
+            content += language_screen
+
+            # 在preferences屏幕中添加语言按钮
+            # 查找 "Game Menu" 或类似的位置
+            if 'textbutton _("Preferences")' in content:
+                content = content.replace(
+                    'textbutton _("Preferences")',
+                    'textbutton _("Preferences")\n                    textbutton _("Language") action Show("language_selector")'
+                )
+                log('  ✅ 已添加语言选择按钮到主菜单')
+            elif 'textbutton _("Preferences") action Show("preferences")' in content:
+                content = content.replace(
+                    'textbutton _("Preferences") action Show("preferences")',
+                    'textbutton _("Preferences") action Show("preferences")\n                    textbutton _("Language") action Show("language_selector")'
+                )
+                log('  ✅ 已添加语言选择按钮到主菜单')
+            else:
+                log('  ⚠️ 未找到主菜单按钮位置，但已添加语言选择屏幕')
+
+            # 写入修改后的文件
+            with open(target_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            log('  ✅ 已添加语言选择界面')
+        else:
+            log('  ⚠️ 未找到preferences屏幕')
+
+    def _add_chinese_font_support(self, export_dir, log):
+        """添加中文字体支持"""
+        from pathlib import Path
+        import shutil
+
+        # 检查是否有中文字体
+        fonts_dir = export_dir / 'game' / 'fonts'
+        fonts_dir.mkdir(exist_ok=True)
+
+        # 常见中文字体文件名
+        chinese_fonts = [
+            'NotoSansCJK-Regular.ttc',
+            'NotoSansSC-Regular.otf',
+            'SourceHanSansCN-Regular.otf',
+            'WenQuanYiMicroHei.ttf',
+            'msyh.ttc',
+            'simsun.ttc',
+        ]
+
+        # 检查是否已有中文字体
+        existing_fonts = []
+        for font in chinese_fonts:
+            if (fonts_dir / font).exists():
+                existing_fonts.append(font)
+
+        if existing_fonts:
+            log(f'  ✅ 已有中文字体: {", ".join(existing_fonts)}')
+            return
+
+        # 尝试从系统复制字体
+        system_fonts_dir = Path('C:/Windows/Fonts')
+        if system_fonts_dir.exists():
+            # 优先使用微软雅黑
+            msyh_font = system_fonts_dir / 'msyh.ttc'
+            if msyh_font.exists():
+                shutil.copy2(msyh_font, fonts_dir / 'msyh.ttc')
+                log('  ✅ 已复制微软雅黑字体')
+                return
+
+            # 备选：使用宋体
+            simsun_font = system_fonts_dir / 'simsun.ttc'
+            if simsun_font.exists():
+                shutil.copy2(simsun_font, fonts_dir / 'simsun.ttc')
+                log('  ✅ 已复制宋体字体')
+                return
+
+        log('  ⚠️ 未找到中文字体，请手动添加')
+
+    def _configure_chinese_font(self, export_dir, log):
+        """配置gui.rpy使用中文字体"""
+        from pathlib import Path
+        import shutil
+        import re
+
+        # 1. 从工作目录或原游戏目录找到原始的gui.rpy
+        work_dir = self.project_manager._get_project_dir(self.current_project.name) / 'work'
+        game_dir = Path(self.current_project.game_dir)
+
+        source_file = None
+        possible_sources = [
+            work_dir / 'game' / 'scripts' / 'gui.rpy',
+            work_dir / 'game' / 'gui.rpy',
+            game_dir / 'game' / 'scripts' / 'gui.rpy',
+            game_dir / 'game' / 'gui.rpy',
+        ]
+
+        for path in possible_sources:
+            if path.exists():
+                source_file = path
+                break
+
+        if not source_file:
+            log('  ⚠️ 找不到原始gui.rpy，跳过字体配置')
+            return
+
+        log(f'  找到原始gui.rpy: {source_file}')
+
+        # 2. 复制到导出目录（覆盖已有的，确保是原始版本）
+        target_file = export_dir / 'game' / 'scripts' / 'gui.rpy'
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target_file)
+        log(f'  已复制到导出目录: {target_file}')
+
+        # 3. 读取导出目录中的文件
+        with open(target_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # 4. 检查是否已配置中文字体
+        if 'msyh.ttc' in content or 'simsun.ttc' in content:
+            log('  ✅ 中文字体已配置')
+            return
+
+        # 5. 替换字体配置
+        content = re.sub(
+            r'(define gui\.text_font\s*=\s*)"[^"]*"',
+            r'\1"fonts/msyh.ttc"',
+            content
+        )
+        content = re.sub(
+            r'(define gui\.name_text_font\s*=\s*)"[^"]*"',
+            r'\1"fonts/msyh.ttc"',
+            content
+        )
+        content = re.sub(
+            r'(define gui\.interface_text_font\s*=\s*)"[^"]*"',
+            r'\1"fonts/msyh.ttc"',
+            content
+        )
+
+        # 6. 写入修改后的文件
+        with open(target_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        log('  ✅ 已配置中文字体')
+
+    def _add_ui_translations(self, export_dir, log):
+        """添加UI文字翻译"""
+        from pathlib import Path
+
+        # UI文字翻译字典
+        ui_translations = {
+            "Start": "开始",
+            "Load": "读取",
+            "Save": "保存",
+            "Preferences": "设置",
+            "About": "关于",
+            "Help": "帮助",
+            "Quit": "退出",
+            "Main Menu": "主菜单",
+            "Return": "返回",
+            "Yes": "是",
+            "No": "否",
+            "OK": "确定",
+            "Cancel": "取消",
+            "Back": "返回",
+            "Window": "窗口",
+            "Fullscreen": "全屏",
+            "Display": "显示",
+            "Text Speed": "文字速度",
+            "Auto-Forward Time": "自动前进时间",
+            "Music Volume": "音乐音量",
+            "Sound Volume": "音效音量",
+            "Voice Volume": "语音音量",
+            "Language": "语言",
+            "Save Slot": "存档位",
+            "Auto": "自动",
+            "Quick": "快速",
+            "History": "历史",
+            "Skip": "跳过",
+            "Unseen Text": "未读文本",
+            "After Choices": "选项后",
+            "Transitions": "转场效果",
+            "Rollback Side": "回滚方向",
+            "Disable": "禁用",
+            "Left": "左",
+            "Right": "右",
+            "Mute All": "全部静音",
+            "Save Page": "存档页",
+            "Load Page": "读取页",
+            "Save your game?": "保存游戏？",
+            "Load your game?": "读取游戏？",
+            "Are you sure?": "确定吗？",
+            "Deleting a save slot cannot be undone.": "删除存档无法撤销。",
+            "No saves found.": "未找到存档。",
+            "File page": "文件页",
+            "Previous": "上一页",
+            "Next": "下一页",
+        }
+
+        # 创建翻译文件
+        tl_file = export_dir / 'game' / 'tl' / 'chinese' / 'common.rpy'
+        tl_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # 生成翻译内容
+        content = []
+        content.append('# UI翻译\n')
+        content.append('# Generated by Ren\'Py Translator\n\n')
+        content.append('translate chinese strings:\n')
+
+        for en, cn in ui_translations.items():
+            content.append(f'    old "{en}"\n')
+            content.append(f'    new "{cn}"\n\n')
+
+        # 写入文件
+        with open(tl_file, 'w', encoding='utf-8') as f:
+            f.writelines(content)
+
+        log(f'  ✅ 已添加UI翻译 ({len(ui_translations)}条)')
 
     # ========== 人物分析 ==========
 
@@ -1587,7 +2220,7 @@ class TranslatorUI:
                 if '__profiles__' not in self.current_project.char_dict:
                     self.current_project.char_dict['__profiles__'] = {}
                 self.current_project.char_dict['__profiles__'][name] = profile
-                self._save_project()
+                self._save_project(show_notify=False)
                 return True, profile
 
             if not profile:
@@ -1669,7 +2302,7 @@ class TranslatorUI:
 请简要总结该角色在这批台词中展现的特点（性格、说话风格、关系等）。"""
 
         try:
-            result = self.translator.translate_text(text=prompt)
+            result = self.translator.analyze_text(prompt=prompt)
 
             # 如果是最终分析，解析为字典
             if is_final:
@@ -1678,7 +2311,8 @@ class TranslatorUI:
                 return result  # 返回原始文本用于后续合并
 
         except Exception as e:
-            print(f'分析失败: {e}')
+            print(f'❌ 角色分析失败: {e}')
+            print(f'📝 提示词:\n{prompt[:500]}...')
             return None
 
     def _merge_summaries(self, name, summaries):
@@ -1702,7 +2336,7 @@ class TranslatorUI:
 翻译建议："""
 
         try:
-            result = self.translator.translate_text(text=prompt)
+            result = self.translator.analyze_text(prompt=prompt)
             # 解析结果为字典
             profile = {}
             current_key = None
@@ -1731,7 +2365,8 @@ class TranslatorUI:
             return profile
 
         except Exception as e:
-            print(f'合并总结失败: {e}')
+            print(f'❌ 合并总结失败: {e}')
+            print(f'📝 提示词:\n{prompt[:500]}...')
             return {}
 
     # ========== 模型配置 ==========
