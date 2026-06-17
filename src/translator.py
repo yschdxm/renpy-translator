@@ -78,12 +78,17 @@ class AITranslator:
 
         # 添加人名词典和角色特征
         if character_dict:
-            # 人名词典
-            dict_text = "\n\n人名翻译词典：\n"
+            # 人名词典（跳过所有特殊键）
+            dict_text = "\n\n人名翻译词典（翻译时必须使用这些中文名）：\n"
             for en_name, cn_name in character_dict.items():
-                if en_name != '__profiles__':  # 跳过特殊键
+                # 跳过所有以 __ 开头的特殊键
+                if en_name.startswith('__'):
+                    continue
+                # 只显示有翻译的人名
+                if cn_name and cn_name.strip():
                     dict_text += f"- {en_name} → {cn_name}\n"
-            prompt += dict_text
+            if dict_text.strip() != "人名翻译词典（翻译时必须使用这些中文名）：":
+                prompt += dict_text
 
             # 当前角色的特征
             profiles = character_dict.get('__profiles__', {})

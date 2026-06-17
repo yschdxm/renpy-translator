@@ -37,7 +37,6 @@ class SDKManager:
             Path.cwd(),
             Path(__file__).parent.parent,  # 项目根目录
             Path.home() / "Downloads",
-            Path("F:/UPC/项目"),
         ])
 
         for search_path in search_paths:

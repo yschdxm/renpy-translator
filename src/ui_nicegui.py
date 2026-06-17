@@ -88,7 +88,7 @@ class TranslatorUI:
             # 新建项目
             ui.label('新建项目').classes('text-subtitle2')
             new_name = ui.input(label='项目名称', placeholder='MyGame')
-            new_game_dir = ui.input(label='游戏目录', placeholder='Z:\\game\\MyGame')
+            new_game_dir = ui.input(label='游戏目录', placeholder='/path/to/game')
 
             # 模型选择
             model_names = [c.name for c in self.config_manager.load_all_configs()]
@@ -344,7 +344,10 @@ class TranslatorUI:
                 options={'all': '全部', 'untranslated': '未翻译', 'translated': '已翻译'},
                 label='筛选', value='all'
             )
-            self.dialogue_char_filter = ui.input(label='角色', placeholder='角色名')
+            self.dialogue_char_filter = ui.select(
+                options=['全部'],
+                label='角色', value='全部'
+            )
             ui.button('🔍', on_click=self._dialogue_apply_filter)
 
         # 队列状态
@@ -440,7 +443,7 @@ class TranslatorUI:
             with ui.row().classes('gap-2 items-center w-full'):
                 self.sdk_path_input = ui.input(
                     label='SDK 路径',
-                    placeholder='F:\\renpy-8.5.3-sdk',
+                    placeholder='/path/to/renpy-sdk',
                     value=self._find_sdk_path()
                 ).classes('flex-1')
                 ui.button('🔍 自动查找', on_click=self._auto_find_sdk)
@@ -1754,7 +1757,26 @@ class TranslatorUI:
         if not self.current_project:
             return
 
+        # 更新角色下拉菜单（显示显示名而不是变量名）
         all_dialogues = self.current_project.dialogues
+        variable_map = self.current_project.char_dict.get('__variable_map__', {})
+
+        # 获取所有出现的变量名
+        var_names = sorted(set(d.get('character', '') for d in all_dialogues if d.get('character', '')))
+
+        # 转换为显示名
+        char_options = ['全部']
+        self._char_display_map = {}  # 显示名 -> 变量名
+        for var in var_names:
+            display = variable_map.get(var, var)
+            char_options.append(display)
+            self._char_display_map[display] = var
+
+        if hasattr(self, 'dialogue_char_filter'):
+            self.dialogue_char_filter.set_options(char_options)
+            if self.dialogue_char_text not in char_options:
+                self.dialogue_char_filter.set_value('全部')
+                self.dialogue_char_text = ''
 
         # 创建带全局索引的对话列表
         indexed_dialogues = [(i, d) for i, d in enumerate(all_dialogues)]
@@ -1811,7 +1833,16 @@ class TranslatorUI:
     def _dialogue_apply_filter(self):
         self.dialogue_search_text = self.dialogue_search.value
         self.dialogue_filter_mode = self.dialogue_filter.value
-        self.dialogue_char_text = self.dialogue_char_filter.value
+
+        # 将显示名转换为变量名
+        selected_char = self.dialogue_char_filter.value
+        if selected_char == '全部':
+            self.dialogue_char_text = ''
+        elif hasattr(self, '_char_display_map'):
+            self.dialogue_char_text = self._char_display_map.get(selected_char, selected_char)
+        else:
+            self.dialogue_char_text = selected_char
+
         self.dialogue_current_page = 0
         self._dialogue_refresh()
 
@@ -2461,27 +2492,43 @@ screen language_selector():
         with open(gui_file, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # 4. 检查是否已配置中文字体
-        if 'msyh.ttc' in content or 'simsun.ttc' in content:
-            log('  ✅ 中文字体已配置')
+        # 查找导出目录中的字体文件
+        fonts_dir = export_dir / 'game' / 'fonts'
+        font_name = None
+        if fonts_dir.exists():
+            for f in fonts_dir.iterdir():
+                if f.suffix.lower() in ['.ttf', '.ttc', '.otf']:
+                    font_name = f.name
+                    break
+
+        if not font_name:
+            log('  ⚠️ 未找到字体文件，跳过字体配置')
             return
 
-        # 5. 替换字体配置
+        # 检查是否已配置该字体
+        if f'fonts/{font_name}' in content:
+            log(f'  ✅ 字体已配置: {font_name}')
+            return
+
+        # 替换字体配置
+        font_path = f'fonts/{font_name}'
         content = re.sub(
             r'(define gui\.text_font\s*=\s*)"[^"]*"',
-            r'\1"fonts/msyh.ttc"',
+            f'\\1"{font_path}"',
             content
         )
         content = re.sub(
             r'(define gui\.name_text_font\s*=\s*)"[^"]*"',
-            r'\1"fonts/msyh.ttc"',
+            f'\\1"{font_path}"',
             content
         )
         content = re.sub(
             r'(define gui\.interface_text_font\s*=\s*)"[^"]*"',
-            r'\1"fonts/msyh.ttc"',
+            f'\\1"{font_path}"',
             content
         )
+
+        log(f'  配置字体: {font_path}')
 
         # 6. 写入修改后的文件
         with open(gui_file, 'w', encoding='utf-8') as f:
