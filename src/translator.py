@@ -78,16 +78,25 @@ class AITranslator:
 
         # 添加人名词典和角色特征
         if character_dict:
-            # 人名词典（跳过所有特殊键）
+            # 获取变量名映射
+            variable_map = character_dict.get('__variable_map__', {})
+
+            # 人名词典（只包含有翻译的人名）
             dict_text = "\n\n人名翻译词典（翻译时必须使用这些中文名）：\n"
+            has_names = False
             for en_name, cn_name in character_dict.items():
-                # 跳过所有以 __ 开头的特殊键
+                # 跳过所有特殊键
                 if en_name.startswith('__'):
                     continue
-                # 只显示有翻译的人名
-                if cn_name and cn_name.strip():
-                    dict_text += f"- {en_name} → {cn_name}\n"
-            if dict_text.strip() != "人名翻译词典（翻译时必须使用这些中文名）：":
+                # 只显示有翻译的人名（确保是字符串且非空）
+                if not isinstance(cn_name, str) or not cn_name.strip():
+                    continue
+                # 跳过占位符（如 [mc_name] 但不是 [Mika]）
+                if en_name.startswith('[') and en_name.endswith(']') and '_name' in en_name:
+                    continue
+                dict_text += f"- {en_name} → {cn_name}\n"
+                has_names = True
+            if has_names:
                 prompt += dict_text
 
             # 当前角色的特征
@@ -339,16 +348,20 @@ class AITranslator:
             print(f'[翻译] 角色: {character or "旁白"}')
             print(f'[翻译] 原文: {text}')
 
+            # 显示人名词典部分
+            dict_start = system_prompt.find('人名翻译词典')
+            if dict_start >= 0:
+                dict_end = system_prompt.find('\n\n', dict_start + 1)
+                if dict_end < 0:
+                    dict_end = len(system_prompt)
+                print(f'\n[翻译] 人名词典:\n{system_prompt[dict_start:dict_end]}')
+
             # 检查是否有人物特征
             if '人物特征' in system_prompt:
                 # 提取人物特征部分
                 profile_start = system_prompt.find('当前说话角色')
                 if profile_start >= 0:
                     print(f'\n[翻译] 人物特征:\n{system_prompt[profile_start:]}')
-                else:
-                    print(f'\n[翻译] 系统提示词（末尾）:\n{system_prompt[-500:]}')
-            else:
-                print(f'\n[翻译] 系统提示词（无人物特征）:\n{system_prompt[-500:]}')
 
             print(f'\n[翻译] 用户提示词:\n{user_prompt}')
             print(f'{"="*50}\n')

@@ -1766,7 +1766,7 @@ class TranslatorUI:
 
         # 转换为显示名
         char_options = ['全部']
-        self._char_display_map = {}  # 显示名 -> 变量名
+        self._char_display_map = {'全部': ''}  # 显示名 -> 变量名
         for var in var_names:
             display = variable_map.get(var, var)
             char_options.append(display)
@@ -1774,7 +1774,9 @@ class TranslatorUI:
 
         if hasattr(self, 'dialogue_char_filter'):
             self.dialogue_char_filter.set_options(char_options)
-            if self.dialogue_char_text not in char_options:
+            # 保持当前选择（如果还在列表中）
+            current_display = self.dialogue_char_filter.value
+            if current_display not in char_options:
                 self.dialogue_char_filter.set_value('全部')
                 self.dialogue_char_text = ''
 
