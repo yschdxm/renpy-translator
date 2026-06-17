@@ -44,7 +44,7 @@
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone [<repository-url>](https://github.com/yschdxm/renpy-translator.git)
 cd renpy-translator
 
 # 安装依赖
