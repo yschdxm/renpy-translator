@@ -474,9 +474,19 @@ class TranslatorUI:
             project.ui_texts = [self._dialogue_to_dict(d) for d in result['ui_texts']]
             project.characters = [self._character_to_dict(c) for c in result['characters']]
 
+            # 初始化人名词典
+            # key: 显示名（如 Froggy），value: 中文名（待翻译）
             for char in result['characters']:
-                if char.name not in project.char_dict:
-                    project.char_dict[char.name] = char.name
+                if char.name and char.name not in project.char_dict:
+                    project.char_dict[char.name] = ''  # 空表示待翻译
+
+            # 存储变量名到显示名的映射（用于翻译时查找）
+            # 这个映射存储在 __variable_map__ 中
+            if '__variable_map__' not in project.char_dict:
+                project.char_dict['__variable_map__'] = {}
+            for char in result['characters']:
+                if char.variable and char.name:
+                    project.char_dict['__variable_map__'][char.variable] = char.name
 
             self.project_manager.save_project(project)
 
@@ -684,7 +694,8 @@ class TranslatorUI:
                 character=dialogue.get('character', ''),
                 context_before=dialogue.get('context_before', []),
                 context_after=dialogue.get('context_after', []),
-                character_dict=self.current_project.char_dict
+                character_dict=self.current_project.char_dict,
+                debug=True
             )
 
             dialogue['translated_text'] = translated
@@ -760,15 +771,12 @@ class TranslatorUI:
     def _do_name_translate(self, queue_item):
         """执行人名翻译（线程池中执行）"""
         row = queue_item['row']
-        prompt = f"将以下人名翻译成中文，只返回中文名，不要解释：{row['original']}"
         try:
-            translated = self.translator.translate_text(text=prompt)
-            translated = translated.strip().replace('"', '').replace("'", '')
+            translated = self.translator.translate_name(row['original'], debug=True)
             self.current_project.char_dict[row['original']] = translated
             return True
         except Exception as e:
             print(f'❌ 人名翻译失败: {e}')
-            print(f'📝 提示词: {prompt}')
             return False
 
     def _update_queue_status(self):
@@ -885,7 +893,7 @@ class TranslatorUI:
                 if translate_type == 'ui':
                     translated = await loop.run_in_executor(
                         self.executor,
-                        lambda t=item['original_text']: self.translator.translate_text(text=t)
+                        lambda t=item['original_text']: self.translator.translate_text(text=t, debug=True)
                     )
                 elif translate_type == 'dialogue':
                     translated = await loop.run_in_executor(
@@ -895,7 +903,8 @@ class TranslatorUI:
                             self.translator.translate_text(
                                 text=t, character=c,
                                 context_before=cb, context_after=ca,
-                                character_dict=self.current_project.char_dict
+                                character_dict=self.current_project.char_dict,
+                                debug=True
                             )
                     )
                 else:
@@ -1042,15 +1051,13 @@ class TranslatorUI:
         idx = queue_item['idx']
         if 0 <= idx < len(self.current_project.ui_texts):
             item = self.current_project.ui_texts[idx]
-            prompt = item['original_text']
             try:
-                translated = self.translator.translate_text(text=prompt)
+                translated = self.translator.translate_ui(item['original_text'], debug=True)
                 item['translated_text'] = translated
                 item['is_translated'] = True
                 return True
             except Exception as e:
                 print(f'❌ UI翻译失败: {e}')
-                print(f'📝 原文: {prompt}')
                 return False
         return False
 
@@ -1247,7 +1254,8 @@ class TranslatorUI:
                     character=character,
                     context_before=item.get('context_before', []),
                     context_after=item.get('context_after', []),
-                    character_dict=self.current_project.char_dict
+                    character_dict=self.current_project.char_dict,
+                    debug=True
                 )
                 item['translated_text'] = translated
                 item['is_translated'] = True
@@ -1355,7 +1363,7 @@ class TranslatorUI:
         # 检查人名翻译（只判断是否有文字，不判断是否与原文相同）
         char_dict = self.current_project.char_dict
         untranslated_names = [k for k, v in char_dict.items()
-                            if k != '__profiles__' and (not v or not v.strip())]
+                            if not k.startswith('__') and isinstance(v, str) and (not v or not v.strip())]
         if untranslated_names:
             return False, f'请先完成人名翻译（还有 {len(untranslated_names)} 个未翻译）'
 
@@ -2018,8 +2026,8 @@ screen language_selector():
         dialogues = self.current_project.dialogues
         char_profiles = char_dict.get('__profiles__', {})
 
-        # 从字典获取角色名（已去重），排除 __profiles__
-        unique_names = [k for k in char_dict.keys() if k != '__profiles__']
+        # 从字典获取角色名（已去重），排除所有以 __ 开头的特殊键
+        unique_names = [k for k in char_dict.keys() if not k.startswith('__')]
 
         rows = []
         for name in unique_names:

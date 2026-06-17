@@ -87,13 +87,41 @@ class AITranslator:
 
             # 当前角色的特征
             profiles = character_dict.get('__profiles__', {})
-            if character and character in profiles:
-                profile = profiles[character]
-                prompt += f"\n\n当前说话角色 [{character}] 的人物特征：\n"
-                for key, value in profile.items():
-                    if value:
-                        prompt += f"- {key}：{value}\n"
-                prompt += "\n请根据该角色的特点进行翻译，保持其说话风格和性格特征。"
+            variable_map = character_dict.get('__variable_map__', {})
+
+            if character and profiles:
+                # 尝试多种方式查找角色特征
+                profile = None
+                matched_key = None
+
+                # 1. 直接匹配
+                if character in profiles:
+                    profile = profiles[character]
+                    matched_key = character
+                # 2. 尝试匹配 [character_name] 格式
+                elif f'[{character}_name]' in profiles:
+                    profile = profiles[f'[{character}_name]']
+                    matched_key = f'[{character}_name]'
+                # 3. 通过变量名映射查找显示名
+                elif character in variable_map:
+                    display_name = variable_map[character]
+                    if display_name in profiles:
+                        profile = profiles[display_name]
+                        matched_key = display_name
+                # 4. 遍历查找包含character的键
+                else:
+                    for key in profiles:
+                        if character.lower() in key.lower() or key.lower() in character.lower():
+                            profile = profiles[key]
+                            matched_key = key
+                            break
+
+                if profile:
+                    prompt += f"\n\n当前说话角色 [{matched_key}] 的人物特征：\n"
+                    for key, value in profile.items():
+                        if value:
+                            prompt += f"- {key}：{value}\n"
+                    prompt += "\n请根据该角色的特点进行翻译，保持其说话风格和性格特征。"
 
         return prompt
 
@@ -127,6 +155,109 @@ class AITranslator:
         prompt += "\n\n请翻译【请翻译以下文本】中的内容，追求信达雅的翻译质量："
         return prompt
 
+    def translate_name(self, name: str, debug: bool = False) -> str:
+        """翻译人名（简洁提示词）"""
+        if not self.client:
+            raise ValueError("请先配置API Key")
+
+        if not name.strip():
+            return ""
+
+        # 检查是否是占位符（如 [mc_name]）
+        if name.startswith('[') and name.endswith(']'):
+            if debug:
+                print(f'\n[人名翻译] 占位符，直接返回: {name}')
+            return name  # 占位符直接返回，不翻译
+
+        system_prompt = """你是一个游戏翻译专家。请将游戏人名翻译成中文，只返回中文名，不要解释。
+
+注意：
+- 如果输入是占位符（如 [xxx_name]），直接返回原文
+- 如果输入是变量名或代码，直接返回原文
+- 只翻译真正的人名"""
+
+        user_prompt = f"请将以下人名翻译成中文，只返回中文名：\n{name}"
+
+        # 打印提示词到日志
+        if debug:
+            print(f'\n{"="*50}')
+            print(f'[人名翻译] 原文: {name}')
+            print(f'[人名翻译] 系统提示词:\n{system_prompt}')
+            print(f'[人名翻译] 用户提示词:\n{user_prompt}')
+            print(f'{"="*50}\n')
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=50,
+                timeout=self.config.timeout
+            )
+
+            result = response.choices[0].message.content.strip()
+            # 清理结果，只保留名字
+            result = result.replace('"', '').replace("'", '').replace('。', '')
+
+            if debug:
+                print(f'[人名翻译] 翻译结果: {result}')
+
+            return result
+
+        except Exception as e:
+            raise Exception(f"人名翻译失败: {str(e)}")
+
+    def translate_ui(self, text: str, debug: bool = False) -> str:
+        """翻译UI文字（简洁提示词）"""
+        if not self.client:
+            raise ValueError("请先配置API Key")
+
+        if not text.strip():
+            return ""
+
+        system_prompt = """你是一个游戏UI翻译专家。请将游戏界面文字翻译成简体中文。
+
+要求：
+- 简洁明了，符合中文UI习惯
+- 按钮文字要简短
+- 保持专业术语的一致性
+- 只返回翻译结果，不要解释"""
+
+        user_prompt = f"请翻译以下游戏界面文字：\n{text}"
+
+        # 打印提示词到日志
+        if debug:
+            print(f'\n{"="*50}')
+            print(f'[UI翻译] 原文: {text}')
+            print(f'[UI翻译] 系统提示词:\n{system_prompt}')
+            print(f'[UI翻译] 用户提示词:\n{user_prompt}')
+            print(f'{"="*50}\n')
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=200,
+                timeout=self.config.timeout
+            )
+
+            result = response.choices[0].message.content.strip()
+
+            if debug:
+                print(f'[UI翻译] 翻译结果: {result}')
+
+            return result
+
+        except Exception as e:
+            raise Exception(f"UI翻译失败: {str(e)}")
+
     def analyze_text(self, prompt: str) -> str:
         """分析文本（不使用翻译系统提示词）"""
         if not self.client:
@@ -137,6 +268,12 @@ class AITranslator:
 
         # 分析任务使用简单的系统提示词
         system_prompt = "你是一个专业的文本分析师。请按照用户的要求进行分析，直接输出分析结果，不要添加额外的解释。"
+
+        # 打印提示词到日志
+        print(f'\n{"="*50}')
+        print(f'[分析] 系统提示词:\n{system_prompt}')
+        print(f'\n[分析] 用户提示词:\n{prompt[:500]}...' if len(prompt) > 500 else f'\n[分析] 用户提示词:\n{prompt}')
+        print(f'{"="*50}\n')
 
         try:
             response = self.client.chat.completions.create(
@@ -150,7 +287,9 @@ class AITranslator:
                 timeout=self.config.timeout
             )
 
-            return response.choices[0].message.content.strip()
+            result = response.choices[0].message.content.strip()
+            print(f'[分析] 返回结果:\n{result[:500]}...' if len(result) > 500 else f'[分析] 返回结果:\n{result}')
+            return result
 
         except Exception as e:
             raise Exception(f"分析失败: {str(e)}")
@@ -158,7 +297,8 @@ class AITranslator:
     def translate_text(self, text: str, character: str = "",
                       context_before: List[str] = None,
                       context_after: List[str] = None,
-                      character_dict: Dict[str, str] = None) -> str:
+                      character_dict: Dict[str, str] = None,
+                      debug: bool = False) -> str:
         """翻译单行文本"""
         if not self.client:
             raise ValueError("请先配置API Key")
@@ -170,6 +310,26 @@ class AITranslator:
         user_prompt = self._build_user_prompt(
             text, character, context_before, context_after
         )
+
+        # 打印提示词到日志（便于调试）
+        if debug:
+            print(f'\n{"="*50}')
+            print(f'[翻译] 角色: {character or "旁白"}')
+            print(f'[翻译] 原文: {text}')
+
+            # 检查是否有人物特征
+            if '人物特征' in system_prompt:
+                # 提取人物特征部分
+                profile_start = system_prompt.find('当前说话角色')
+                if profile_start >= 0:
+                    print(f'\n[翻译] 人物特征:\n{system_prompt[profile_start:]}')
+                else:
+                    print(f'\n[翻译] 系统提示词（末尾）:\n{system_prompt[-500:]}')
+            else:
+                print(f'\n[翻译] 系统提示词（无人物特征）:\n{system_prompt[-500:]}')
+
+            print(f'\n[翻译] 用户提示词:\n{user_prompt}')
+            print(f'{"="*50}\n')
 
         try:
             response = self.client.chat.completions.create(
@@ -184,6 +344,10 @@ class AITranslator:
             )
 
             translated = response.choices[0].message.content.strip()
+
+            if debug:
+                print(f'[翻译] 翻译结果: {translated}')
+
             return translated
 
         except Exception as e:
