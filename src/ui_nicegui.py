@@ -2428,45 +2428,32 @@ screen language_selector():
         from pathlib import Path
         import shutil
 
-        # 检查是否有中文字体
-        fonts_dir = export_dir / 'game' / 'fonts'
-        fonts_dir.mkdir(exist_ok=True)
-
-        # 常见中文字体文件名
-        chinese_fonts = [
-            'NotoSansCJK-Regular.ttc',
-            'NotoSansSC-Regular.otf',
-            'SourceHanSansCN-Regular.otf',
-            'WenQuanYiMicroHei.ttf',
-            'msyh.ttc',
-            'simsun.ttc',
-        ]
-
-        # 检查是否已有中文字体
-        existing_fonts = []
-        for font in chinese_fonts:
-            if (fonts_dir / font).exists():
-                existing_fonts.append(font)
-
-        if existing_fonts:
-            log(f'  ✅ 已有中文字体: {", ".join(existing_fonts)}')
-            return
-
         # 从项目内置字体目录复制
         project_dir = Path(__file__).parent.parent
         builtin_fonts_dir = project_dir / 'fonts'
 
-        if builtin_fonts_dir.exists():
-            for font_file in builtin_fonts_dir.iterdir():
-                if font_file.suffix.lower() in ['.ttf', '.ttc', '.otf']:
-                    try:
-                        shutil.copy2(font_file, fonts_dir / font_file.name)
-                        log(f'  ✅ 已复制内置字体: {font_file.name}')
-                        return
-                    except Exception:
-                        continue
+        if not builtin_fonts_dir.exists():
+            log('  ⚠️ 未找到内置字体目录 fonts/')
+            return
 
-        log('  ⚠️ 未找到内置字体，请将中文字体放入 fonts/ 目录')
+        # 查找内置字体文件
+        font_files = [f for f in builtin_fonts_dir.iterdir()
+                     if f.suffix.lower() in ['.ttf', '.ttc', '.otf']]
+
+        if not font_files:
+            log('  ⚠️ fonts/ 目录中没有字体文件')
+            return
+
+        # 复制字体到导出目录
+        fonts_dir = export_dir / 'game' / 'fonts'
+        fonts_dir.mkdir(exist_ok=True)
+
+        for font_file in font_files:
+            try:
+                shutil.copy2(font_file, fonts_dir / font_file.name)
+                log(f'  ✅ 已复制字体: {font_file.name}')
+            except Exception as e:
+                log(f'  ⚠️ 复制字体失败: {e}')
 
     def _configure_chinese_font(self, export_dir, log):
         """配置gui.rpy使用中文字体"""
@@ -2494,45 +2481,49 @@ screen language_selector():
         with open(gui_file, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # 查找导出目录中的字体文件
+        # 查找导出目录中的字体文件（优先使用项目内置字体）
         fonts_dir = export_dir / 'game' / 'fonts'
         font_name = None
+
+        # 项目内置字体名
+        builtin_font = 'MiSans-Regular.ttf'
+
         if fonts_dir.exists():
-            for f in fonts_dir.iterdir():
-                if f.suffix.lower() in ['.ttf', '.ttc', '.otf']:
-                    font_name = f.name
-                    break
+            # 优先查找项目内置字体
+            if (fonts_dir / builtin_font).exists():
+                font_name = builtin_font
+            else:
+                # 如果没有内置字体，使用第一个找到的字体
+                for f in fonts_dir.iterdir():
+                    if f.suffix.lower() in ['.ttf', '.ttc', '.otf']:
+                        font_name = f.name
+                        break
 
         if not font_name:
             log('  ⚠️ 未找到字体文件，跳过字体配置')
-            return
-
-        # 检查是否已配置该字体
-        if f'fonts/{font_name}' in content:
-            log(f'  ✅ 字体已配置: {font_name}')
             return
 
         # 替换字体配置
         font_path = f'fonts/{font_name}'
         content = re.sub(
             r'(define gui\.text_font\s*=\s*)"[^"]*"',
-            f'\\1"{font_path}"',
+            lambda m: f'{m.group(1)}"{font_path}"',
             content
         )
         content = re.sub(
             r'(define gui\.name_text_font\s*=\s*)"[^"]*"',
-            f'\\1"{font_path}"',
+            lambda m: f'{m.group(1)}"{font_path}"',
             content
         )
         content = re.sub(
             r'(define gui\.interface_text_font\s*=\s*)"[^"]*"',
-            f'\\1"{font_path}"',
+            lambda m: f'{m.group(1)}"{font_path}"',
             content
         )
 
         log(f'  配置字体: {font_path}')
 
-        # 6. 写入修改后的文件
+        # 写入修改后的文件
         with open(gui_file, 'w', encoding='utf-8') as f:
             f.write(content)
 
