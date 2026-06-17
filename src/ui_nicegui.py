@@ -2419,24 +2419,21 @@ screen language_selector():
             log(f'  ✅ 已有中文字体: {", ".join(existing_fonts)}')
             return
 
-        # 尝试从系统复制字体
-        system_fonts_dir = Path('C:/Windows/Fonts')
-        if system_fonts_dir.exists():
-            # 优先使用微软雅黑
-            msyh_font = system_fonts_dir / 'msyh.ttc'
-            if msyh_font.exists():
-                shutil.copy2(msyh_font, fonts_dir / 'msyh.ttc')
-                log('  ✅ 已复制微软雅黑字体')
-                return
+        # 从项目内置字体目录复制
+        project_dir = Path(__file__).parent.parent
+        builtin_fonts_dir = project_dir / 'fonts'
 
-            # 备选：使用宋体
-            simsun_font = system_fonts_dir / 'simsun.ttc'
-            if simsun_font.exists():
-                shutil.copy2(simsun_font, fonts_dir / 'simsun.ttc')
-                log('  ✅ 已复制宋体字体')
-                return
+        if builtin_fonts_dir.exists():
+            for font_file in builtin_fonts_dir.iterdir():
+                if font_file.suffix.lower() in ['.ttf', '.ttc', '.otf']:
+                    try:
+                        shutil.copy2(font_file, fonts_dir / font_file.name)
+                        log(f'  ✅ 已复制内置字体: {font_file.name}')
+                        return
+                    except Exception:
+                        continue
 
-        log('  ⚠️ 未找到中文字体，请手动添加')
+        log('  ⚠️ 未找到内置字体，请将中文字体放入 fonts/ 目录')
 
     def _configure_chinese_font(self, export_dir, log):
         """配置gui.rpy使用中文字体"""

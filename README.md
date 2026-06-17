@@ -44,18 +44,40 @@
 
 ```bash
 # 克隆项目
-git clone [<repository-url>](https://github.com/yschdxm/renpy-translator.git)
+git clone https://github.com/yschdxm/renpy-translator.git
 cd renpy-translator
 
 # 安装依赖
 uv sync
 ```
 
+### 准备字体
+
+将一款开源中文字体放入 `fonts/` 目录：
+
+```bash
+# 示例：下载 Noto Sans SC 字体
+mkdir fonts
+cd fonts
+# 从 https://fonts.google.com/noto/specimen/Noto+Sans+SC 下载
+# 将 .otf 或 .ttf 文件放入此目录
+```
+
+```
+renpy-translator/
+├── fonts/
+│   └── NotoSansSC-Regular.otf
+```
+
 ### 配置 Ren'Py SDK
 
-1. 下载 [Ren'Py SDK](https://www.renpy.org/latest.html)
+1. 下载对应平台的 [Ren'Py SDK](https://www.renpy.org/latest.html)
 2. 解压到项目目录（如 `renpy-8.5.3-sdk`）
 3. 在工具的"模型配置"页面设置 SDK 路径
+
+**跨平台兼容**：SDK 在不同平台完全兼容：
+- Windows: 自动使用 `renpy.exe`
+- macOS/Linux: 自动使用 `renpy.sh`
 
 ### 配置 AI 模型
 
