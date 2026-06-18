@@ -3320,8 +3320,19 @@ class TranslatorUI:
             else:
                 char_lines = []
 
+            # 如果没有台词，标记为已分析（空 profile），不影响翻译
             if not char_lines:
-                return False, f'该角色没有台词 (变量名: {var_name or "未找到"})'
+                empty_profile = {
+                    '性格特征': '该角色没有台词',
+                    '说话风格': '无',
+                    '背景': '无'
+                }
+                # 保存空 profile
+                if '__profiles__' not in self.current_project.char_dict:
+                    self.current_project.char_dict['__profiles__'] = {}
+                self.current_project.char_dict['__profiles__'][name] = empty_profile
+                self.project_manager.save_project(self.current_project)
+                return True, '该角色没有台词，已跳过分析'
 
             # 获取模型配置
             max_context = 8  # 默认8K
