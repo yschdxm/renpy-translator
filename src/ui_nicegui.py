@@ -87,17 +87,14 @@ class TranslatorUI:
 
             # 新建项目
             ui.label('新建项目').classes('text-subtitle2')
-            new_name = ui.input(label='项目名称', placeholder='MyGame')
-            new_game_dir = ui.input(label='游戏目录', placeholder='/path/to/game')
+            self.create_btn = ui.button('➕ 创建项目', on_click=self._show_create_project_dialog).classes('w-full')
 
-            # 模型选择
-            model_names = [c.name for c in self.config_manager.load_all_configs()]
-            new_model = ui.select(options=model_names, label='AI模型', value=model_names[0] if model_names else None)
+            ui.separator()
 
-            # 创建按钮（添加引用以便禁用）
-            self.create_btn = ui.button('➕ 创建项目', on_click=lambda: self._create_project(
-                new_name.value, new_game_dir.value, new_model.value
-            )).classes('w-full')
+            # 导出导入
+            with ui.row().classes('w-full gap-2'):
+                self.export_project_btn = ui.button('📦 导出项目', on_click=self._export_current_project)
+                self.import_project_btn = ui.button('📥 导入项目', on_click=self._import_project)
 
     def _create_main_content(self):
         """创建主内容区"""
@@ -471,6 +468,10 @@ class TranslatorUI:
                     with ui.item_section():
                         ui.item_label(p.name)
                         ui.item_label(p.progress_text).props('caption')
+                    with ui.item_section():
+                        with ui.row().classes('gap-1'):
+                            ui.button(icon='edit', on_click=lambda name=p.name: self._show_edit_project_dialog(name)).props('flat dense @click.stop')
+                            ui.button(icon='delete', on_click=lambda name=p.name: self._confirm_delete_project(name)).props('flat dense color=negative @click.stop')
 
     # ========== SDK 管理 ==========
 
@@ -512,6 +513,553 @@ class TranslatorUI:
         else:
             self.sdk_status.text = '❌ 无效的 SDK 路径'
             self.sdk_status.classes(replace='text-caption text-negative')
+
+    async def _export_current_project(self):
+        """导出当前项目"""
+        if not self.current_project:
+            ui.notify('请先打开项目', type='warning')
+            return
+
+        # 创建进度对话框
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('📦 导出项目').classes('text-h6')
+            self.export_progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+            self.export_status_label = ui.label('准备中...').classes('text-caption')
+
+        # 设置对话框不可关闭（导出过程中）
+        dialog.props('persistent')
+        dialog.open()
+
+        # 创建导出路径
+        export_dir = Path(self.project_manager.projects_dir).parent / 'exports'
+        export_dir.mkdir(exist_ok=True)
+        export_path = export_dir / f'{self.current_project.name}.zip'
+
+        # 执行导出并等待完成
+        success = await self._do_export_with_progress(export_path)
+
+        # 关闭进度对话框
+        if success:
+            await asyncio.sleep(0.5)
+        else:
+            await asyncio.sleep(2)
+        dialog.close()
+
+        # 导出成功后显示结果对话框
+        if success and hasattr(self, '_last_export_path'):
+            with ui.dialog() as result_dialog, ui.card().classes('w-96'):
+                ui.label('✅ 导出成功').classes('text-h6')
+                ui.label(f'文件已保存到:').classes('text-body1')
+                ui.label(self._last_export_path).classes('text-body2 text-grey')
+                with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                    ui.button('打开文件夹', on_click=lambda: os.startfile(str(Path(self._last_export_path).parent)))
+                    ui.button('下载', on_click=lambda: ui.download(self._last_export_path), color='positive')
+                    ui.button('关闭', on_click=result_dialog.close)
+            result_dialog.props('persistent')
+            result_dialog.open()
+
+    async def _do_export_with_progress(self, export_path):
+        """带进度的导出，返回是否成功"""
+        from datetime import datetime
+        import shutil
+        import zipfile
+        import tempfile
+        import json
+
+        try:
+            project_name = self.current_project.name
+            project_dir = self.project_manager._get_project_dir(project_name)
+            game_dir = project_dir / 'game'
+
+            # 步骤1: 准备
+            self.export_progress_bar.value = 0.05
+            self.export_status_label.text = '正在准备...'
+            await asyncio.sleep(0)
+
+            # 步骤2: 读取项目配置
+            self.export_progress_bar.value = 0.1
+            self.export_status_label.text = '正在读取项目配置...'
+            await asyncio.sleep(0)
+
+            # 读取并修改项目配置
+            project_file = project_dir / 'project.json'
+            with open(project_file, 'r', encoding='utf-8') as f:
+                project_data = json.load(f)
+
+            # 保存原始路径信息
+            project_data['_export_info'] = {
+                'exported_at': datetime.now().isoformat(),
+                'original_game_dir': project_data.get('game_dir', ''),
+            }
+
+            # 转换对话中的文件路径为相对路径
+            for d in project_data.get('dialogues', []):
+                fp = d.get('file_path', '')
+                if fp and Path(fp).is_absolute():
+                    d['file_path'] = self._convert_to_relative_path(fp, game_dir)
+
+            # 转换字符串中的文件路径
+            for u in project_data.get('ui_texts', []):
+                fp = u.get('file_path', '')
+                if fp and Path(fp).is_absolute():
+                    u['file_path'] = self._convert_to_relative_path(fp, game_dir)
+
+            # 转换最后位置的文件路径
+            last_pos = project_data.get('last_position', {})
+            if last_pos.get('file') and Path(last_pos['file']).is_absolute():
+                last_pos['file'] = self._convert_to_relative_path(last_pos['file'], game_dir)
+
+            # 清除绝对路径
+            project_data['game_dir'] = ''
+            project_data['work_dir'] = ''
+
+            await asyncio.sleep(0)
+
+            # 统计总文件数（用于计算真实进度）
+            total_files = 0
+            if game_dir.exists():
+                for _, _, files in os.walk(game_dir):
+                    total_files += len(files)
+            fonts_dir = project_dir.parent.parent / 'fonts'
+            if fonts_dir.exists():
+                for _, _, files in os.walk(fonts_dir):
+                    total_files += len(files)
+
+            if total_files == 0:
+                total_files = 1  # 避免除零
+
+            # 步骤3: 复制和打包（在线程池中执行阻塞操作）
+            self.export_progress_bar.value = 0.15
+            self.export_status_label.text = '正在复制游戏文件...'
+            await asyncio.sleep(0)
+
+            # 使用共享进度变量
+            progress_data = {'current': 0, 'total': total_files, 'phase': 'copying'}
+
+            # 进度更新协程
+            async def _update_progress_loop():
+                """异步轮询更新进度条"""
+                while progress_data['phase'] != 'done':
+                    if progress_data['phase'] == 'copying':
+                        percent = 0.15 + (progress_data['current'] / progress_data['total']) * 0.55
+                        self.export_progress_bar.value = percent
+                        self.export_status_label.text = f'正在复制文件... ({progress_data["current"]}/{progress_data["total"]})'
+                    elif progress_data['phase'] == 'zipping':
+                        percent = 0.7 + (progress_data['current'] / progress_data['total']) * 0.25
+                        self.export_progress_bar.value = percent
+                        self.export_status_label.text = f'正在压缩... ({progress_data["current"]}/{progress_data["total"]})'
+                    await asyncio.sleep(0.2)
+
+            def _do_copy_and_zip():
+                """在线程池中执行文件复制和压缩"""
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_project_dir = Path(temp_dir) / project_name
+                    temp_project_dir.mkdir()
+
+                    # 保存项目配置
+                    with open(temp_project_dir / 'project.json', 'w', encoding='utf-8') as f:
+                        json.dump(project_data, f, ensure_ascii=False, indent=2)
+
+                    # 复制游戏文件（带进度）
+                    if game_dir.exists():
+                        dest_game = temp_project_dir / 'game'
+                        self._copy_tree_with_progress(game_dir, dest_game, progress_data)
+
+                    # 复制字体
+                    if fonts_dir.exists():
+                        dest_fonts = temp_project_dir / 'fonts'
+                        self._copy_tree_with_progress(fonts_dir, dest_fonts, progress_data)
+
+                    # 打包成zip（带进度）
+                    progress_data['phase'] = 'zipping'
+                    progress_data['current'] = 0
+
+                    export_path_obj = Path(export_path)
+                    export_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+                    all_files = []
+                    for root, dirs, files in os.walk(temp_project_dir):
+                        for file in files:
+                            file_path = Path(root) / file
+                            arcname = file_path.relative_to(temp_dir)
+                            all_files.append((file_path, arcname))
+
+                    progress_data['total'] = len(all_files) if all_files else 1
+
+                    with zipfile.ZipFile(export_path_obj, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for i, (file_path, arcname) in enumerate(all_files):
+                            zf.write(file_path, arcname)
+                            progress_data['current'] = i + 1
+
+                    progress_data['phase'] = 'done'
+                    return export_path_obj
+
+            # 同时启动进度更新和导出任务
+            loop = asyncio.get_event_loop()
+            progress_task = asyncio.create_task(_update_progress_loop())
+            export_task = loop.run_in_executor(self.executor, _do_copy_and_zip)
+
+            # 等待导出完成
+            result_path = await export_task
+
+            # 确保进度更新任务也完成
+            await progress_task
+
+            # 更新进度
+            self.export_progress_bar.value = 1.0
+            self.export_status_label.text = f'✅ 导出成功: {result_path.name}'
+            # 保存导出路径供后续下载
+            self._last_export_path = str(result_path)
+            return True
+
+        except Exception as e:
+            self.export_status_label.text = f'❌ 导出失败: {str(e)}'
+            print(f'导出失败: {str(e)}')
+            return False
+
+    def _convert_to_relative_path(self, file_path: str, game_dir: Path) -> str:
+        """将绝对路径转换为相对路径"""
+        try:
+            abs_path = Path(file_path)
+            if abs_path.is_absolute():
+                rel_path = abs_path.relative_to(game_dir)
+                return rel_path.as_posix()
+        except ValueError:
+            pass
+
+        # 尝试提取 game 之后的部分
+        parts = Path(file_path).parts
+        if 'game' in parts:
+            idx = parts.index('game')
+            return Path(*parts[idx:]).as_posix()
+
+        return Path(file_path).name
+
+    def _copy_tree_with_progress(self, src: Path, dst: Path, progress_data: dict):
+        """带进度的目录复制"""
+        import shutil
+
+        # 先复制目录结构
+        if dst.exists():
+            shutil.rmtree(dst)
+        dst.mkdir(parents=True)
+
+        # 复制所有文件
+        for root, dirs, files in os.walk(src):
+            # 创建子目录
+            rel_root = Path(root).relative_to(src)
+            dst_root = dst / rel_root
+            dst_root.mkdir(parents=True, exist_ok=True)
+
+            # 复制文件
+            for file in files:
+                src_file = Path(root) / file
+                dst_file = dst_root / file
+                shutil.copy2(src_file, dst_file)
+                progress_data['current'] += 1
+
+    async def _import_project(self):
+        """导入项目"""
+        # 创建导入对话框
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('📥 导入项目').classes('text-h6')
+            ui.label('项目中已包含游戏文件，无需指定游戏目录').classes('text-caption text-grey')
+
+            # 文件上传
+            import_file_data = {'path': None, 'name': None}
+
+            async def on_upload(e):
+                # 保存文件到临时目录
+                import tempfile
+                temp_dir = tempfile.mkdtemp()
+                temp_path = Path(temp_dir) / e.file.name
+                await e.file.save(temp_path)
+                import_file_data['path'] = str(temp_path)
+                import_file_data['name'] = e.file.name
+                import_file_label.text = f'已选择: {e.file.name}'
+
+            ui.upload(label='选择项目zip文件', on_upload=on_upload, max_files=1, auto_upload=True).props('accept=.zip')
+            import_file_label = ui.label('未选择文件').classes('text-caption')
+
+            import_name = ui.input(label='项目名称（可选）', placeholder='留空使用原名称')
+
+            with ui.row().classes('gap-2'):
+                ui.button('取消', on_click=dialog.close)
+                ui.button('导入', color='primary', on_click=lambda: self._do_import(
+                    import_name.value,
+                    import_file_data,
+                    dialog
+                ))
+
+        dialog.props('persistent')
+        dialog.open()
+
+    async def _do_import(self, project_name, import_file_data, dialog):
+        """执行导入"""
+        if not import_file_data.get('path'):
+            ui.notify('请先选择zip文件', type='warning')
+            return
+
+        # 关闭选择对话框
+        dialog.close()
+        await asyncio.sleep(0)
+
+        # 创建进度对话框
+        with ui.dialog() as progress_dialog, ui.card().classes('w-96'):
+            ui.label('📥 导入项目').classes('text-h6')
+            progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+            progress_label = ui.label('正在导入...').classes('text-caption')
+
+        progress_dialog.props('persistent')
+        progress_dialog.open()
+
+        try:
+            # 在线程池中执行导入
+            loop = asyncio.get_event_loop()
+
+            def _do_import_thread():
+                from project_exporter import ProjectExporter
+                exporter = ProjectExporter(str(self.project_manager.projects_dir))
+                return exporter.import_project(
+                    import_file_data['path'],
+                    project_name if project_name else None
+                )
+
+            progress_bar.value = 0.3
+            progress_label.text = '正在解压文件...'
+            await asyncio.sleep(0)
+
+            result = await loop.run_in_executor(self.executor, _do_import_thread)
+
+            progress_bar.value = 1.0
+            progress_label.text = '导入完成！'
+            await asyncio.sleep(0.5)
+
+            if result['success']:
+                ui.notify(result['message'], type='positive')
+                self._refresh_project_list()
+            else:
+                ui.notify(result['message'], type='negative')
+
+        except Exception as e:
+            ui.notify(f'导入失败: {str(e)}', type='negative')
+
+        finally:
+            await asyncio.sleep(0)
+            progress_dialog.close()
+
+    def _show_edit_project_dialog(self, project_name):
+        """显示编辑项目模态框"""
+        # 加载项目数据
+        project = self.project_manager.load_project(project_name)
+        if not project:
+            ui.notify('项目不存在', type='negative')
+            return
+
+        # 创建对话框
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('✏️ 编辑项目').classes('text-h6')
+
+            # 项目名称
+            name_input = ui.input(label='项目名称', value=project.name).classes('w-full')
+
+            # 模型选择
+            model_names = [c.name for c in self.config_manager.load_all_configs()]
+            model_select = ui.select(
+                options=model_names,
+                label='AI模型',
+                value=project.model_config_name if project.model_config_name else (model_names[0] if model_names else None)
+            ).classes('w-full')
+
+            with ui.row().classes('gap-2'):
+                ui.button('取消', on_click=dialog.close)
+                ui.button('保存', color='primary', on_click=lambda: self._save_edit_project(
+                    project.name,
+                    name_input.value,
+                    model_select.value,
+                    dialog
+                ))
+
+        dialog.props('persistent')
+        dialog.open()
+
+    async def _save_edit_project(self, old_name, new_name, model, dialog):
+        """保存编辑后的项目"""
+        if not new_name:
+            ui.notify('项目名称不能为空', type='warning')
+            return
+
+        # 加载项目
+        project = self.project_manager.load_project(old_name)
+        if not project:
+            ui.notify('项目不存在', type='negative')
+            return
+
+        # 如果名称改变了，需要重命名
+        if old_name != new_name:
+            # 检查新名称是否已存在
+            if self.project_manager._get_project_file(new_name).exists():
+                ui.notify('项目名称已存在', type='negative')
+                return
+
+            # 重命名项目目录
+            old_dir = self.project_manager._get_project_dir(old_name)
+            new_dir = self.project_manager._get_project_dir(new_name)
+            old_dir.rename(new_dir)
+
+            # 更新 file_path 中的路径
+            old_path_prefix = str(old_dir)
+            new_path_prefix = str(new_dir)
+
+            for d in project.dialogues:
+                fp = d.get('file_path', '')
+                if fp and old_path_prefix in fp:
+                    d['file_path'] = fp.replace(old_path_prefix, new_path_prefix)
+
+            for u in project.ui_texts:
+                fp = u.get('file_path', '')
+                if fp and old_path_prefix in fp:
+                    u['file_path'] = fp.replace(old_path_prefix, new_path_prefix)
+
+            # 更新 last_position
+            if project.last_position.get('file'):
+                fp = project.last_position['file']
+                if old_path_prefix in fp:
+                    project.last_position['file'] = fp.replace(old_path_prefix, new_path_prefix)
+
+        # 更新项目配置
+        project.name = new_name
+        project.model_config_name = model
+        self.project_manager.save_project(project)
+
+        # 如果当前打开的是这个项目，更新引用
+        if self.current_project and self.current_project.name == old_name:
+            self.current_project = project
+
+        ui.notify('项目已更新', type='positive')
+        dialog.close()
+        await asyncio.sleep(0)
+        self._refresh_project_list()
+
+    def _confirm_delete_project(self, project_name):
+        """确认删除项目"""
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('🗑️ 删除项目').classes('text-h6')
+            ui.label(f'确定要删除项目 "{project_name}" 吗？').classes('text-body1')
+            ui.label('此操作不可撤销，将删除项目所有数据。').classes('text-caption text-negative')
+
+            with ui.row().classes('gap-2'):
+                ui.button('取消', on_click=dialog.close)
+                ui.button('删除', color='negative', on_click=lambda: self._delete_project(project_name, dialog))
+
+        dialog.props('persistent')
+        dialog.open()
+
+    async def _delete_project(self, project_name, dialog):
+        """删除项目"""
+        import shutil
+
+        # 关闭确认对话框
+        dialog.close()
+        await asyncio.sleep(0)
+
+        # 创建进度对话框
+        with ui.dialog() as progress_dialog, ui.card().classes('w-96'):
+            ui.label('🗑️ 删除项目').classes('text-h6')
+            progress_label = ui.label('正在删除...').classes('text-caption')
+
+        progress_dialog.props('persistent')
+        progress_dialog.open()
+
+        try:
+            # 如果删除的是当前打开的项目，先关闭
+            if self.current_project and self.current_project.name == project_name:
+                self.current_project = None
+                self.status_label.text = '未打开项目'
+
+            # 在线程池中执行删除
+            loop = asyncio.get_event_loop()
+
+            def _do_delete():
+                project_dir = self.project_manager._get_project_dir(project_name)
+                if project_dir.exists():
+                    shutil.rmtree(project_dir)
+
+            await loop.run_in_executor(self.executor, _do_delete)
+
+            ui.notify(f'项目 "{project_name}" 已删除', type='positive')
+            self._refresh_project_list()
+
+        except Exception as e:
+            ui.notify(f'删除失败: {str(e)}', type='negative')
+
+        finally:
+            await asyncio.sleep(0.5)
+            progress_dialog.close()
+
+    def _show_create_project_dialog(self):
+        """显示创建项目模态框"""
+        # 创建对话框
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('➕ 创建新项目').classes('text-h6')
+            ui.label('填写游戏目录路径，自动解析并创建项目').classes('text-caption text-grey')
+
+            # 项目名称
+            name_input = ui.input(label='项目名称', placeholder='MyGame').classes('w-full')
+
+            # 游戏目录路径
+            game_dir_input = ui.input(label='游戏目录', placeholder='C:\\path\\to\\game').classes('w-full')
+
+            # 模型选择
+            model_names = [c.name for c in self.config_manager.load_all_configs()]
+            model_select = ui.select(options=model_names, label='AI模型', value=model_names[0] if model_names else None).classes('w-full')
+
+            with ui.row().classes('gap-2'):
+                ui.button('取消', on_click=dialog.close)
+                ui.button('创建', color='primary', on_click=lambda: self._do_create_project(
+                    name_input.value,
+                    game_dir_input.value,
+                    model_select.value,
+                    dialog
+                ))
+
+        dialog.props('persistent')
+        dialog.open()
+
+    def _do_create_project(self, name, game_dir, model, dialog):
+        """执行创建项目"""
+        if not name:
+            ui.notify('请填写项目名称', type='warning')
+            return
+
+        if not game_dir:
+            ui.notify('请填写游戏目录', type='warning')
+            return
+
+        if not Path(game_dir).exists():
+            ui.notify('游戏目录不存在', type='negative')
+            return
+
+        # 禁用创建按钮
+        self.create_btn.disable()
+        self.create_btn.text = '创建中...'
+        dialog.close()
+
+        # 存储创建状态
+        self._creating_project = {
+            'done': False,
+            'success': False,
+            'message': '',
+            'name': name,
+            'game_dir': game_dir,
+            'model': model
+        }
+
+        # 在线程池中执行
+        self.executor.submit(self._create_project_thread, name, game_dir, model)
+
+        # 启动定时器检查状态
+        ui.timer(0.5, self._check_project_creation, once=True)
 
     def _create_project(self, name, game_dir, model):
         """创建项目"""
@@ -1724,6 +2272,7 @@ class TranslatorUI:
                 # 关闭按钮
                 ui.button('关闭', on_click=dialog.close).classes('mt-4')
 
+            dialog.props('persistent')
             dialog.open()
 
     def _do_dialogue_translate(self, queue_item):
@@ -2063,7 +2612,7 @@ class TranslatorUI:
                         if msg == '__DONE__':
                             break
                         self.export_log.push(msg)
-                    except:
+                    except Exception:
                         pass
                     await asyncio.sleep(0.1)  # 每100ms检查一次
 
@@ -2076,8 +2625,12 @@ class TranslatorUI:
                 lambda: self._export_game_thread(log_queue)
             )
 
-            # 等待日志处理完成
-            await log_task
+            # 等待日志处理完成（设置超时保护）
+            try:
+                await asyncio.wait_for(log_task, timeout=10.0)
+            except asyncio.TimeoutError:
+                log_task.cancel()
+                self.export_log.push('⚠️ 日志处理超时')
 
             if result['success']:
                 self.export_log.push('')
@@ -2697,6 +3250,7 @@ screen language_selector():
 
             ui.button('关闭', on_click=dialog.close).classes('mt-4')
 
+        dialog.props('persistent')
         dialog.open()
 
     def _analyze_all_characters(self):
@@ -3068,6 +3622,7 @@ screen language_selector():
                         ui.notify(f'已删除配置: {name}', type='positive'),
                         dialog.close()
                     ))
+        dialog.props('persistent')
         dialog.open()
 
     def _clear_config_form(self):
