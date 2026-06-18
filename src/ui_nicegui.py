@@ -2909,9 +2909,8 @@ class TranslatorUI:
             log('  ⚠️ 未找到合适的插入位置')
             return
 
-        # 6. 构建语言选择代码
+        # 6. 构建语言选择代码（避免使用 style_prefix，防止样式循环）
         language_block = '''            vbox:
-                style_prefix "radio"
                 label _("Language")
                 textbutton "English" action Language(None)
                 textbutton "中文" action Language("chinese")
@@ -2926,55 +2925,6 @@ class TranslatorUI:
             f.write(content)
 
         log('  ✅ 已在preferences中添加语言选择')
-
-        # 检查是否已有语言选择
-        if 'Language("chinese")' in content:
-            log('  ✅ 语言选择界面已存在')
-            return
-
-        # 在preferences屏幕中添加语言选择
-        if 'screen preferences():' in content:
-            # 在文件末尾添加语言选择屏幕
-            language_screen = """
-
-# 语言选择屏幕（由翻译工具添加）
-screen language_selector():
-    tag menu
-    use preferences
-    vbox:
-        style_prefix "radio"
-        xalign 0.5
-        yalign 0.5
-        spacing 20
-        label _("Language")
-        textbutton "English" action Language(None)
-        textbutton "中文" action Language("chinese")
-"""
-            content += language_screen
-
-            # 在preferences屏幕中添加语言按钮
-            # 查找 "Game Menu" 或类似的位置
-            if 'textbutton _("Preferences")' in content:
-                content = content.replace(
-                    'textbutton _("Preferences")',
-                    'textbutton _("Preferences")\n                    textbutton _("Language") action Show("language_selector")'
-                )
-                log('  ✅ 已添加语言选择按钮到主菜单')
-            elif 'textbutton _("Preferences") action Show("preferences")' in content:
-                content = content.replace(
-                    'textbutton _("Preferences") action Show("preferences")',
-                    'textbutton _("Preferences") action Show("preferences")\n                    textbutton _("Language") action Show("language_selector")'
-                )
-                log('  ✅ 已添加语言选择按钮到主菜单')
-            else:
-                log('  ⚠️ 未找到主菜单按钮位置，但已添加语言选择屏幕')
-
-            # 写入修改后的文件
-            with open(target_file, 'w', encoding='utf-8') as f:
-                f.write(content)
-            log('  ✅ 已添加语言选择界面')
-        else:
-            log('  ⚠️ 未找到preferences屏幕')
 
     def _add_chinese_font_support(self, export_dir, log):
         """添加中文字体支持"""
@@ -3009,30 +2959,8 @@ screen language_selector():
                 log(f'  ⚠️ 复制字体失败: {e}')
 
     def _configure_chinese_font(self, export_dir, log):
-        """配置gui.rpy使用中文字体"""
+        """配置所有rpy文件使用中文字体"""
         import re
-
-        # 在导出目录中查找gui.rpy
-        possible_paths = [
-            export_dir / 'game' / 'scripts' / 'gui.rpy',
-            export_dir / 'game' / 'gui.rpy',
-        ]
-
-        gui_file = None
-        for path in possible_paths:
-            if path.exists():
-                gui_file = path
-                break
-
-        if not gui_file:
-            log('  ⚠️ 找不到gui.rpy，跳过字体配置')
-            return
-
-        log(f'  找到gui.rpy: {gui_file}')
-
-        # 读取文件
-        with open(gui_file, 'r', encoding='utf-8') as f:
-            content = f.read()
 
         # 查找导出目录中的字体文件（优先使用项目内置字体）
         fonts_dir = export_dir / 'game' / 'fonts'
@@ -3056,31 +2984,84 @@ screen language_selector():
             log('  ⚠️ 未找到字体文件，跳过字体配置')
             return
 
-        # 替换字体配置
         font_path = f'fonts/{font_name}'
-        content = re.sub(
-            r'(define gui\.text_font\s*=\s*)"[^"]*"',
-            lambda m: f'{m.group(1)}"{font_path}"',
-            content
-        )
-        content = re.sub(
-            r'(define gui\.name_text_font\s*=\s*)"[^"]*"',
-            lambda m: f'{m.group(1)}"{font_path}"',
-            content
-        )
-        content = re.sub(
-            r'(define gui\.interface_text_font\s*=\s*)"[^"]*"',
-            lambda m: f'{m.group(1)}"{font_path}"',
-            content
-        )
+        log(f'  使用字体: {font_path}')
 
-        log(f'  配置字体: {font_path}')
+        # 1. 配置 gui.rpy
+        possible_paths = [
+            export_dir / 'game' / 'scripts' / 'gui.rpy',
+            export_dir / 'game' / 'gui.rpy',
+        ]
 
-        # 写入修改后的文件
-        with open(gui_file, 'w', encoding='utf-8') as f:
-            f.write(content)
+        gui_file = None
+        for path in possible_paths:
+            if path.exists():
+                gui_file = path
+                break
 
-        log('  ✅ 已配置中文字体')
+        if gui_file:
+            with open(gui_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            content = re.sub(
+                r'(define gui\.text_font\s*=\s*)"[^"]*"',
+                lambda m: f'{m.group(1)}"{font_path}"',
+                content
+            )
+            content = re.sub(
+                r'(define gui\.name_text_font\s*=\s*)"[^"]*"',
+                lambda m: f'{m.group(1)}"{font_path}"',
+                content
+            )
+            content = re.sub(
+                r'(define gui\.interface_text_font\s*=\s*)"[^"]*"',
+                lambda m: f'{m.group(1)}"{font_path}"',
+                content
+            )
+
+            with open(gui_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            log(f'  ✅ 已配置 gui.rpy')
+
+        # 2. 遍历所有rpy文件，替换硬编码的字体引用
+        game_dir = export_dir / 'game'
+        modified_count = 0
+
+        # 需要替换的非中文字体列表
+        non_chinese_fonts = [
+            'DejaVuSans.ttf',
+            'VCR_OSD_MONO_1.001.ttf',
+            'Daydream.ttf',
+        ]
+
+        for rpy_file in game_dir.rglob('*.rpy'):
+            if rpy_file.name == 'gui.rpy':
+                continue  # 已经处理过了
+
+            try:
+                with open(rpy_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                original_content = content
+
+                # 替换 font "xxx.ttf" 格式
+                for old_font in non_chinese_fonts:
+                    content = content.replace(f'font "{old_font}"', f'font "{font_path}"')
+
+                # 如果内容有变化，写入文件
+                if content != original_content:
+                    with open(rpy_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    modified_count += 1
+                    log(f'  ✅ 已更新: {rpy_file.name}')
+
+            except Exception as e:
+                log(f'  ⚠️ 处理 {rpy_file.name} 失败: {e}')
+
+        if modified_count > 0:
+            log(f'  ✅ 共更新 {modified_count} 个文件')
+        else:
+            log('  ✅ 无需更新其他文件')
 
     def _add_ui_translations(self, export_dir, log):
         """添加字符串翻译"""
