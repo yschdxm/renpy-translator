@@ -144,6 +144,8 @@ class TranslatorUI:
             self.name_page_label = ui.label('第 1 页')
             ui.button('▶', on_click=lambda: self._name_next_page()).props('flat dense')
             ui.button('⏭', on_click=lambda: self._name_goto_page(-1)).props('flat dense')
+            self.name_page_input = ui.number(label='跳转', value=1, min=1).classes('w-20')
+            ui.button('跳', on_click=lambda: self._name_goto_page(int(self.name_page_input.value) - 1)).props('flat dense')
             self.translate_all_names_btn = ui.button('🌐 翻译全部人名', color='primary', on_click=self._translate_all_names)
             self.stop_names_btn = ui.button('⏹ 停止', color='red', on_click=self._stop_translation)
             self.stop_names_btn.set_visibility(False)
@@ -258,6 +260,8 @@ class TranslatorUI:
             self.ui_page_label = ui.label('第 1 页')
             ui.button('▶', on_click=lambda: self._ui_next_page()).props('flat dense')
             ui.button('⏭', on_click=lambda: self._ui_goto_page(-1)).props('flat dense')
+            self.ui_page_input = ui.number(label='跳转', value=1, min=1).classes('w-20')
+            ui.button('跳', on_click=lambda: self._ui_goto_page(int(self.ui_page_input.value) - 1)).props('flat dense')
             self.ui_translate_page_btn = ui.button('🚀 翻译本页', color='primary', on_click=self._ui_translate_page)
             self.ui_translate_all_btn = ui.button('⚡ 全部翻译', color='secondary', on_click=self._ui_translate_all)
             self.ui_stop_btn = ui.button('⏹ 停止', color='red', on_click=self._stop_translation)
@@ -328,6 +332,8 @@ class TranslatorUI:
             self.dialogue_page_label = ui.label('第 1 页')
             ui.button('▶', on_click=lambda: self._dialogue_next_page()).props('flat dense')
             ui.button('⏭', on_click=lambda: self._dialogue_goto_page(-1)).props('flat dense')
+            self.dialogue_page_input = ui.number(label='跳转', value=1, min=1).classes('w-20')
+            ui.button('跳', on_click=lambda: self._dialogue_goto_page(int(self.dialogue_page_input.value) - 1)).props('flat dense')
             self.translate_page_btn = ui.button('🚀 翻译本页', color='primary', on_click=self._dialogue_translate_page)
             self.translate_all_btn = ui.button('⚡ 全部翻译', color='secondary', on_click=self._dialogue_translate_all)
             self.stop_translate_btn = ui.button('⏹ 停止', color='red', on_click=self._stop_translation)
@@ -1976,6 +1982,7 @@ class TranslatorUI:
         self.name_table.rows = rows
         self.name_stats.text = f'📊 共 {total} 个人名'
         self.name_page_label.text = f'第 {self.name_current_page + 1} / {total_pages} 页'
+        self.name_page_input.value = self.name_current_page + 1
 
     def _name_prev_page(self):
         if self.name_current_page > 0:
@@ -2116,7 +2123,7 @@ class TranslatorUI:
         self.ui_table.rows = rows
         self.ui_stats.text = f'📊 总计: {total} | ✅ 已翻译: {translated}'
         self.ui_page_label.text = f'第 {self.ui_current_page + 1} / {total_pages} 页'
-        self.ui_page_label.text = f'第 {self.ui_current_page + 1} / {total_pages} 页'
+        self.ui_page_input.value = self.ui_current_page + 1
 
     def _ui_prev_page(self):
         if self.ui_current_page > 0:
@@ -2380,6 +2387,7 @@ class TranslatorUI:
         self.dialogue_table.rows = rows
         self.dialogue_stats.text = f'📊 总计: {total} | ✅ 已翻译: {translated}'
         self.dialogue_page_label.text = f'第 {self.dialogue_current_page + 1} / {total_pages} 页'
+        self.dialogue_page_input.value = self.dialogue_current_page + 1
 
     def _dialogue_apply_filter(self):
         self.dialogue_search_text = self.dialogue_search.value
@@ -2749,7 +2757,7 @@ class TranslatorUI:
                 with open(tl_file, 'r', encoding='utf-8') as f:
                     content = f.read()
 
-                # 替换对话格式: # "原文" \n "原文" -> # "原文" \n "译文"
+                # 替换对话格式
                 lines = content.split('\n')
                 new_lines = []
                 i = 0
@@ -2760,13 +2768,47 @@ class TranslatorUI:
                     comment_match = re.match(r'^\s+#\s+(.*)', line)
                     if comment_match:
                         comment_text = comment_match.group(1).strip()
+
+                        # 跳过空注释和文件路径注释
+                        if not comment_text or comment_text.startswith('game/'):
+                            new_lines.append(line)
+                            i += 1
+                            continue
+
+                        # 检查是否是重复的注释行（跳过第二个）
+                        if i + 1 < len(lines):
+                            next_comment = re.match(r'^\s+#\s+(.*)', lines[i + 1])
+                            if next_comment and next_comment.group(1).strip() == comment_text:
+                                # 跳过重复的注释行
+                                new_lines.append(line)
+                                i += 1
+                                continue
+
                         new_lines.append(line)
 
                         # 检查下一行是否是内容行
                         if i + 1 < len(lines):
-                            content_match = re.match(r'^\s+"(.*)"', lines[i + 1])
+                            # 匹配角色对话格式: mc "text" 或 旁白格式: "text"
+                            content_match = re.match(r'^\s+(\w+)\s+"(.*)"', lines[i + 1])
+                            narration_match = re.match(r'^\s+"(.*)"', lines[i + 1])
+
                             if content_match:
-                                content_text = content_match.group(1).replace('\\"', '"')
+                                # 角色对话格式
+                                character = content_match.group(1)
+                                content_text = content_match.group(2).replace('\\"', '"')
+                                # 查找翻译
+                                if content_text in translation_dict:
+                                    translated = translation_dict[content_text]
+                                    escaped = translated.replace('"', '\\"')
+                                    new_lines.append(f'    {character} "{escaped}"')
+                                    filled_count += 1
+                                else:
+                                    new_lines.append(lines[i + 1])
+                                i += 2
+                                continue
+                            elif narration_match:
+                                # 旁白格式
+                                content_text = narration_match.group(1).replace('\\"', '"')
                                 # 查找翻译
                                 if content_text in translation_dict:
                                     translated = translation_dict[content_text]
