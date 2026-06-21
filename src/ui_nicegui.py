@@ -44,93 +44,162 @@ class TranslatorUI:
         self.executor = ThreadPoolExecutor(max_workers=5)  # 线程池
 
         # UI组件引用
-        self.project_list = None
-        self.dialogue_preview = None
-        self.translation_input = None
-        self.status_label = None
-        self.progress_label = None
+        self.header_project_select = None
+        self.header_progress = None
+        self.header_queue = None
+        self._panels = {}
+        self._nav_items = {}
+        self._active_panel = 'names'
 
     def create(self):
-        """创建UI"""
-        # 页面标题
-        ui.markdown('# 🎮 Ren\'Py翻译工具')
+        """创建UI - 专业项目软件布局"""
+        self._active_panel = 'projects'
 
-        # 顶部状态栏
-        with ui.header().classes('bg-primary text-white'):
-            with ui.row().classes('w-full items-center'):
-                ui.label('🎮 Ren\'Py翻译工具').classes('text-h5')
-                ui.space()
-                self.status_label = ui.label('未打开项目').classes('text-subtitle1')
+        ui.add_head_html('<style>.q-splitter__separator{background:#e0e0e0!important;width:1px!important;}</style>')
 
-        # 主布局：左侧边栏 + 右侧内容
-        with ui.row().classes('w-full'):
-            # 左侧边栏
-            with ui.column().classes('w-64 gap-2'):
-                self._create_sidebar()
+        # ========== 顶部栏 ==========
+        with ui.header().classes('items-center').style('background: #1a1a2e;'):
+            ui.label('🎮 Ren\'Py Translator').classes('text-h6 text-white q-ml-md').style('font-weight: 600;')
+            ui.separator().props('vertical').classes('q-mx-sm')
+            self.header_project_select = ui.select(
+                options={}, label='切换项目', value=None, with_input=True
+            ).classes('w-48').props('dark dense outlined hide-details color=grey-5')
+            self.header_project_select.on('update:model-value', lambda e: self._on_header_project_select(e))
+            self._refresh_header_project_options()
 
-            # 右侧内容区
-            with ui.column().classes('flex-1 gap-2'):
-                self._create_main_content()
+            ui.space()
 
-    def _create_sidebar(self):
-        """创建左侧边栏"""
-        with ui.card().classes('w-full'):
-            ui.label('📁 项目管理').classes('text-h6')
+            self.header_progress = ui.label('').classes('text-caption text-grey-5')
+            ui.separator().props('vertical').classes('q-mx-xs')
+            self.header_queue = ui.label('').classes('text-caption text-grey-5')
 
-            # 项目列表
-            self.project_list = ui.list().classes('w-full')
+        # ========== 主体 ==========
+        with ui.column().classes('w-full').style('height: calc(100vh - 50px); padding: 0;'):
+            with ui.splitter(horizontal=False).classes('w-full h-full') as splitter:
+                # ===== 左侧导航 =====
+                with splitter.before:
+                    with ui.column().classes('full-width').style('overflow-x: hidden; overflow-y: auto;'):
+                        self._nav_items = {}
+                        with ui.list().classes('full-width'):
+                            nav_items = [
+                                ('projects', 'folder', '项目管理'),
+                                ('names', 'person', '人名翻译'),
+                                ('analysis', 'psychology', '人物分析'),
+                                ('strings', 'translate', '字符串翻译'),
+                                ('dialogue', 'chat', '对话翻译'),
+                                ('export', 'folder_zip', '导出游戏'),
+                                ('config', 'settings', '模型配置'),
+                            ]
+                            for key, icon, label in nav_items:
+                                with ui.item(on_click=lambda k=key: self._switch_panel(k)).classes('q-py-xs'):
+                                    with ui.item_section().props('avatar'):
+                                        ui.icon(icon).props('size=sm')
+                                    with ui.item_section():
+                                        ui.item_label(label).classes('text-body2')
+                                self._nav_items[key] = (icon, label)
 
-            # 刷新项目列表
-            self._refresh_project_list()
+                # ===== 右侧内容 =====
+                with splitter.after:
+                    splitter.props(':model-value=15')
+                    self._panels = {}
+                    with ui.column().classes('full-width').style('overflow-y: auto; height: 100%;'):
+                        with ui.card().classes('w-full flat bordered').style('display: block;') as panel_projects:
+                            self._create_project_panel()
+                        self._panels['projects'] = panel_projects
 
-            ui.separator()
+                        with ui.card().classes('w-full flat bordered').style('display: none;') as panel_names:
+                            self._create_name_panel()
+                        self._panels['names'] = panel_names
 
-            # 新建项目
-            ui.label('新建项目').classes('text-subtitle2')
-            self.create_btn = ui.button('➕ 创建项目', on_click=self._show_create_project_dialog).classes('w-full')
+                        with ui.card().classes('w-full flat bordered').style('display: none;') as panel_analysis:
+                            self._create_analysis_panel()
+                        self._panels['analysis'] = panel_analysis
 
-            ui.separator()
+                        with ui.card().classes('w-full flat bordered').style('display: none;') as panel_strings:
+                            self._create_strings_panel()
+                        self._panels['strings'] = panel_strings
 
-            # 导出导入
-            with ui.row().classes('w-full gap-2'):
-                self.export_project_btn = ui.button('📦 导出项目', on_click=self._export_current_project)
-                self.import_project_btn = ui.button('📥 导入项目', on_click=self._import_project)
+                        with ui.card().classes('w-full flat bordered').style('display: none;') as panel_dialogue:
+                            self._create_dialogue_panel()
+                        self._panels['dialogue'] = panel_dialogue
 
-    def _create_main_content(self):
-        """创建主内容区"""
-        # 标签页
-        with ui.tabs() as tabs:
-            tab_name = ui.tab('人名翻译', icon='person')
-            tab_analysis = ui.tab('人物分析', icon='psychology')
-            tab_strings = ui.tab('字符串翻译', icon='translate')
-            tab_dialogue = ui.tab('对话翻译', icon='chat')
-            tab_export = ui.tab('导出游戏', icon='folder_zip')
-            tab_config = ui.tab('模型配置', icon='settings')
+                        with ui.card().classes('w-full flat bordered').style('display: none;') as panel_export:
+                            self._create_export_panel()
+                        self._panels['export'] = panel_export
 
-        with ui.tab_panels(tabs, value='人名翻译').classes('w-full'):
-            # 人名翻译
-            with ui.tab_panel('人名翻译'):
-                self._create_name_panel()
+                        with ui.card().classes('w-full flat bordered').style('display: none;') as panel_config:
+                            self._create_config_panel()
+                        self._panels['config'] = panel_config
 
-            # 人物分析
-            with ui.tab_panel('人物分析'):
-                self._create_analysis_panel()
+        self._refresh_config_list()
 
-            # 字符串翻译（菜单选项等）
-            with ui.tab_panel('字符串翻译'):
-                self._create_strings_panel()
+    def _switch_panel(self, panel_key: str):
+        """切换主内容面板"""
+        for key, panel in self._panels.items():
+            panel.style('display: block;' if key == panel_key else 'display: none;')
+        self._active_panel = panel_key
 
-            # 对话翻译
-            with ui.tab_panel('对话翻译'):
-                self._create_dialogue_panel()
+    # ========== 项目管理面板 ==========
 
-            # 导出游戏
-            with ui.tab_panel('导出游戏'):
-                self._create_export_panel()
+    def _create_project_panel(self):
+        """项目管理面板 - 所有项目操作集中在此"""
+        with ui.row().classes('items-center q-mb-md'):
+            ui.label('项目管理').classes('text-h6')
+            ui.space()
+            ui.button('新建项目', on_click=self._show_create_project_dialog, icon='add', color='primary').props('dense')
+            ui.button('导入项目', on_click=self._import_project, icon='file_upload').props('dense outline')
 
-            # 模型配置
-            with ui.tab_panel('模型配置'):
-                self._create_config_panel()
+        ui.separator()
+
+        # 项目卡片列表
+        self.project_card_container = ui.column().classes('full-width')
+        self._refresh_project_cards()
+
+        # 导出的项目包
+        ui.separator()
+        with ui.row().classes('items-center q-mt-md q-mb-sm'):
+            ui.label('已导出的项目包').classes('text-subtitle1')
+            ui.space()
+            ui.button('刷新', icon='refresh', on_click=self._refresh_export_packages).props('flat dense')
+
+        self.export_packages_container = ui.column().classes('full-width')
+        self._refresh_export_packages()
+
+    def _refresh_project_cards(self):
+        """刷新项目卡片列表"""
+        self.project_card_container.clear()
+        projects = self.project_manager.list_projects()
+
+        with self.project_card_container:
+            if not projects:
+                with ui.card().classes('w-full flat bordered q-pa-lg'):
+                    with ui.column().classes('items-center'):
+                        ui.icon('folder_off', size='3rem').classes('text-grey-5')
+                        ui.label('暂无项目').classes('text-grey-6 q-mt-sm')
+                        ui.label('点击上方「新建项目」开始').classes('text-caption text-grey-5')
+                return
+
+            for p in projects:
+                is_active = self.current_project and self.current_project.name == p.name
+                with ui.card().classes('w-full flat bordered q-mb-sm'):
+                    with ui.row().classes('items-center full-width q-pa-sm'):
+                        ui.icon('folder_open' if is_active else 'folder', size='1.5rem').classes(
+                            'text-primary' if is_active else 'text-grey-6')
+
+                        with ui.column().classes('q-ml-sm'):
+                            ui.label(p.name).classes(
+                                'text-subtitle1 text-weight-medium text-primary' if is_active else 'text-subtitle1')
+                            ui.label(p.progress_text).props('caption')
+
+                        ui.space()
+
+                        with ui.row().classes('gap-xs items-center'):
+                            btn_open = ui.button('打开', on_click=lambda name=p.name: self._open_project(name)).props('dense flat no-caps')
+                            if is_active:
+                                btn_open.props('color=primary')
+                            ui.button('导出', on_click=lambda name=p.name: self._export_project_by_name(name)).props('dense flat no-caps')
+                            ui.button(icon='edit', on_click=lambda name=p.name: self._show_edit_project_dialog(name)).props('flat dense round size=sm')
+                            ui.button(icon='delete', on_click=lambda name=p.name: self._confirm_delete_project(name)).props('flat dense round size=sm color=negative')
 
     def _create_name_panel(self):
         """创建人名翻译面板"""
@@ -464,20 +533,25 @@ class TranslatorUI:
     # ========== 项目操作 ==========
 
     def _refresh_project_list(self):
-        """刷新项目列表"""
-        self.project_list.clear()
-        projects = self.project_manager.list_projects()
+        """刷新项目列表（调用卡片版本）"""
+        if hasattr(self, 'project_card_container'):
+            self._refresh_project_cards()
+        self._refresh_header_project_options()
 
-        with self.project_list:
-            for p in projects:
-                with ui.item(on_click=lambda name=p.name: self._open_project(name)):
-                    with ui.item_section():
-                        ui.item_label(p.name)
-                        ui.item_label(p.progress_text).props('caption')
-                    with ui.item_section():
-                        with ui.row().classes('gap-1'):
-                            ui.button(icon='edit', on_click=lambda name=p.name: self._show_edit_project_dialog(name)).props('flat dense @click.stop')
-                            ui.button(icon='delete', on_click=lambda name=p.name: self._confirm_delete_project(name)).props('flat dense color=negative @click.stop')
+    def _refresh_header_project_options(self):
+        """刷新顶栏项目下拉选项"""
+        if not self.header_project_select:
+            return
+        projects = self.project_manager.list_projects()
+        options = {p.name: p.name for p in projects}
+        self.header_project_select.options = options
+        self.header_project_select.update()
+
+    def _on_header_project_select(self, e):
+        """顶栏项目下拉选择事件"""
+        name = e.args if hasattr(e, 'args') else e
+        if name and isinstance(name, str) and name != '':
+            self._open_project(name)
 
     # ========== SDK 管理 ==========
 
@@ -519,6 +593,12 @@ class TranslatorUI:
         else:
             self.sdk_status.text = '❌ 无效的 SDK 路径'
             self.sdk_status.classes(replace='text-caption text-negative')
+
+    def _export_project_by_name(self, name):
+        """按名称导出项目（先打开再导出）"""
+        if not self.current_project or self.current_project.name != name:
+            self._open_project(name)
+        asyncio.create_task(self._export_current_project())
 
     async def _export_current_project(self):
         """导出当前项目"""
@@ -981,7 +1061,8 @@ class TranslatorUI:
             # 如果删除的是当前打开的项目，先关闭
             if self.current_project and self.current_project.name == project_name:
                 self.current_project = None
-                self.status_label.text = '未打开项目'
+                self.header_project_select.value = None
+                self.header_progress.text = ''
 
             # 在线程池中执行删除
             loop = asyncio.get_event_loop()
@@ -1046,9 +1127,6 @@ class TranslatorUI:
             ui.notify('游戏目录不存在', type='negative')
             return
 
-        # 禁用创建按钮
-        self.create_btn.disable()
-        self.create_btn.text = '创建中...'
         dialog.close()
 
         # 存储创建状态
@@ -1073,9 +1151,6 @@ class TranslatorUI:
             ui.notify('请填写完整信息', type='warning')
             return
 
-        # 禁用创建按钮
-        self.create_btn.disable()
-        self.create_btn.text = '创建中...'
         ui.notify('正在创建项目，请稍候...', type='info', timeout=2000)
 
         # 存储创建状态
@@ -1405,7 +1480,6 @@ class TranslatorUI:
     def _check_project_creation(self):
         """检查项目创建状态"""
         if not hasattr(self, '_creating_project') or not self._creating_project['done']:
-            # 还没完成，继续检查
             if hasattr(self, '_creating_project') and not self._creating_project['done']:
                 ui.timer(0.5, self._check_project_creation, once=True)
             return
@@ -1414,12 +1488,10 @@ class TranslatorUI:
         if self._creating_project['success']:
             ui.notify(self._creating_project['message'], type='positive')
             self._refresh_project_list()
+            # 自动打开新创建的项目
+            self._open_project(self._creating_project['name'])
         else:
             ui.notify(self._creating_project['message'], type='negative')
-
-        # 恢复按钮
-        self.create_btn.enable()
-        self.create_btn.text = '➕ 创建项目'
 
     def _open_project(self, name):
         """打开项目"""
@@ -1433,17 +1505,25 @@ class TranslatorUI:
         self.ui_current_page = 0
         self.dialogue_current_page = 0
 
-        # 初始化翻译器
         if project.model_config_name:
             self._init_translator(project.model_config_name)
 
-        # 更新所有面板
+        # 刷新所有面板
         self._name_refresh()
         self._refresh_analysis()
         self._ui_refresh()
         self._dialogue_refresh()
         self._refresh_export_stats()
-        self.status_label.text = f'当前项目: {name}'
+
+        # 更新状态
+        stats = project.get_stats()
+        self._refresh_header_project_options()
+        self.header_project_select.value = name
+        self.header_progress.text = f'进度: {stats["translated_dialogues"]}/{stats["total_dialogues"]}'
+
+        # 刷新项目卡片并切到人名翻译
+        self._refresh_project_cards()
+        self._switch_panel('names')
 
         ui.notify(f'已打开项目: {name}', type='positive')
 
@@ -1499,54 +1579,15 @@ class TranslatorUI:
 
     def _update_progress(self):
         """更新进度显示"""
-        if not self.current_project:
-            self.progress_label.text = '请先打开项目'
+        if not self.current_project or not self.header_progress:
             return
 
         stats = self.current_project.get_stats()
-        filtered = self._get_filtered_dialogues()
-        self.progress_label.text = (
-            f"📊 总进度: {stats['translated_dialogues']}/{stats['total_dialogues']} 对话 | "
-            f"当前筛选: {len(filtered)} 条 | 位置: {self.current_index + 1}/{len(filtered)}"
-        )
+        self.header_progress.text = f'进度: {stats["translated_dialogues"]}/{stats["total_dialogues"]}'
 
     def _update_preview(self):
-        """更新对话预览"""
-        filtered = self._get_filtered_dialogues()
-        if not filtered or self.current_index >= len(filtered):
-            self.dialogue_preview.content = '暂无对话'
-            return
-
-        dialogue = filtered[self.current_index]
-
-        # 构建预览文本
-        preview = f"""
-**📍 位置:** {dialogue.get('file_path', '')}:{dialogue.get('line_number', 0)}
-
-**👤 角色:** {dialogue.get('character', '') or '旁白'}
-
-**📝 原文:**
-{dialogue.get('original_text', '')}
-
-**🔄 译文:**
-{dialogue.get('translated_text', '') or '*未翻译*'}
-"""
-
-        # 上下文
-        ctx_before = dialogue.get('context_before', [])
-        ctx_after = dialogue.get('context_after', [])
-
-        if ctx_before:
-            preview += '\n\n**--- 前文 ---**\n'
-            for line in ctx_before[-2:]:
-                preview += f'{line}\n'
-
-        if ctx_after:
-            preview += '\n**--- 后文 ---**\n'
-            for line in ctx_after[:2]:
-                preview += f'{line}\n'
-
-        self.dialogue_preview.content = preview
+        """更新对话预览（NiceGUI版本通过表格直接展示，此方法仅更新进度）"""
+        self._update_progress()
 
     def _apply_filter(self, search, mode, char):
         """应用筛选"""
@@ -1612,15 +1653,13 @@ class TranslatorUI:
         except Exception as e:
             ui.notify(f'翻译失败: {str(e)}', type='negative')
 
-    def _manual_translate(self):
-        """手动翻译"""
+    def _manual_translate(self, text=None):
+        """手动翻译（通过参数传入或从表格直接编辑）"""
         if not self.current_project:
             ui.notify('请先打开项目', type='warning')
             return
 
-        text = self.translation_input.value
         if not text:
-            ui.notify('请输入翻译内容', type='warning')
             return
 
         filtered = self._get_filtered_dialogues()
@@ -1631,7 +1670,6 @@ class TranslatorUI:
         dialogue['translated_text'] = text
         dialogue['is_translated'] = True
 
-        self.translation_input.value = ''
         self._update_progress()
         self._update_preview()
         self._save_project()
@@ -1750,11 +1788,16 @@ class TranslatorUI:
 
     def _update_queue_status(self):
         """更新队列状态显示"""
-        if hasattr(self, 'queue_status'):
-            total = len(self.translate_queue)
-            translating = sum(1 for v in self.translate_queue.values() if v['status'] == '翻译中')
-            queued = sum(1 for v in self.translate_queue.values() if v['status'] == '排队中')
+        total = len(self.translate_queue)
+        translating = sum(1 for v in self.translate_queue.values() if v['status'] == '翻译中')
+        queued = sum(1 for v in self.translate_queue.values() if v['status'] == '排队中')
+
+        if hasattr(self, 'queue_status') and self.queue_status:
             self.queue_status.text = f'队列状态: {translating}个翻译中, {queued}个排队'
+
+        # 同步更新顶栏
+        if self.header_queue:
+            self.header_queue.text = f'队列: {translating}翻译中 / {queued}排队' if total > 0 else ''
 
     def _process_next_in_queue(self):
         """处理队列中的下一个任务（异步）"""
@@ -2550,6 +2593,18 @@ class TranslatorUI:
         ui.label('导出日志').classes('text-subtitle1')
         self.export_log = ui.log().classes('w-full h-64')
 
+        ui.separator()
+
+        # 导出文件管理
+        with ui.card().classes('w-full'):
+            with ui.row().classes('w-full items-center'):
+                ui.label('📁 导出文件管理').classes('text-h6')
+                ui.space()
+                ui.button('🔄 刷新列表', on_click=self._refresh_export_files).props('flat dense')
+
+            self.export_files_list = ui.list().classes('w-full')
+            self._refresh_export_files()
+
     def _refresh_export_stats(self):
         """刷新导出统计"""
         if not self.current_project:
@@ -2581,6 +2636,100 @@ class TranslatorUI:
         percent = (translated / total * 100) if total > 0 else 0
 
         self.export_stats.text = f'📊 总体进度: {translated}/{total} ({percent:.1f}%)'
+
+    def _refresh_export_packages(self):
+        """刷新已导出的项目包列表"""
+        if not hasattr(self, 'export_packages_container'):
+            return
+        self.export_packages_container.clear()
+
+        exports_dir = Path(self.project_manager.projects_dir).parent / 'exports'
+
+        with self.export_packages_container:
+            if not exports_dir.exists():
+                ui.label('暂无导出包').props('caption')
+                return
+
+            zip_files = sorted(exports_dir.glob('*.zip'), key=lambda f: f.stat().st_mtime, reverse=True)
+            if not zip_files:
+                ui.label('暂无导出包').props('caption')
+                return
+
+            for zf in zip_files:
+                size_mb = zf.stat().st_size / 1024 / 1024
+                with ui.card().classes('w-full flat bordered q-mb-xs'):
+                    with ui.row().classes('items-center full-width q-pa-sm'):
+                        ui.icon('inventory_2').classes('text-grey-7')
+                        with ui.column().classes('q-ml-sm'):
+                            ui.label(zf.name).classes('text-body2')
+                            ui.label(f'{size_mb:.1f} MB').props('caption')
+                        ui.space()
+                        with ui.row().classes('gap-xs'):
+                            ui.button(icon='download', on_click=lambda p=str(zf): ui.download(p)).props('flat dense round size=sm')
+                            ui.button(icon='folder_open', on_click=lambda p=str(zf.parent): os.startfile(p)).props('flat dense round size=sm')
+                            ui.button(icon='delete', color='negative',
+                                on_click=lambda p=str(zf): self._confirm_delete_export(p, Path(p).name)).props('flat dense round size=sm')
+
+    def _refresh_export_files(self):
+        """刷新导出文件列表"""
+        self.export_files_list.clear()
+
+        if not self.current_project:
+            with self.export_files_list:
+                ui.label('请先打开项目').props('caption')
+            return
+
+        project_dir = self.project_manager._get_project_dir(self.current_project.name)
+        export_dir = project_dir / 'output'
+
+        with self.export_files_list:
+            if export_dir.exists():
+                total_size = sum(f.stat().st_size for f in export_dir.rglob('*') if f.is_file())
+                with ui.item():
+                    with ui.item_section().props('avatar'):
+                        ui.icon('folder').classes('text-primary')
+                    with ui.item_section():
+                        ui.item_label('output')
+                        ui.item_label(f'{total_size / 1024 / 1024:.1f} MB').props('caption')
+                    with ui.item_section().props('side'):
+                        ui.button(icon='folder_open', on_click=lambda: os.startfile(str(export_dir))).props('flat dense')
+                        ui.button(icon='delete', color='negative',
+                            on_click=lambda: self._confirm_delete_export(str(export_dir), 'output')).props('flat dense')
+            else:
+                ui.label('暂无导出文件').props('caption')
+
+    def _confirm_delete_export(self, path, name):
+        """确认删除导出文件"""
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('🗑️ 删除确认').classes('text-h6')
+            ui.label(f'确定要删除 "{name}" 吗？').classes('text-body1')
+            ui.label('此操作不可撤销。').classes('text-caption text-negative')
+
+            with ui.row().classes('gap-2'):
+                ui.button('取消', on_click=dialog.close)
+                ui.button('删除', color='negative', on_click=lambda: self._do_delete_export(path, dialog))
+
+        dialog.props('persistent')
+        dialog.open()
+
+    async def _do_delete_export(self, path, dialog):
+        """执行删除导出文件"""
+        import shutil
+
+        dialog.close()
+
+        try:
+            path_obj = Path(path)
+            if path_obj.is_dir():
+                shutil.rmtree(path_obj)
+                ui.notify(f'已删除目录: {path_obj.name}', type='positive')
+            elif path_obj.is_file():
+                path_obj.unlink()
+                ui.notify(f'已删除文件: {path_obj.name}', type='positive')
+
+            self._refresh_export_files()
+        except Exception as e:
+            ui.notify(f'删除失败: {str(e)}', type='negative')
 
     def _export_game(self):
         """导出翻译后的游戏"""
