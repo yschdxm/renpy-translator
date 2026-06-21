@@ -62,9 +62,9 @@ class TranslatorUI:
             ui.label('🎮 Ren\'Py Translator').classes('text-h6 text-white q-ml-md').style('font-weight: 600;')
             ui.separator().props('vertical').classes('q-mx-sm')
             self.header_project_select = ui.select(
-                options={}, label='切换项目', value=None, with_input=True
-            ).classes('w-48').props('dark dense outlined hide-details color=grey-5')
-            self.header_project_select.on('update:model-value', lambda e: self._on_header_project_select(e))
+                options={}, label='切换项目', value=None
+            ).classes('w-48').props('dark dense outlined hide-details')
+            self.header_project_select.on_value_change(lambda e: self._on_header_project_select(e.value))
             self._refresh_header_project_options()
 
             ui.space()
@@ -547,10 +547,9 @@ class TranslatorUI:
         self.header_project_select.options = options
         self.header_project_select.update()
 
-    def _on_header_project_select(self, e):
+    def _on_header_project_select(self, name):
         """顶栏项目下拉选择事件"""
-        name = e.args if hasattr(e, 'args') else e
-        if name and isinstance(name, str) and name != '':
+        if name and isinstance(name, str):
             self._open_project(name)
 
     # ========== SDK 管理 ==========
