@@ -970,7 +970,10 @@ class TranslatorUI:
 
         finally:
             await asyncio.sleep(0)
-            progress_dialog.close()
+            try:
+                progress_dialog.close()
+            except Exception:
+                pass
 
     def _show_edit_project_dialog(self, project_name):
         """显示编辑项目模态框"""
@@ -1113,55 +1116,120 @@ class TranslatorUI:
             await loop.run_in_executor(self.executor, _do_delete)
 
             ui.notify(f'项目 "{project_name}" 已删除', type='positive')
+
+            # 先关闭对话框，再刷新列表（避免 UI 上下文失效）
+            progress_dialog.close()
+            await asyncio.sleep(0)
             self._refresh_project_list()
 
         except Exception as e:
             ui.notify(f'删除失败: {str(e)}', type='negative')
-
-        finally:
-            await asyncio.sleep(0.5)
             try:
                 progress_dialog.close()
-            except RuntimeError:
-                pass  # 对话框已被删除，忽略错误
+            except Exception:
+                pass
 
     def _show_create_project_dialog(self):
         """显示创建项目模态框"""
         # 创建对话框
         with ui.dialog() as dialog, ui.card().classes('w-96'):
             ui.label('➕ 创建新项目').classes('text-h6')
-            ui.label('填写游戏目录路径，自动解析并创建项目').classes('text-caption text-grey')
+            ui.label('选择游戏目录路径或上传zip文件，自动解析并创建项目').classes('text-caption text-grey')
 
             # 项目名称
             name_input = ui.input(label='项目名称', placeholder='MyGame').classes('w-full')
 
-            # 游戏目录路径
-            game_dir_input = ui.input(label='游戏目录', placeholder='C:\\path\\to\\game').classes('w-full')
+            # 输入方式切换
+            input_method = ui.toggle(['路径输入', '上传zip'], value='路径输入').classes('w-full')
+
+            # 路径输入区域
+            path_container = ui.column().classes('w-full')
+            with path_container:
+                game_dir_input = ui.input(label='游戏目录', placeholder='C:\\path\\to\\game').classes('w-full')
+
+            # zip上传区域（默认隐藏）
+            zip_container = ui.column().classes('w-full')
+            zip_container.style('display: none;')
+            zip_data = {'zip_path': None}
+
+            with zip_container:
+                async def on_zip_upload(e):
+                    import tempfile
+                    # 仅保存zip文件，不解压
+                    temp_dir = tempfile.mkdtemp()
+                    temp_path = Path(temp_dir) / e.file.name
+                    await e.file.save(temp_path)
+                    zip_data['zip_path'] = str(temp_path)
+                    zip_status_label.text = f'✅ 已上传: {e.file.name}'
+                    zip_status_label.classes(replace='text-caption text-positive')
+
+                ui.upload(label='选择游戏zip文件', on_upload=on_zip_upload, max_files=1, auto_upload=True).props('accept=.zip')
+                zip_status_label = ui.label('未选择文件').classes('text-caption')
+
+            def _on_method_change(e):
+                if e.value == '路径输入':
+                    path_container.style('display: block;')
+                    zip_container.style('display: none;')
+                else:
+                    path_container.style('display: none;')
+                    zip_container.style('display: block;')
+
+            input_method.on_value_change(_on_method_change)
 
             # 模型选择
             model_names = [c.name for c in self.config_manager.load_all_configs()]
             model_select = ui.select(options=model_names, label='AI模型', value=model_names[0] if model_names else None).classes('w-full')
 
+            async def _on_create():
+                if input_method.value == '路径输入':
+                    await self._do_create_project(
+                        name_input.value,
+                        game_dir_input.value,
+                        model_select.value,
+                        dialog
+                    )
+                else:
+                    if not zip_data.get('zip_path'):
+                        ui.notify('请先上传zip文件', type='warning')
+                        return
+                    # 点击创建后再解压
+                    import zipfile
+                    try:
+                        extract_dir = Path(zip_data['zip_path']).parent / 'extracted'
+                        extract_dir.mkdir(exist_ok=True)
+                        with zipfile.ZipFile(zip_data['zip_path'], 'r') as zf:
+                            zf.extractall(str(extract_dir))
+                        # 检查是否有单层根目录
+                        entries = list(extract_dir.iterdir())
+                        if len(entries) == 1 and entries[0].is_dir():
+                            game_dir = str(entries[0])
+                        else:
+                            game_dir = str(extract_dir)
+                    except Exception as ex:
+                        ui.notify(f'zip解压失败: {str(ex)}', type='negative')
+                        return
+                    await self._do_create_project(
+                        name_input.value,
+                        game_dir,
+                        model_select.value,
+                        dialog
+                    )
+
             with ui.row().classes('gap-2'):
                 ui.button('取消', on_click=dialog.close)
-                ui.button('创建', color='primary', on_click=lambda: self._do_create_project(
-                    name_input.value,
-                    game_dir_input.value,
-                    model_select.value,
-                    dialog
-                ))
+                ui.button('创建', color='primary', on_click=_on_create)
 
         dialog.props('persistent')
         dialog.open()
 
-    def _do_create_project(self, name, game_dir, model, dialog):
+    async def _do_create_project(self, name, game_dir, model, dialog):
         """执行创建项目"""
         if not name:
             ui.notify('请填写项目名称', type='warning')
             return
 
         if not game_dir:
-            ui.notify('请填写游戏目录', type='warning')
+            ui.notify('请填写游戏目录或上传zip文件', type='warning')
             return
 
         if not Path(game_dir).exists():
@@ -1169,101 +1237,153 @@ class TranslatorUI:
             return
 
         dialog.close()
+        await asyncio.sleep(0)
 
-        # 存储创建状态
-        self._creating_project = {
-            'done': False,
-            'success': False,
-            'message': '',
-            'name': name,
-            'game_dir': game_dir,
-            'model': model
-        }
+        # 创建进度对话框
+        with ui.dialog() as progress_dialog, ui.card().classes('w-96'):
+            ui.label('➕ 创建项目').classes('text-h6')
+            self._create_progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+            self._create_progress_label = ui.label('准备中...').classes('text-caption')
 
-        # 在线程池中执行
-        self.executor.submit(self._create_project_thread, name, game_dir, model)
+        progress_dialog.props('persistent')
+        progress_dialog.open()
 
-        # 启动定时器检查状态
-        ui.timer(0.5, self._check_project_creation, once=True)
+        success = await self._do_create_project_with_progress(name, game_dir, model)
 
-    def _create_project(self, name, game_dir, model):
-        """创建项目"""
-        if not name or not game_dir:
-            ui.notify('请填写完整信息', type='warning')
-            return
+        if success:
+            await asyncio.sleep(0.5)
+        else:
+            await asyncio.sleep(2)
+        progress_dialog.close()
 
-        ui.notify('正在创建项目，请稍候...', type='info', timeout=2000)
+        if success:
+            ui.notify(f'项目 "{name}" 创建成功！', type='positive')
+            self._refresh_project_list()
+            self._open_project(name)
+        else:
+            if hasattr(self, '_create_error_msg'):
+                ui.notify(self._create_error_msg, type='negative')
 
-        # 存储创建状态
-        self._creating_project = {
-            'done': False,
-            'success': False,
-            'message': '',
-            'name': name,
-            'game_dir': game_dir,
-            'model': model
-        }
-
-        # 在线程池中执行
-        self.executor.submit(self._create_project_thread, name, game_dir, model)
-
-        # 启动定时器检查状态
-        ui.timer(0.5, self._check_project_creation, once=True)
-
-    def _create_project_thread(self, name, game_dir, model):
-        """在线程池中创建项目"""
+    async def _do_create_project_with_progress(self, name, game_dir, model):
+        """带进度的项目创建，返回是否成功"""
         import shutil
 
         try:
-            project = self.project_manager.create_project(name, game_dir, model or '')
+            bar = self._create_progress_bar
+            label = self._create_progress_label
 
-            # 创建工作目录（直接使用解包后的游戏）
+            # ===== 步骤1: 初始化项目 =====
+            bar.value = 0.05
+            label.text = '正在初始化项目...'
+            await asyncio.sleep(0)
+
+            loop = asyncio.get_event_loop()
+
+            def _step1_init():
+                return self.project_manager.create_project(name, game_dir, model or '')
+
+            project = await loop.run_in_executor(self.executor, _step1_init)
             project_dir = self.project_manager._get_project_dir(name)
             game_work_dir = project_dir / 'game'
 
-            # 清理旧的工作目录
-            if game_work_dir.exists():
-                shutil.rmtree(game_work_dir)
+            # ===== 步骤2: 复制游戏文件 =====
+            bar.value = 0.10
+            label.text = '正在复制游戏文件...'
+            await asyncio.sleep(0)
 
-            # 1. 复制游戏到项目目录
-            print(f'[创建项目] 复制游戏文件...')
-            shutil.copytree(game_dir, game_work_dir)
+            # 统计源目录文件总数
+            total_files = 0
+            for _, _, files in os.walk(game_dir):
+                total_files += len(files)
+            if total_files == 0:
+                total_files = 1
 
-            # 2. 解包 rpa 文件
-            print(f'[创建项目] 解包 rpa 文件...')
-            self.parser.parse_directory(
-                str(game_work_dir),
-                extract_rpa=True,
-                decompile_rpyc=True,
-                work_dir=str(game_work_dir)
-            )
+            copy_progress = {'current': 0, 'total': total_files, 'done': False}
 
-            # 3. 清理冲突文件
-            print(f'[创建项目] 清理冲突文件...')
-            self._cleanup_conflicts(game_work_dir)
+            async def _update_copy_progress():
+                while not copy_progress['done']:
+                    pct = copy_progress['current'] / copy_progress['total']
+                    bar.value = 0.10 + pct * 0.20
+                    label.text = f'正在复制游戏文件... ({copy_progress["current"]}/{copy_progress["total"]})'
+                    await asyncio.sleep(0.3)
 
-            # 4. 使用 SDK 生成翻译文件
+            def _do_copy():
+                if game_work_dir.exists():
+                    shutil.rmtree(game_work_dir)
+                # 逐文件复制以更新进度
+                game_src = Path(game_dir)
+                game_work_dir.mkdir(parents=True, exist_ok=True)
+                for root, dirs, files in os.walk(game_src):
+                    rel_root = Path(root).relative_to(game_src)
+                    dst_root = game_work_dir / rel_root
+                    dst_root.mkdir(parents=True, exist_ok=True)
+                    for file in files:
+                        shutil.copy2(Path(root) / file, dst_root / file)
+                        copy_progress['current'] += 1
+                copy_progress['done'] = True
+
+            progress_task = asyncio.create_task(_update_copy_progress())
+            await loop.run_in_executor(self.executor, _do_copy)
+            await progress_task
+
+            bar.value = 0.30
+
+            # ===== 步骤3: 解包 rpa 文件 & 反编译 rpyc =====
+            label.text = '正在解包游戏资源...'
+            await asyncio.sleep(0)
+
+            def _step3_parse():
+                self.parser.parse_directory(
+                    str(game_work_dir),
+                    extract_rpa=True,
+                    decompile_rpyc=True,
+                    work_dir=str(game_work_dir)
+                )
+
+            await loop.run_in_executor(self.executor, _step3_parse)
+            bar.value = 0.45
+
+            # ===== 步骤4: 清理冲突文件 =====
+            label.text = '正在清理冲突文件...'
+            await asyncio.sleep(0)
+
+            def _step4_cleanup():
+                self._cleanup_conflicts(game_work_dir)
+
+            await loop.run_in_executor(self.executor, _step4_cleanup)
+            bar.value = 0.50
+
+            # ===== 步骤5: SDK 生成翻译文件 =====
             sdk_path = self.sdk_path_input.value if hasattr(self, 'sdk_path_input') else ''
             if not sdk_path:
                 raise Exception('请先配置 Ren\'Py SDK 路径')
 
-            print(f'[创建项目] 使用 SDK 生成翻译文件...')
-            self.sdk_manager.sdk_path = Path(sdk_path)
-            sdk_result = self.sdk_manager.generate_translations(str(game_work_dir), 'chinese')
+            label.text = '正在使用 SDK 生成翻译文件...'
+            await asyncio.sleep(0)
 
+            def _step5_sdk():
+                self.sdk_manager.sdk_path = Path(sdk_path)
+                return self.sdk_manager.generate_translations(str(game_work_dir), 'chinese')
+
+            sdk_result = await loop.run_in_executor(self.executor, _step5_sdk)
             if not sdk_result['success']:
                 raise Exception(f'SDK 生成翻译文件失败: {sdk_result["message"]}')
 
-            print(f'[创建项目] SDK 生成成功')
+            bar.value = 0.70
 
-            # 5. 解析角色信息
-            print(f'[创建项目] 解析角色信息...')
-            fresh_parser = RenpyParser()
-            result = fresh_parser.parse_directory(
-                str(game_work_dir),
-                extract_rpa=False,
-                decompile_rpyc=False
-            )
+            # ===== 步骤6: 解析角色信息 =====
+            label.text = '正在解析角色信息...'
+            await asyncio.sleep(0)
+
+            def _step6_characters():
+                fresh_parser = RenpyParser()
+                return fresh_parser.parse_directory(
+                    str(game_work_dir),
+                    extract_rpa=False,
+                    decompile_rpyc=False
+                )
+
+            result = await loop.run_in_executor(self.executor, _step6_characters)
             project.characters = [self._character_to_dict(c) for c in result['characters']]
 
             # 初始化人名词典
@@ -1271,37 +1391,51 @@ class TranslatorUI:
                 if char.name and char.name not in project.char_dict:
                     project.char_dict[char.name] = ''
 
-            # 存储变量名到显示名的映射
             if '__variable_map__' not in project.char_dict:
                 project.char_dict['__variable_map__'] = {}
             for char in result['characters']:
                 if char.variable and char.name:
                     project.char_dict['__variable_map__'][char.variable] = char.name
 
-            # 6. 解析翻译文件
+            bar.value = 0.80
+
+            # ===== 步骤7: 解析翻译文件 =====
             tl_dir = game_work_dir / 'game' / 'tl' / 'chinese'
             if not tl_dir.exists():
                 raise Exception('翻译文件目录不存在')
 
-            print(f'[创建项目] 解析翻译文件...')
-            tl_result = self._parse_translation_files(tl_dir, str(game_work_dir), project.char_dict)
+            label.text = '正在解析翻译文件...'
+            await asyncio.sleep(0)
+
+            def _step7_tl():
+                return self._parse_translation_files(tl_dir, str(game_work_dir), project.char_dict)
+
+            tl_result = await loop.run_in_executor(self.executor, _step7_tl)
             project.dialogues = tl_result.get('dialogues', [])
             project.ui_texts = tl_result.get('ui_texts', [])
 
-            # 保存项目
-            self.project_manager.save_project(project)
+            bar.value = 0.95
 
-            self._creating_project['success'] = True
-            self._creating_project['message'] = f'项目创建成功！共 {len(project.dialogues)} 条对话'
+            # ===== 步骤8: 保存项目 =====
+            label.text = '正在保存项目...'
+            await asyncio.sleep(0)
+
+            def _step8_save():
+                self.project_manager.save_project(project)
+
+            await loop.run_in_executor(self.executor, _step8_save)
+
+            bar.value = 1.0
+            label.text = f'✅ 创建成功！共 {len(project.dialogues)} 条对话, {len(project.ui_texts)} 条字符串'
+            return True
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self._creating_project['success'] = False
-            self._creating_project['message'] = f'创建失败: {str(e)}'
-
-        finally:
-            self._creating_project['done'] = True
+            self._create_error_msg = f'创建失败: {str(e)}'
+            if hasattr(self, '_create_progress_label'):
+                self._create_progress_label.text = f'❌ {self._create_error_msg}'
+            return False
 
     def _cleanup_conflicts(self, game_dir: Path):
         """清理冲突文件，避免 SDK 报错"""
@@ -1517,22 +1651,6 @@ class TranslatorUI:
 
                 ui_texts.append(entry)
                 current_old = None
-
-    def _check_project_creation(self):
-        """检查项目创建状态"""
-        if not hasattr(self, '_creating_project') or not self._creating_project['done']:
-            if hasattr(self, '_creating_project') and not self._creating_project['done']:
-                ui.timer(0.5, self._check_project_creation, once=True)
-            return
-
-        # 完成，更新UI
-        if self._creating_project['success']:
-            ui.notify(self._creating_project['message'], type='positive')
-            self._refresh_project_list()
-            # 自动打开新创建的项目
-            self._open_project(self._creating_project['name'])
-        else:
-            ui.notify(self._creating_project['message'], type='negative')
 
     def _open_project(self, name):
         """打开项目"""
@@ -3037,6 +3155,14 @@ class TranslatorUI:
                 if original:
                     translation_dict[original] = u.get('translated_text', '')
 
+        # 添加人名翻译（人名在解析时被排除在ui_texts之外，需要单独加入）
+        char_dict = self.current_project.char_dict
+        for en_name, cn_name in char_dict.items():
+            if not en_name.startswith('__') and isinstance(cn_name, str) and cn_name.strip():
+                translation_dict[en_name] = cn_name
+
+        log(f'  📊 翻译字典: {len(translation_dict)} 条（含人名）')
+
         # 查找翻译目录
         tl_dir = export_dir / "game" / "tl" / "chinese"
         if not tl_dir.exists():
@@ -3258,16 +3384,36 @@ class TranslatorUI:
                 f.write(content)
             log(f'  ✅ 已配置 gui.rpy')
 
-        # 2. 遍历所有rpy文件，替换硬编码的字体引用
+        # 2. 遍历所有rpy文件，自动检测并替换非中文字体引用
         game_dir = export_dir / 'game'
         modified_count = 0
 
-        # 需要替换的非中文字体列表
-        non_chinese_fonts = [
-            'DejaVuSans.ttf',
-            'VCR_OSD_MONO_1.001.ttf',
-            'Daydream.ttf',
-        ]
+        # 自动收集游戏中所有使用的字体（排除中文字体本身）
+        chinese_font_names = {font_name.lower(), 'fonts/' + font_name.lower()}
+
+        # 扫描所有rpy文件，收集字体引用
+        all_fonts = set()
+        font_pattern_1 = re.compile(r'font\s+"([^"]+\.(?:ttf|ttc|otf))"', re.IGNORECASE)
+        font_pattern_2 = re.compile(r'\{font=([^}]+\.(?:ttf|ttc|otf))\}', re.IGNORECASE)
+
+        for rpy_file in game_dir.rglob('*.rpy'):
+            if rpy_file.name == 'gui.rpy':
+                continue
+            try:
+                with open(rpy_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                for m in font_pattern_1.finditer(content):
+                    all_fonts.add(m.group(1))
+                for m in font_pattern_2.finditer(content):
+                    all_fonts.add(m.group(1))
+            except:
+                pass
+
+        # 过滤掉已经是中文字体的
+        non_chinese_fonts = [f for f in all_fonts if f.lower() not in chinese_font_names]
+
+        if non_chinese_fonts:
+            log(f'  🔍 检测到 {len(non_chinese_fonts)} 个非中文字体: {", ".join(sorted(non_chinese_fonts))}')
 
         for rpy_file in game_dir.rglob('*.rpy'):
             if rpy_file.name == 'gui.rpy':
@@ -3279,9 +3425,11 @@ class TranslatorUI:
 
                 original_content = content
 
-                # 替换 font "xxx.ttf" 格式
                 for old_font in non_chinese_fonts:
+                    # 替换 font "xxx.ttf" 格式
                     content = content.replace(f'font "{old_font}"', f'font "{font_path}"')
+                    # 替换 {font=xxx.ttf} 格式（Ren'Py text tag）
+                    content = content.replace(f'{{font={old_font}}}', f'{{font={font_path}}}')
 
                 # 如果内容有变化，写入文件
                 if content != original_content:
