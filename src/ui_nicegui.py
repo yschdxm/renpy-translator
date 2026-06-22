@@ -593,11 +593,49 @@ class TranslatorUI:
             self.sdk_status.text = '❌ 无效的 SDK 路径'
             self.sdk_status.classes(replace='text-caption text-negative')
 
-    def _export_project_by_name(self, name):
-        """按名称导出项目（先打开再导出）"""
-        if not self.current_project or self.current_project.name != name:
-            self._open_project(name)
-        asyncio.create_task(self._export_current_project())
+    async def _export_project_by_name(self, name):
+        """按名称导出项目"""
+        await self._do_export_project(name)
+
+    async def _do_export_project(self, project_name):
+        """导出指定项目（不需要打开项目）"""
+        # 创建进度对话框
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('📦 导出项目').classes('text-h6')
+            self.export_progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+            self.export_status_label = ui.label('准备中...').classes('text-caption')
+
+        # 设置对话框不可关闭（导出过程中）
+        dialog.props('persistent')
+        dialog.open()
+
+        # 创建导出路径
+        export_dir = Path(self.project_manager.projects_dir).parent / 'exports'
+        export_dir.mkdir(exist_ok=True)
+        export_path = export_dir / f'{project_name}.zip'
+
+        # 执行导出并等待完成
+        success = await self._do_export_with_progress(export_path, project_name)
+
+        # 关闭进度对话框
+        if success:
+            await asyncio.sleep(0.5)
+        else:
+            await asyncio.sleep(2)
+        dialog.close()
+
+        # 导出成功后显示结果对话框
+        if success and hasattr(self, '_last_export_path'):
+            with ui.dialog() as result_dialog, ui.card().classes('w-96'):
+                ui.label('✅ 导出成功').classes('text-h6')
+                ui.label(f'文件已保存到:').classes('text-body1')
+                ui.label(self._last_export_path).classes('text-body2 text-grey')
+                with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                    ui.button('打开文件夹', on_click=lambda: os.startfile(str(Path(self._last_export_path).parent)))
+                    ui.button('下载', on_click=lambda: ui.download(self._last_export_path), color='positive')
+                    ui.button('关闭', on_click=result_dialog.close)
+            result_dialog.props('persistent')
+            result_dialog.open()
 
     async def _export_current_project(self):
         """导出当前项目"""
@@ -643,7 +681,7 @@ class TranslatorUI:
             result_dialog.props('persistent')
             result_dialog.open()
 
-    async def _do_export_with_progress(self, export_path):
+    async def _do_export_with_progress(self, export_path, project_name=None):
         """带进度的导出，返回是否成功"""
         from datetime import datetime
         import shutil
@@ -652,7 +690,8 @@ class TranslatorUI:
         import json
 
         try:
-            project_name = self.current_project.name
+            if not project_name:
+                project_name = self.current_project.name
             project_dir = self.project_manager._get_project_dir(project_name)
             game_dir = project_dir / 'game'
 
@@ -1081,7 +1120,10 @@ class TranslatorUI:
 
         finally:
             await asyncio.sleep(0.5)
-            progress_dialog.close()
+            try:
+                progress_dialog.close()
+            except RuntimeError:
+                pass  # 对话框已被删除，忽略错误
 
     def _show_create_project_dialog(self):
         """显示创建项目模态框"""
@@ -1524,7 +1566,10 @@ class TranslatorUI:
         self._refresh_project_cards()
         self._switch_panel('names')
 
-        ui.notify(f'已打开项目: {name}', type='positive')
+        try:
+            ui.notify(f'已打开项目: {name}', type='positive')
+        except RuntimeError:
+            pass  # UI 元素已失效，忽略通知
 
     def _save_project(self, show_notify=True):
         """保存项目"""
