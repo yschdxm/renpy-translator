@@ -95,7 +95,7 @@ class SDKManager:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,  # 增加超时时间
+                timeout=300,  # 5 分钟超时
                 cwd=str(game_dir)  # 在游戏目录中运行
             )
 

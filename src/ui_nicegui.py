@@ -1256,9 +1256,8 @@ class TranslatorUI:
             else:
                 await asyncio.sleep(2)
             progress_dialog.close()
-        except RuntimeError:
-            # 客户端已断开，忽略
-            pass
+        except RuntimeError as e:
+            print(f'[UI] 客户端已断开 (progress_dialog.close): {e}')
 
         try:
             if success:
@@ -1268,9 +1267,8 @@ class TranslatorUI:
             else:
                 if hasattr(self, '_create_error_msg'):
                     ui.notify(self._create_error_msg, type='negative')
-        except RuntimeError:
-            # 客户端已断开，忽略
-            pass
+        except RuntimeError as e:
+            print(f'[UI] 客户端已断开 (notify/refresh): {e}')
 
     async def _do_create_project_with_progress(self, name, game_dir, model):
         """带进度的项目创建，返回是否成功"""
@@ -1284,7 +1282,8 @@ class TranslatorUI:
                 for attr, value in kwargs.items():
                     setattr(element, attr, value)
                 return True
-            except RuntimeError:
+            except RuntimeError as e:
+                print(f'[UI] 客户端已断开 (safe_update): {e}')
                 return False
 
         try:
@@ -1456,8 +1455,8 @@ class TranslatorUI:
             if hasattr(self, '_create_progress_label'):
                 try:
                     self._create_progress_label.text = f'❌ {self._create_error_msg}'
-                except RuntimeError:
-                    pass  # 客户端已断开
+                except RuntimeError as e:
+                    print(f'[UI] 客户端已断开 (error_label): {e}')
             return False
 
     def _cleanup_conflicts(self, game_dir: Path):
@@ -1709,8 +1708,8 @@ class TranslatorUI:
 
         try:
             ui.notify(f'已打开项目: {name}', type='positive')
-        except RuntimeError:
-            pass  # UI 元素已失效，忽略通知
+        except RuntimeError as e:
+            print(f'[UI] 客户端已断开 (open_project notify): {e}')
 
     def _save_project(self, show_notify=True):
         """保存项目"""
