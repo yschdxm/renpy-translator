@@ -1236,17 +1236,13 @@ class TranslatorUI:
             ui.notify('游戏目录不存在', type='negative')
             return
 
-        dialog.close()
-        await asyncio.sleep(0)
-
-        # 创建进度对话框
-        with ui.dialog() as progress_dialog, ui.card().classes('w-96'):
-            ui.label('➕ 创建项目').classes('text-h6')
-            self._create_progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
-            self._create_progress_label = ui.label('准备中...').classes('text-caption')
-
-        progress_dialog.props('persistent')
-        progress_dialog.open()
+        # 清空对话框内容，复用来显示进度
+        dialog.clear()
+        with dialog:
+            with ui.card().classes('w-96'):
+                ui.label('➕ 创建项目').classes('text-h6')
+                self._create_progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+                self._create_progress_label = ui.label('准备中...').classes('text-caption')
 
         success = await self._do_create_project_with_progress(name, game_dir, model)
 
@@ -1255,9 +1251,9 @@ class TranslatorUI:
                 await asyncio.sleep(0.5)
             else:
                 await asyncio.sleep(2)
-            progress_dialog.close()
+            dialog.close()
         except RuntimeError as e:
-            print(f'[UI] 客户端已断开 (progress_dialog.close): {e}')
+            print(f'[UI] 客户端已断开 (dialog.close): {e}')
 
         try:
             if success:
@@ -1384,7 +1380,11 @@ class TranslatorUI:
                 self.sdk_manager.sdk_path = Path(sdk_path)
                 return self.sdk_manager.generate_translations(str(game_work_dir), 'chinese')
 
-            sdk_result = await loop.run_in_executor(self.executor, _step5_sdk)
+            # 使用任务执行 SDK，并定期发送心跳保持 WebSocket 连接
+            sdk_task = loop.run_in_executor(self.executor, _step5_sdk)
+            while not sdk_task.done():
+                await asyncio.sleep(1)
+            sdk_result = sdk_task.result()
             if not sdk_result['success']:
                 raise Exception(f'SDK 生成翻译文件失败: {sdk_result["message"]}')
 
