@@ -1250,31 +1250,50 @@ class TranslatorUI:
 
         success = await self._do_create_project_with_progress(name, game_dir, model)
 
-        if success:
-            await asyncio.sleep(0.5)
-        else:
-            await asyncio.sleep(2)
-        progress_dialog.close()
+        try:
+            if success:
+                await asyncio.sleep(0.5)
+            else:
+                await asyncio.sleep(2)
+            progress_dialog.close()
+        except RuntimeError:
+            # 客户端已断开，忽略
+            pass
 
-        if success:
-            ui.notify(f'项目 "{name}" 创建成功！', type='positive')
-            self._refresh_project_list()
-            self._open_project(name)
-        else:
-            if hasattr(self, '_create_error_msg'):
-                ui.notify(self._create_error_msg, type='negative')
+        try:
+            if success:
+                ui.notify(f'项目 "{name}" 创建成功！', type='positive')
+                self._refresh_project_list()
+                self._open_project(name)
+            else:
+                if hasattr(self, '_create_error_msg'):
+                    ui.notify(self._create_error_msg, type='negative')
+        except RuntimeError:
+            # 客户端已断开，忽略
+            pass
 
     async def _do_create_project_with_progress(self, name, game_dir, model):
         """带进度的项目创建，返回是否成功"""
         import shutil
+
+        def safe_update(element, **kwargs):
+            """安全更新 UI 元素，客户端断开时静默忽略"""
+            try:
+                if not element.client.has_socket_connection:
+                    return False
+                for attr, value in kwargs.items():
+                    setattr(element, attr, value)
+                return True
+            except RuntimeError:
+                return False
 
         try:
             bar = self._create_progress_bar
             label = self._create_progress_label
 
             # ===== 步骤1: 初始化项目 =====
-            bar.value = 0.05
-            label.text = '正在初始化项目...'
+            safe_update(bar, value=0.05)
+            safe_update(label, text='正在初始化项目...')
             await asyncio.sleep(0)
 
             loop = asyncio.get_event_loop()
@@ -1287,8 +1306,8 @@ class TranslatorUI:
             game_work_dir = project_dir / 'game'
 
             # ===== 步骤2: 复制游戏文件 =====
-            bar.value = 0.10
-            label.text = '正在复制游戏文件...'
+            safe_update(bar, value=0.10)
+            safe_update(label, text='正在复制游戏文件...')
             await asyncio.sleep(0)
 
             # 统计源目录文件总数
@@ -1303,8 +1322,9 @@ class TranslatorUI:
             async def _update_copy_progress():
                 while not copy_progress['done']:
                     pct = copy_progress['current'] / copy_progress['total']
-                    bar.value = 0.10 + pct * 0.20
-                    label.text = f'正在复制游戏文件... ({copy_progress["current"]}/{copy_progress["total"]})'
+                    if not safe_update(bar, value=0.10 + pct * 0.20):
+                        break
+                    safe_update(label, text=f'正在复制游戏文件... ({copy_progress["current"]}/{copy_progress["total"]})')
                     await asyncio.sleep(0.3)
 
             def _do_copy():
@@ -1326,10 +1346,10 @@ class TranslatorUI:
             await loop.run_in_executor(self.executor, _do_copy)
             await progress_task
 
-            bar.value = 0.30
+            safe_update(bar, value=0.30)
 
             # ===== 步骤3: 解包 rpa 文件 & 反编译 rpyc =====
-            label.text = '正在解包游戏资源...'
+            safe_update(label, text='正在解包游戏资源...')
             await asyncio.sleep(0)
 
             def _step3_parse():
@@ -1341,24 +1361,24 @@ class TranslatorUI:
                 )
 
             await loop.run_in_executor(self.executor, _step3_parse)
-            bar.value = 0.45
+            safe_update(bar, value=0.45)
 
             # ===== 步骤4: 清理冲突文件 =====
-            label.text = '正在清理冲突文件...'
+            safe_update(label, text='正在清理冲突文件...')
             await asyncio.sleep(0)
 
             def _step4_cleanup():
                 self._cleanup_conflicts(game_work_dir)
 
             await loop.run_in_executor(self.executor, _step4_cleanup)
-            bar.value = 0.50
+            safe_update(bar, value=0.50)
 
             # ===== 步骤5: SDK 生成翻译文件 =====
             sdk_path = self.sdk_path_input.value if hasattr(self, 'sdk_path_input') else ''
             if not sdk_path:
                 raise Exception('请先配置 Ren\'Py SDK 路径')
 
-            label.text = '正在使用 SDK 生成翻译文件...'
+            safe_update(label, text='正在使用 SDK 生成翻译文件...')
             await asyncio.sleep(0)
 
             def _step5_sdk():
@@ -1369,10 +1389,10 @@ class TranslatorUI:
             if not sdk_result['success']:
                 raise Exception(f'SDK 生成翻译文件失败: {sdk_result["message"]}')
 
-            bar.value = 0.70
+            safe_update(bar, value=0.70)
 
             # ===== 步骤6: 解析角色信息 =====
-            label.text = '正在解析角色信息...'
+            safe_update(label, text='正在解析角色信息...')
             await asyncio.sleep(0)
 
             def _step6_characters():
@@ -1397,14 +1417,14 @@ class TranslatorUI:
                 if char.variable and char.name:
                     project.char_dict['__variable_map__'][char.variable] = char.name
 
-            bar.value = 0.80
+            safe_update(bar, value=0.80)
 
             # ===== 步骤7: 解析翻译文件 =====
             tl_dir = game_work_dir / 'game' / 'tl' / 'chinese'
             if not tl_dir.exists():
                 raise Exception('翻译文件目录不存在')
 
-            label.text = '正在解析翻译文件...'
+            safe_update(label, text='正在解析翻译文件...')
             await asyncio.sleep(0)
 
             def _step7_tl():
@@ -1414,10 +1434,10 @@ class TranslatorUI:
             project.dialogues = tl_result.get('dialogues', [])
             project.ui_texts = tl_result.get('ui_texts', [])
 
-            bar.value = 0.95
+            safe_update(bar, value=0.95)
 
             # ===== 步骤8: 保存项目 =====
-            label.text = '正在保存项目...'
+            safe_update(label, text='正在保存项目...')
             await asyncio.sleep(0)
 
             def _step8_save():
@@ -1425,8 +1445,8 @@ class TranslatorUI:
 
             await loop.run_in_executor(self.executor, _step8_save)
 
-            bar.value = 1.0
-            label.text = f'✅ 创建成功！共 {len(project.dialogues)} 条对话, {len(project.ui_texts)} 条字符串'
+            safe_update(bar, value=1.0)
+            safe_update(label, text=f'✅ 创建成功！共 {len(project.dialogues)} 条对话, {len(project.ui_texts)} 条字符串')
             return True
 
         except Exception as e:
@@ -1434,7 +1454,10 @@ class TranslatorUI:
             traceback.print_exc()
             self._create_error_msg = f'创建失败: {str(e)}'
             if hasattr(self, '_create_progress_label'):
-                self._create_progress_label.text = f'❌ {self._create_error_msg}'
+                try:
+                    self._create_progress_label.text = f'❌ {self._create_error_msg}'
+                except RuntimeError:
+                    pass  # 客户端已断开
             return False
 
     def _cleanup_conflicts(self, game_dir: Path):
