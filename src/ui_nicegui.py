@@ -2107,7 +2107,8 @@ class TranslatorUI:
                 if translate_type == 'ui':
                     translated = await loop.run_in_executor(
                         self.executor,
-                        lambda t=item['original_text']: self.translator.translate_text(text=t, debug=True)
+                        lambda t=item['original_text']: self.translator.translate_ui(
+                            text=t, character_dict=self.current_project.char_dict, debug=True)
                     )
                 elif translate_type == 'dialogue':
                     translated = await loop.run_in_executor(
