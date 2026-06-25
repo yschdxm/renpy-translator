@@ -2280,7 +2280,9 @@ class TranslatorUI:
         if 0 <= idx < len(self.current_project.ui_texts):
             item = self.current_project.ui_texts[idx]
             try:
-                translated = self.translator.translate_ui(item['original_text'], debug=True)
+                # 获取人名词典
+                char_dict = self.current_project.char_dict if self.current_project else None
+                translated = self.translator.translate_ui(item['original_text'], character_dict=char_dict, debug=True)
                 item['translated_text'] = translated
                 item['is_translated'] = True
                 return True

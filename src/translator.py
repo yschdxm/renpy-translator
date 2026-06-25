@@ -233,7 +233,7 @@ class AITranslator:
                 print(f'[人名翻译] 异常: {e}')
             raise Exception(f"人名翻译失败: {str(e)}")
 
-    def translate_ui(self, text: str, debug: bool = False) -> str:
+    def translate_ui(self, text: str, character_dict: Dict[str, str] = None, debug: bool = False) -> str:
         """翻译UI文字（简洁提示词）"""
         if not self.client:
             raise ValueError("请先配置API Key")
@@ -256,6 +256,29 @@ class AITranslator:
 - 保持专业术语的一致性
 - 保留原意但可以适当本地化
 - 只返回翻译结果，不要解释"""
+
+        # 添加人名词典
+        if character_dict:
+            # 获取变量名映射
+            variable_map = character_dict.get('__variable_map__', {})
+
+            # 人名词典（只包含有翻译的人名）
+            dict_text = "\n\n人名翻译词典（翻译时必须使用这些中文名）：\n"
+            has_names = False
+            for en_name, cn_name in character_dict.items():
+                # 跳过所有特殊键
+                if en_name.startswith('__'):
+                    continue
+                # 只显示有翻译的人名（确保是字符串且非空）
+                if not isinstance(cn_name, str) or not cn_name.strip():
+                    continue
+                # 跳过占位符（如 [mc_name] 但不是 [Mika]）
+                if en_name.startswith('[') and en_name.endswith(']') and '_name' in en_name:
+                    continue
+                dict_text += f"- {en_name} → {cn_name}\n"
+                has_names = True
+            if has_names:
+                system_prompt += dict_text
 
         user_prompt = f"请翻译：\n{text}"
 
