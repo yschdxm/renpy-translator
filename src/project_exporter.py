@@ -24,7 +24,7 @@ class ProjectExporter:
                 rel_path = abs_path.relative_to(project_game_dir)
                 return rel_path.as_posix()
         except ValueError:
-            pass
+            pass  # 路径不在 game 目录下，回退到后续逻辑
 
         # 如果无法转换，尝试提取game之后的部分
         parts = Path(file_path).parts

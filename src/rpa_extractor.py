@@ -193,8 +193,8 @@ class RPAExtractor:
                         if len_match:
                             length = int(len_match.group(1))
                             index[filename] = (offset, length, b'')
-                    except:
-                        pass
+                    except Exception as parse_err:
+                        print(f"解析索引行失败: {parse_err}")
 
         except Exception as e:
             print(f"简单解析失败: {e}")
@@ -251,15 +251,16 @@ class RPAExtractor:
             try:
                 decompressed = zlib.decompress(index_data)
                 index_data = decompressed
-            except:
+            except Exception as decomp_err:
+                print(f"索引解压失败，尝试解密: {decomp_err}")
                 # 如果解压失败，可能是需要先解密
                 if key:
                     index_data = self._decrypt_index(index_data, key)
                     try:
                         decompressed = zlib.decompress(index_data)
                         index_data = decompressed
-                    except:
-                        pass
+                    except Exception as decomp_err2:
+                        print(f"解密后解压仍然失败: {decomp_err2}")
 
             # 解析索引
             index = None

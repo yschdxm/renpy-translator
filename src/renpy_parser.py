@@ -4,7 +4,6 @@ import re
 import os
 import sys
 import struct
-import subprocess
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
@@ -236,7 +235,6 @@ class RenpyParser:
     def parse_directory(self, game_dir: str,
                        include_ui: bool = False,
                        extract_rpa: bool = True,
-                       decompile_rpyc: bool = True,
                        work_dir: str = None) -> dict:
         """解析整个游戏目录
 
@@ -244,7 +242,6 @@ class RenpyParser:
             game_dir: 游戏目录路径
             include_ui: 是否包含UI文字
             extract_rpa: 是否解包rpa文件
-            decompile_rpyc: 是否反编译rpyc文件
             work_dir: 工作目录（用于存放临时文件，不修改原游戏）
         """
         from rpa_extractor import RPAExtractor
@@ -300,24 +297,6 @@ class RenpyParser:
                     except Exception as e:
                         print(f"解包 {rpa_file.name} 失败: {e}")
 
-        # 自动反编译.rpyc文件（反编译到工作目录）
-        if decompile_rpyc:
-            # 先检查工作目录中的rpyc文件
-            rpyc_files = list((work_path / 'game').rglob('*.rpyc'))
-            # 也检查原游戏目录中的rpyc文件
-            rpyc_files.extend(list((game_path / 'game').rglob('*.rpyc')))
-            # 去重
-            rpyc_files = list(set(rpyc_files))
-
-            if rpyc_files:
-                print(f"找到 {len(rpyc_files)} 个.rpyc文件，正在反编译...")
-                for rpyc_file in rpyc_files:
-                    try:
-                        # 反编译到工作目录
-                        self._decompile_rpyc(str(rpyc_file), str(work_path))
-                    except Exception as e:
-                        print(f"反编译 {rpyc_file.name} 失败: {e}")
-
         # 查找所有.rpy文件（优先使用工作目录中的文件）
         rpy_files = []
 
@@ -365,60 +344,3 @@ class RenpyParser:
             'total_files': len(rpy_files),
             'extracted_rpa': extracted_files
         }
-
-    def _decompile_rpyc(self, rpyc_path: str, output_dir: str = None) -> Optional[str]:
-        """反编译.rpyc文件为.rpy
-
-        Args:
-            rpyc_path: rpyc文件路径
-            output_dir: 输出目录（如果指定，将rpy文件输出到该目录）
-        """
-        rpyc_path = Path(rpyc_path)
-
-        # 确定输出路径
-        if output_dir:
-            output_path = Path(output_dir)
-            # 保持相对路径结构
-            try:
-                # 尝试从游戏目录计算相对路径
-                # 假设rpyc_path包含game目录
-                parts = rpyc_path.parts
-                if 'game' in parts:
-                    game_idx = parts.index('game')
-                    relative = Path(*parts[game_idx:])
-                    rpy_path = output_path / relative.with_suffix('.rpy')
-                else:
-                    rpy_path = output_path / 'game' / rpyc_path.with_suffix('.rpy').name
-            except:
-                rpy_path = output_path / rpyc_path.with_suffix('.rpy').name
-        else:
-            rpy_path = rpyc_path.with_suffix('.rpy')
-
-        # 确保输出目录存在
-        rpy_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # 如果.rpy文件已存在，跳过
-        if rpy_path.exists():
-            return str(rpy_path)
-
-        # 尝试使用unrpyc反编译
-        try:
-            # 使用unrpyc命令行工具
-            result = subprocess.run(
-                ['unrpyc', str(rpyc_path)],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            if result.returncode == 0 and rpy_path.exists():
-                return str(rpy_path)
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-
-        return None
-
-    def decompile_rpyc(self, rpyc_path: str, output_path: Optional[str] = None) -> str:
-        """反编译.rpyc文件为.rpy（需要unrpyc）"""
-        # 这里需要调用unrpyc工具
-        # 实际实现时需要集成unrpyc库
-        raise NotImplementedError("需要集成unrpyc库")
