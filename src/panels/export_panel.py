@@ -8,6 +8,13 @@ from pathlib import Path
 from queue import Queue
 from nicegui import ui
 
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except (RuntimeError, AttributeError):
+        return None
+
 from database import ProjectDatabase
 from project_manager import ProjectManager
 from logger import TranslationLogger
@@ -82,9 +89,9 @@ class ExportPanel:
         u_count = self.db.get_ui_text_count()
         n_count = self.db.get_char_dict_count()
 
-        self.dialogue_stats.text = f'对话翻译: {d_count["translated"]}/{d_count["total"]}'
-        self.ui_stats.text = f'字符串翻译: {u_count["translated"]}/{u_count["total"]}'
-        self.name_stats.text = f'人名翻译: {n_count["translated"]}/{n_count["total"]}'
+        _safe(setattr, self.dialogue_stats, 'text', f'对话翻译: {d_count["translated"]}/{d_count["total"]}')
+        _safe(setattr, self.ui_stats, 'text', f'字符串翻译: {u_count["translated"]}/{u_count["total"]}')
+        _safe(setattr, self.name_stats, 'text', f'人名翻译: {n_count["translated"]}/{n_count["total"]}')
 
         total = d_count['total'] + u_count['total'] + n_count['total']
         translated = d_count['translated'] + u_count['translated'] + n_count['translated']
@@ -94,17 +101,17 @@ class ExportPanel:
     async def _export_game(self):
         """导出翻译后的游戏"""
         if not self.db:
-            ui.notify('请先打开项目', type='warning')
+            _safe(ui.notify, '请先打开项目', type='warning')
             return
 
         loop = asyncio.get_event_loop()
         d_count = await loop.run_in_executor(None, self.db.get_dialogue_count)
         if d_count['translated'] == 0:
-            ui.notify('没有已翻译的内容可导出', type='warning')
+            _safe(ui.notify, '没有已翻译的内容可导出', type='warning')
             return
 
-        self.export_btn.disable()
-        self.export_btn.text = '导出中...'
+        _safe(self.export_btn.disable)
+        _safe(setattr, self.export_btn, 'text', '导出中...')
         await self._do_export()
 
     async def _do_export(self):
@@ -153,8 +160,8 @@ class ExportPanel:
             self.logger.error(f'❌ 导出异常: {str(e)}', panel='export')
 
         finally:
-            self.export_btn.enable()
-            self.export_btn.text = '📦 开始导出'
+            _safe(self.export_btn.enable)
+            _safe(setattr, self.export_btn, 'text', '📦 开始导出')
 
     def _export_thread(self, project_name: str, log_queue: Queue) -> dict:
         """在线程中执行导出"""
@@ -192,8 +199,14 @@ class ExportPanel:
                     translation_dict[u['original_text']] = u['translated_text']
 
             # 人名翻译
-            char_dict = self.db.get_char_dict()
-            for en, cn in char_dict.items():
+            characters = self.db.get_characters()
+            for c in characters:
+                if c['cn_name'] and c['cn_name'].strip():
+                    translation_dict[c['display_name']] = c['cn_name']
+
+            # 术语表
+            glossary = self.db.get_glossary()
+            for en, cn in glossary.items():
                 if cn and cn.strip():
                     translation_dict[en] = cn
 

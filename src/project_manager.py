@@ -166,9 +166,9 @@ class ProjectManager:
         finally:
             db.close()
 
-    def import_from_json_file(self, zip_extract_dir: str,
-                               project_name: str = None) -> dict:
-        """从解压的 ZIP 目录导入项目
+    def import_from_zip(self, zip_extract_dir: str,
+                        project_name: str = None) -> dict:
+        """从解压的 ZIP 目录导入项目（仅支持新格式 .db）
 
         Args:
             zip_extract_dir: ZIP 解压后的临时目录
@@ -177,29 +177,26 @@ class ProjectManager:
         Returns:
             {'success': bool, 'message': str, 'project_name': str}
         """
+        import shutil
         extract_path = Path(zip_extract_dir)
 
-        # 查找 project.json
-        json_file = extract_path / "project.json"
-        if not json_file.exists():
-            # 尝试子目录
-            for sub in extract_path.iterdir():
-                if sub.is_dir():
-                    candidate = sub / "project.json"
-                    if candidate.exists():
-                        json_file = candidate
-                        extract_path = sub
-                        break
+        # 查找 project.db（新格式）
+        db_file = None
+        for candidate in [extract_path / "project.db"] + list(extract_path.rglob("project.db")):
+            if candidate.exists():
+                db_file = candidate
+                break
 
-        if not json_file.exists():
-            return {'success': False, 'message': '找不到 project.json'}
+        if not db_file:
+            return {'success': False, 'message': '找不到 project.db（仅支持新格式项目包）'}
 
         try:
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
             if not project_name:
-                project_name = data.get('name', 'imported_project')
+                # 从 db 读取名称
+                temp_db = ProjectDatabase(str(db_file))
+                temp_db.connect()
+                project_name = temp_db.get_meta("name", "imported_project")
+                temp_db.close()
 
             # 检查是否已存在
             if self.project_exists(project_name):
@@ -208,13 +205,15 @@ class ProjectManager:
                     i += 1
                 project_name = f"{project_name}_{i}"
 
-            # 创建项目数据库
-            db_path = self._get_db_path(project_name)
-            db = ProjectDatabase.from_json_dict(str(db_path), data)
-            db.close()
+            # 复制数据库文件
+            project_dir = self._get_project_dir(project_name)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(db_file, project_dir / "project.db")
+            game_src = extract_path / "game"
+            if game_src.exists():
+                shutil.copytree(game_src, project_dir / "game")
 
             # 复制游戏文件
-            project_dir = self._get_project_dir(project_name)
             game_src = extract_path / "game"
             if game_src.exists():
                 shutil.copytree(game_src, project_dir / "game")

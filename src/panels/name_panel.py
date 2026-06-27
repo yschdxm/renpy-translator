@@ -4,6 +4,14 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from nicegui import ui
 
+
+def _safe(fn, *args, **kwargs):
+    """安全执行 UI 操作"""
+    try:
+        return fn(*args, **kwargs)
+    except (RuntimeError, AttributeError):
+        return None
+
 from database import ProjectDatabase
 from translation_service import TranslationService
 from translator import AITranslator
@@ -25,7 +33,8 @@ class NamePanel:
         self.translation_service: TranslationService = None
         self.translator: AITranslator = None
         self._executor = ThreadPoolExecutor(max_workers=2)
-        self._max_context_k: int = 8  # 模型最大上下文（单位K），默认8K
+        self._max_context_k: int = 8
+        self._on_task_state_change: callable = None  # (running: bool) -> None
 
         self.table: PaginatedTable = None
         self.progress: ProgressPanel = None
@@ -81,15 +90,16 @@ class NamePanel:
                     '⏹ 停止', color='red',
                     on_click=self._stop
                 )
-                self.stop_btn.set_visibility(False)
+                _safe(self.stop_btn.set_visibility, False)
                 ui.button('🔄 刷新', on_click=self.async_refresh).props('flat dense')
 
             self.table = PaginatedTable(
                 columns=[
                     {'name': 'index', 'label': '#', 'field': 'index', 'sortable': True},
+                    {'name': 'variable', 'label': '变量名', 'field': 'variable'},
                     {'name': 'original', 'label': '原文人名', 'field': 'original'},
                     {'name': 'translated', 'label': '中文名', 'field': 'translated'},
-                    {'name': 'lines', 'label': '台词数', 'field': 'lines'},
+                    {'name': 'lines', 'label': '台词数', 'field': 'lines', 'sortable': True},
                     {'name': 'name_status', 'label': '翻译', 'field': 'name_status'},
                     {'name': 'analysis_status', 'label': '分析', 'field': 'analysis_status'},
                     {'name': 'action', 'label': '操作', 'field': 'action'},
@@ -157,9 +167,9 @@ class NamePanel:
         counts = await loop.run_in_executor(None, self.db.get_char_dict_count)
         profiles = await loop.run_in_executor(None, self.db.get_all_profiles)
         self.table.set_query(self._query_names)
-        self.table.refresh()
+        _safe(self.table.refresh)
         analyzed = len(profiles)
-        self.stats_label.text = f'📊 {counts["total"]} 人名，翻译 {counts["translated"]}，分析 {analyzed}'
+        _safe(setattr, self.stats_label, 'text', f'📊 {counts["total"]} 人名，翻译 {counts["translated"]}，分析 {analyzed}')
 
     def _update_stats(self):
         if not self.db:
@@ -167,39 +177,27 @@ class NamePanel:
         counts = self.db.get_char_dict_count()
         profiles = self.db.get_all_profiles()
         analyzed = len(profiles)
-        self.stats_label.text = f'📊 {counts["total"]} 人名，翻译 {counts["translated"]}，分析 {analyzed}'
+        _safe(setattr, self.stats_label, 'text', f'📊 {counts["total"]} 人名，翻译 {counts["translated"]}，分析 {analyzed}')
 
     def _query_names(self, page: int, page_size: int, **filters):
-        char_dict = self.db.get_char_dict()
-        profiles = self.db.get_all_profiles()
-        variable_map = self.db.get_variable_map()
+        characters = self.db.get_characters()
 
-        # 统计台词数
-        dialogues, _ = self.db.get_dialogues_page(0, 999999)
-        var_line_counts = {}
-        for d in dialogues:
-            var = d.get('character', '')
-            if var:
-                var_line_counts[var] = var_line_counts.get(var, 0) + 1
+        # 过滤掉占位符（单独显示或跳过）
+        chars = [c for c in characters if not c['is_placeholder']]
 
-        # 反向映射: 显示名 -> 变量名
-        display_to_var = {v: k for k, v in variable_map.items()}
-
-        all_names = [(en, cn) for en, cn in char_dict.items()]
-        total = len(all_names)
+        total = len(chars)
         start = page * page_size
         end = min(start + page_size, total)
-        page_items = all_names[start:end]
+        page_items = chars[start:end]
 
         rows = []
-        for i, (en, cn) in enumerate(page_items):
+        for i, c in enumerate(page_items):
+            name = c['display_name']
+            cn = c['cn_name']
             name_ok = bool(cn and cn.strip())
-            analysis_ok = en in profiles
-            is_processing = en in self._processing_names
-            var_name = display_to_var.get(en, en)
-            lines_count = var_line_counts.get(var_name, 0)
+            analysis_ok = bool(c['profile_json'])
+            is_processing = name in self._processing_names
 
-            # 翻译状态
             if is_processing:
                 name_status = '处理中'
             elif name_ok:
@@ -207,7 +205,6 @@ class NamePanel:
             else:
                 name_status = '待翻译'
 
-            # 分析状态
             if is_processing:
                 analysis_status = '处理中'
             elif analysis_ok:
@@ -217,12 +214,13 @@ class NamePanel:
 
             rows.append({
                 'index': start + i + 1,
-                'original': en,
+                'variable': c['variable'] or '',
+                'original': name,
                 'translated': cn or '',
-                'lines': lines_count,
+                'lines': c['lines_count'],
                 'name_status': name_status,
                 'analysis_status': analysis_status,
-                'action': en,
+                'action': name,
             })
 
         return rows, total
@@ -230,13 +228,13 @@ class NamePanel:
     def _on_name_update(self, e):
         row = e.args
         if row and self.db:
-            self.db.update_char_name(row['original'], row['translated'])
+            self.db.update_character_cn_name(row['original'], row['translated'])
             self.logger.info(f"人名已保存: {row['original']} -> {row['translated']}", panel='names')
 
     async def _on_translate_analyze(self, e):
         row = e.args
         if not self.translation_service:
-            ui.notify('请先配置翻译器', type='warning')
+            _safe(ui.notify, '请先配置翻译器', type='warning')
             return
         if row:
             await self._do_translate_and_analyze(row['original'])
@@ -248,7 +246,7 @@ class NamePanel:
         loop = asyncio.get_event_loop()
         profile = await loop.run_in_executor(None, self.db.get_profile, row['original'])
         if not profile:
-            ui.notify('该角色尚未分析', type='warning')
+            _safe(ui.notify, '该角色尚未分析', type='warning')
             return
 
         with ui.dialog() as dialog, ui.card().classes('w-full max-w-2xl'):
@@ -277,7 +275,7 @@ class NamePanel:
         if is_placeholder:
             self.logger.info(f'占位符 {en_name}，跳过人名翻译，仅分析角色', panel='names')
             # 占位符直接填入原值作为"翻译"
-            self.db.update_char_name(en_name, en_name)
+            self.db.update_character_cn_name(en_name, en_name)
 
         # 标记为处理中
         self._processing_names.add(en_name)
@@ -311,11 +309,13 @@ class NamePanel:
                 return
 
             # 获取人名词典用于参考
-            char_dict = self.db.get_char_dict()
+            glossary_text = self.db.get_glossary_for_prompt()
+            char_prompt = self.db.get_characters_for_prompt()
             dict_text = ""
-            for en, cn in char_dict.items():
-                if cn and cn.strip() and not en.startswith('['):
-                    dict_text += f"- {en} → {cn}\n"
+            if char_prompt:
+                dict_text += char_prompt + "\n"
+            if glossary_text:
+                dict_text += glossary_text
 
             # 根据模型上下文动态计算每段台词数
             batch_size = self._calc_batch_size(len(char_lines))
@@ -429,7 +429,7 @@ class NamePanel:
 
             # 保存人名翻译（占位符不翻译）
             if cn_name and not is_placeholder:
-                self.db.update_char_name(en_name, cn_name)
+                self.db.update_character_cn_name(en_name, cn_name)
                 self.logger.info(f'人名: {en_name} -> {cn_name}', panel='names')
 
             # 合并所有分析结果
@@ -519,73 +519,73 @@ class NamePanel:
         return profile if profile else None
 
     async def _translate_all(self):
-        """翻译全部人名 + 分析全部角色（并发5条）"""
+        """翻译全部人名 + 分析全部角色（顺序处理，保证上下文连贯）"""
         if not self.translation_service:
-            ui.notify('请先配置翻译器', type='warning')
+            _safe(ui.notify, '请先配置翻译器', type='warning')
             return
 
         self._cancel = False
-        self.translate_all_btn.set_visibility(False)
-        self.stop_btn.set_visibility(True)
+        _safe(self.translate_all_btn.set_visibility, False)
+        _safe(self.stop_btn.set_visibility, True)
+        if self._on_task_state_change:
+            self._on_task_state_change(True)
 
         loop = asyncio.get_event_loop()
-        concurrency = 5
         completed_count = 0
 
         # 获取未翻译的人名
         def _get_todo():
-            names = self.db.get_untranslated_names()
+            chars = self.db.get_untranslated_characters()
             profiles = self.db.get_all_profiles()
-            return names, profiles
+            return chars, profiles
 
-        names, profiles = await loop.run_in_executor(None, _get_todo)
+        chars_todo, profiles = await loop.run_in_executor(None, _get_todo)
 
-        total = len(names)
+        total = len(chars_todo)
         if total == 0:
             # 没有未翻译的人名，检查是否需要重新分析
-            char_dict = self.db.get_char_dict()
-            unanalyzed = [en for en in char_dict if en not in profiles]
+            all_chars = self.db.get_characters()
+            unanalyzed = [c['display_name'] for c in all_chars
+                          if c['display_name'] not in profiles and not c['is_placeholder']]
             if unanalyzed:
                 total = len(unanalyzed)
-                self.logger.info(f'人名已全部翻译，补充分析 {total} 个角色（并发{concurrency}）', panel='names')
+                self.logger.info(f'人名已全部翻译，补充分析 {total} 个角色', panel='names')
 
-                for batch_start in range(0, total, concurrency):
+                for i, name in enumerate(unanalyzed):
                     if self._cancel:
                         break
-                    batch = unanalyzed[batch_start:batch_start + concurrency]
-                    tasks = [self._do_translate_and_analyze(name) for name in batch]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    completed_count += len(batch)
-                    self.progress.update(completed_count, total, f'分析中: {completed_count}/{total}')
+                    self.progress.update(i, total, f'分析中: {i+1}/{total} {name}')
+                    await self._do_translate_and_analyze(name)
+                    completed_count += 1
             else:
-                ui.notify('所有人名已翻译并分析', type='info')
+                _safe(ui.notify, '所有人名已翻译并分析', type='info')
         else:
-            # 融合流程：并发5条，同时翻译人名+分析角色
-            self.logger.info(f'开始翻译+分析 {total} 个角色（并发{concurrency}）', panel='names')
+            # 融合流程：顺序处理，同时翻译人名+分析角色
+            self.logger.info(f'开始翻译+分析 {total} 个角色', panel='names')
 
-            for batch_start in range(0, total, concurrency):
+            for i, c in enumerate(chars_todo):
                 if self._cancel:
                     break
-                batch = names[batch_start:batch_start + concurrency]
-                batch_names = [en_name for en_name, _ in batch]
-                tasks = [self._do_translate_and_analyze(name) for name in batch_names]
-                await asyncio.gather(*tasks, return_exceptions=True)
-                completed_count += len(batch)
-                self.progress.update(completed_count, total, f'翻译+分析: {completed_count}/{total}')
+                name = c['display_name']
+                self.progress.update(i, total, f'翻译+分析: {i+1}/{total} {name}')
+                await self._do_translate_and_analyze(name)
+                completed_count += 1
 
                 await self.async_refresh()
 
             self.logger.info(f'翻译+分析完成: {completed_count}/{total}', panel='names')
 
-        self.translate_all_btn.set_visibility(True)
-        self.stop_btn.set_visibility(False)
+        _safe(self.translate_all_btn.set_visibility, True)
+        _safe(self.stop_btn.set_visibility, False)
         self.progress.reset()
+        if self._on_task_state_change:
+            self._on_task_state_change(False)
         await self.async_refresh()
 
         if self._cancel:
-            ui.notify('已停止', type='warning')
+            _safe(ui.notify, '已停止', type='warning')
         else:
-            ui.notify('全部完成', type='positive')
+            _safe(ui.notify, '全部完成', type='positive')
 
     async def _stop(self):
         self._cancel = True

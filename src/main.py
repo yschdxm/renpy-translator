@@ -8,10 +8,9 @@ import asyncio
 import os
 import sys
 
-# 添加当前目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from nicegui import ui
+from nicegui import ui, app
 
 from project_manager import ProjectManager
 from config_manager import ConfigManager
@@ -29,23 +28,34 @@ from panels.export_panel import ExportPanel
 from panels.config_panel import ConfigPanel
 
 
+def safe_ui(fn, *args, **kwargs):
+    """安全执行 UI 操作，客户端断开时跳过
+
+    用法：
+        safe_ui(setattr, self.label, 'text', '...')
+        safe_ui(ui.notify, '完成', type='positive')
+        safe_ui(self.table.refresh)
+    """
+    try:
+        return fn(*args, **kwargs)
+    except (RuntimeError, AttributeError):
+        return None
+
+
 class App:
     """Ren'Py Translator 主应用"""
 
     def __init__(self):
-        # 管理器
         self.project_manager = ProjectManager()
         self.config_manager = ConfigManager()
         self.parser = RenpyParser()
         self.sdk_manager = SDKManager()
         self.logger = TranslationLogger()
 
-        # 当前状态
         self.db: ProjectDatabase = None
         self.translator: AITranslator = None
         self.translation_service: TranslationService = None
 
-        # 面板
         self.project_panel = ProjectPanel(
             project_manager=self.project_manager,
             logger=self.logger,
@@ -70,37 +80,40 @@ class App:
             logger=self.logger
         )
 
-        # UI 组件
         self.header_project_select: ui.select = None
         self.header_progress: ui.label = None
         self._panels: dict = {}
         self._active_panel = 'projects'
+        self._ui_created = False
+        # 任务运行状态（跨页面重建保留，每个面板独立）
+        self._task_states: dict = {'name': False, 'ui': False, 'dialogue': False}
 
     def create(self):
-        """创建 UI"""
+        """创建 UI（每个客户端独立的 UI 元素）"""
         self._active_panel = 'projects'
 
         ui.add_head_html('<style>.q-splitter__separator{background:#e0e0e0!important;width:1px!important;}</style>')
 
-        # ========== 顶部栏 ==========
         with ui.header().classes('items-center').style('background: #1a1a2e;'):
             ui.label("🎮 Ren'Py Translator").classes('text-h6 text-white q-ml-md').style('font-weight: 600;')
             ui.separator().props('vertical').classes('q-mx-sm')
-            self.header_project_select = ui.select(
+            header_select = ui.select(
                 options={}, label='切换项目', value=None
             ).classes('w-48').props('dark dense outlined hide-details')
+
             async def _on_select(e):
                 if e.value and isinstance(e.value, str):
-                    await self._open_project(e.value)
-            self.header_project_select.on_value_change(_on_select)
+                    await self._open_project(e.value, switch_to_names=False)
+            header_select.on_value_change(_on_select)
 
             ui.space()
-            self.header_progress = ui.label('').classes('text-caption text-grey-5')
+            header_progress = ui.label('').classes('text-caption text-grey-5')
 
-        # ========== 主体 ==========
+        # 本客户端的面板引用
+        panels = {}
+
         with ui.column().classes('w-full').style('height: calc(100vh - 50px); padding: 0;'):
             with ui.splitter(horizontal=False).classes('w-full h-full') as splitter:
-                # 左侧导航
                 with splitter.before:
                     with ui.column().classes('full-width').style('overflow-x: hidden; overflow-y: auto;'):
                         with ui.list().classes('full-width'):
@@ -119,136 +132,190 @@ class App:
                                     with ui.item_section():
                                         ui.item_label(label).classes('text-body2')
 
-                # 右侧内容
+                        ui.separator()
+                        with ui.expansion('📜 当前提示词', value=False).classes('full-width'):
+                            prompt_log = ui.log().classes('w-full').style('max-height: 40vh; font-size: 11px;')
+                            ui.button('清空', icon='delete', on_click=lambda: safe_ui(prompt_log.clear)).props('flat dense size=sm')
+
                 with splitter.after:
                     splitter.props(':model-value=15')
-                    self._panels = {}
                     with ui.column().classes('full-width').style('overflow-y: auto; height: 100%;'):
                         with ui.card().classes('w-full flat bordered').style('display: block;') as panel:
                             self.project_panel.create(panel)
-                        self._panels['projects'] = panel
+                        panels['projects'] = panel
 
                         with ui.card().classes('w-full flat bordered').style('display: none;') as panel:
                             self.name_panel.create(panel)
-                        self._panels['names'] = panel
+                        panels['names'] = panel
 
                         with ui.card().classes('w-full flat bordered').style('display: none;') as panel:
                             self.strings_panel.create(panel)
-                        self._panels['strings'] = panel
+                        panels['strings'] = panel
 
                         with ui.card().classes('w-full flat bordered').style('display: none;') as panel:
                             self.dialogue_panel.create(panel)
-                        self._panels['dialogue'] = panel
+                        panels['dialogue'] = panel
 
                         with ui.card().classes('w-full flat bordered').style('display: none;') as panel:
                             self.export_panel.create(panel)
-                        self._panels['export'] = panel
+                        panels['export'] = panel
 
                         with ui.card().classes('w-full flat bordered').style('display: none;') as panel:
                             self.config_panel.create(panel)
-                        self._panels['config'] = panel
+                        panels['config'] = panel
 
-        # 初始刷新
+        # 存储本客户端的引用
+        self._panels = panels
+        self.header_project_select = header_select
+        self.header_progress = header_progress
+        self.prompt_display = prompt_log
+
         self._refresh_header_options()
         self.config_panel.refresh()
 
+        # 页面重建时恢复之前打开的项目
+        saved_project = app.storage.user.get('current_project')
+        if saved_project and not self.db:
+            asyncio.create_task(self._restore_project(saved_project))
+
+    async def _restore_project(self, name: str):
+        """恢复之前打开的项目"""
+        if self.project_manager.project_exists(name):
+            await self._open_project(name)
+
     def _switch_panel(self, panel_key: str):
-        """切换面板"""
+        """切换面板（供 _open_project 等内部方法调用）"""
         for key, panel in self._panels.items():
-            panel.style('display: block;' if key == panel_key else 'display: none;')
+            safe_ui(panel.style, 'display: block;' if key == panel_key else 'display: none;')
         self._active_panel = panel_key
 
     def _refresh_header_options(self):
-        """刷新顶栏项目下拉"""
         if not self.header_project_select:
             return
         projects = self.project_manager.list_projects()
         options = {p.name: p.name for p in projects}
         self.header_project_select.options = options
-        self.header_project_select.update()
+        safe_ui(self.header_project_select.update)
 
-    async def _open_project(self, name: str):
-        """打开项目（所有阻塞操作在线程池中执行）"""
-        import asyncio as _aio
-        loop = _aio.get_event_loop()
+    async def _open_project(self, name: str, switch_to_names: bool = True):
+        loop = asyncio.get_event_loop()
 
-        # 关闭旧数据库
         if self.db:
             await loop.run_in_executor(None, self.db.close)
 
-        # 打开新数据库（sqlite3.connect 在线程池）
         db = await loop.run_in_executor(None, self.project_manager.open_project, name)
         if not db:
-            ui.notify('项目不存在', type='negative')
+            safe_ui(ui.notify, '项目不存在', type='negative')
             return
 
         self.db = db
 
-        # 读取配置（sqlite3 查询在线程池）
+        # 持久化当前项目
+        app.storage.user['current_project'] = name
+
         model_name = await loop.run_in_executor(None, db.get_meta, 'model_config_name')
         if model_name:
             self.translator = await loop.run_in_executor(
                 None, self.config_panel.create_translator, model_name
             )
 
-        # 初始化翻译服务
+        if self.translator and hasattr(self, 'prompt_display'):
+            self.translator.prompt_callback = self._on_prompt
+
+        # 获取模型配置
+        max_context_k = 8
+        max_tokens = 1000
+        if model_name:
+            model_config = self.config_manager.get_config_by_name(model_name)
+            if model_config:
+                max_context_k = getattr(model_config, 'max_context', 8)
+                max_tokens = getattr(model_config, 'max_tokens', 1000)
+
         if self.translator:
             self.translation_service = TranslationService(
                 translator=self.translator,
                 db=self.db,
                 logger=self.logger,
-                max_concurrent=5
+                max_context_k=max_context_k,
+                max_tokens=max_tokens,
             )
         else:
             self.translation_service = None
 
-        # 设置各面板的数据库和服务引用
         self.name_panel.set_db(self.db)
         self.name_panel.set_translation_service(self.translation_service)
         self.name_panel.set_translator(self.translator)
-
-        # 传递模型上下文大小，用于动态计算分段
-        if model_name:
-            model_config = self.config_manager.get_config_by_name(model_name)
-            if model_config:
-                self.name_panel.set_max_context(getattr(model_config, 'max_context', 8))
+        self.name_panel.set_max_context(max_context_k)
 
         self.strings_panel.set_db(self.db)
         self.strings_panel.set_translation_service(self.translation_service)
+        self.strings_panel._on_task_state_change = lambda running: self.set_task_running(running, 'ui')
 
         self.dialogue_panel.set_db(self.db)
         self.dialogue_panel.set_translation_service(self.translation_service)
+        self.dialogue_panel._on_task_state_change = lambda running: self.set_task_running(running, 'dialogue')
+
+        # name_panel 的回调在 __init__ 后设置（因为 _translate_all 直接管理按钮）
+        self.name_panel._on_task_state_change = lambda running: self.set_task_running(running, 'name')
 
         self.export_panel.set_db(self.db)
 
-        # 刷新所有面板
         await self.name_panel.async_refresh()
         await self.strings_panel.async_refresh()
         await self.dialogue_panel.async_refresh()
         await self.export_panel.async_refresh()
 
-        # 更新顶栏
         self._refresh_header_options()
-        self.header_project_select.value = name
+        safe_ui(setattr, self.header_project_select, 'value', name)
 
         d_count = await loop.run_in_executor(None, self.db.get_dialogue_count)
-        self.header_progress.text = f'进度: {d_count["translated"]}/{d_count["total"]}'
+        safe_ui(setattr, self.header_progress, 'text', f'进度: {d_count["translated"]}/{d_count["total"]}')
 
-        # 切换到人名面板
-        self._switch_panel('names')
+        if switch_to_names:
+            self._switch_panel('names')
         await self.project_panel.async_refresh_projects()
 
-        ui.notify(f'已打开项目: {name}', type='positive')
+        # 恢复按钮状态（如果后台任务仍在运行）
+        self._restore_task_state()
+
+        safe_ui(ui.notify, f'已打开项目: {name}', type='positive')
+
+    def set_task_running(self, running: bool, task_type: str):
+        """设置指定面板的任务运行状态"""
+        self._task_states[task_type] = running
+
+    def _restore_task_state(self):
+        """恢复各面板按钮状态（页面重建后调用）"""
+        if self._task_states.get('name'):
+            safe_ui(self.name_panel.translate_all_btn.set_visibility, False)
+            safe_ui(self.name_panel.stop_btn.set_visibility, True)
+        if self._task_states.get('ui'):
+            self.strings_panel._set_buttons_translating(True)
+        if self._task_states.get('dialogue'):
+            self.dialogue_panel._set_buttons_translating(True)
+
+    def _on_prompt(self, system_prompt: str, user_prompt: str, task_type: str):
+        if not hasattr(self, 'prompt_display') or not self.prompt_display:
+            return
+        type_labels = {'name': '人名翻译', 'ui': '字符串翻译', 'dialogue': '对话翻译', 'analysis': '分析'}
+        label = type_labels.get(task_type, task_type)
+        safe_ui(self.prompt_display.clear)
+        safe_ui(self.prompt_display.push, f'───── {label} ─────')
+        safe_ui(self.prompt_display.push, f'[系统]\n{system_prompt}')
+        safe_ui(self.prompt_display.push, f'[用户]\n{user_prompt}')
+
+
+_app_instance = None
 
 
 def create_app():
-    """创建应用"""
-    app = App()
-    app.create()
-    return app
+    global _app_instance
+    if _app_instance is None:
+        _app_instance = App()
+    _app_instance.create()
+    return _app_instance
 
 
-# NiceGUI 页面
 @ui.page('/')
 def index():
     create_app()
@@ -260,4 +327,5 @@ if __name__ in {"__main__", "__mp_main__"}:
         port=7980,
         reload=False,
         favicon='🎮',
+        storage_secret='renpy-translator-secret-key',
     )

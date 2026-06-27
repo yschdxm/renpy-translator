@@ -25,6 +25,7 @@ ui.run(
     port=7860,
     language="zh-CN",
     dark=True,
+    storage_secret='renpy-translator-secret-key',
     uvicorn_reload_dirs=str(Path(__file__).parent / 'src'),
     uvicorn_reload_includes='*.py',
 )

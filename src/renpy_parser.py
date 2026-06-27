@@ -21,6 +21,7 @@ class DialogueLine:
     original_text: str
     translated_text: str = ""
     is_translated: bool = False
+    label: str = ""  # 所属 label 名
 
 
 @dataclass
@@ -110,15 +111,22 @@ class RenpyParser:
         return characters
 
     def extract_dialogue(self, content: str, file_path: str) -> List[DialogueLine]:
-        """从脚本中提取对话文本（上下文将在显示时动态计算）"""
+        """从脚本中提取对话文本，记录每条对话所属的 label"""
         lines = content.split('\n')
         dialogues = []
+        current_label = ""
 
         for line_num, line in enumerate(lines, 1):
             stripped = line.strip()
 
             # 跳过注释和空行
             if stripped.startswith('#') or not stripped:
+                continue
+
+            # 检测 label 定义：label xxx:
+            label_match = re.match(r'^label\s+(\w+)\s*:', stripped)
+            if label_match:
+                current_label = label_match.group(1)
                 continue
 
             # 检查角色对话模式
@@ -162,7 +170,8 @@ class RenpyParser:
                         file_path=file_path,
                         line_number=line_num,
                         character=char_name,
-                        original_text=text
+                        original_text=text,
+                        label=current_label
                     )
                     dialogues.append(dialogue)
                     break

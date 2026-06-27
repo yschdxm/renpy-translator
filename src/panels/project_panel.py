@@ -60,8 +60,8 @@ class ProjectPanel:
                 ui.button('刷新', icon='refresh',
                           on_click=self._run_refresh_exports).props('flat dense')
 
-        # 页面加载完成后异步刷新（ui.timer 回调无 slot 上下文，必须用 create_task）
-        ui.timer(0.1, lambda: asyncio.create_task(self.async_refresh_projects()), once=True)
+        # 初始加载项目列表（create 中有 slot 上下文，直接同步加载）
+        self._load_initial_projects()
 
     async def _run_refresh_exports(self):
         await self.async_refresh_export_packages()
@@ -75,6 +75,38 @@ class ProjectPanel:
     async def _run_edit_project(self, name: str):
         await self._show_edit_dialog(name)
 
+    def _load_initial_projects(self):
+        """初始加载项目列表（同步，在 create 调用，有 slot 上下文）"""
+        projects = self.project_manager.list_projects()
+
+        with self.project_card_container:
+            if not projects:
+                with ui.card().classes('w-full flat bordered q-pa-lg'):
+                    with ui.column().classes('items-center'):
+                        ui.icon('folder_off', size='3rem').classes('text-grey-5')
+                        ui.label('暂无项目').classes('text-grey-6 q-mt-sm')
+                        ui.label('点击上方「新建项目」开始').classes('text-caption text-grey-5')
+                return
+
+            for p in projects:
+                with ui.card().classes('w-full flat bordered q-mb-sm') as card:
+                    with ui.row().classes('items-center full-width q-pa-sm'):
+                        ui.icon('folder', size='1.5rem').classes('text-grey-6')
+                        with ui.column().classes('q-ml-sm'):
+                            lbl_name = ui.label(p.name).classes('text-subtitle1')
+                            lbl_progress = ui.label(p.progress_text).props('caption')
+                        ui.space()
+                        with ui.row().classes('gap-xs items-center'):
+                            ui.button('打开', on_click=lambda n=p.name: asyncio.create_task(self._run_open_project(n))).props('dense flat no-caps')
+                            ui.button('导出', on_click=lambda n=p.name: asyncio.create_task(self._run_export_project(n))).props('dense flat no-caps')
+                            ui.button(icon='edit', on_click=lambda n=p.name: asyncio.create_task(self._run_edit_project(n))).props('flat dense round size=sm')
+                            ui.button(icon='delete', on_click=lambda n=p.name: self._confirm_delete(n)).props('flat dense round size=sm color=negative')
+                self._project_cards[p.name] = {
+                    'card': card,
+                    'label_name': lbl_name,
+                    'label_progress': lbl_progress,
+                }
+
     async def async_refresh_projects(self):
         """刷新项目卡片列表（就地更新，不清空重建）"""
         loop = asyncio.get_event_loop()
@@ -86,7 +118,7 @@ class ProjectPanel:
 
         # 删除不再存在的项目卡片
         for name in old_names - new_names:
-            self._project_cards[name].delete()
+            self._project_cards[name]['card'].delete()
             del self._project_cards[name]
 
         # 更新或创建项目卡片
@@ -107,7 +139,7 @@ class ProjectPanel:
                                 lbl_progress = ui.label(p.progress_text).props('caption')
                             ui.space()
                             with ui.row().classes('gap-xs items-center'):
-                                ui.button('打开', on_click=lambda n=p.name: self._run_open_project(n)).props('dense flat no-caps')
+                                ui.button('打开', on_click=lambda n=p.name: asyncio.create_task(self._run_open_project(n))).props('dense flat no-caps')
                                 ui.button('导出', on_click=lambda n=p.name: self._run_export_project(n)).props('dense flat no-caps')
                                 ui.button(icon='edit', on_click=lambda n=p.name: self._run_edit_project(n)).props('flat dense round size=sm')
                                 ui.button(icon='delete', on_click=lambda n=p.name: self._confirm_delete(n)).props('flat dense round size=sm color=negative')
@@ -441,13 +473,11 @@ class ProjectPanel:
         char_result = await loop.run_in_executor(None, _parse_chars)
 
         # 保存角色信息到数据库（在线程池中）
-        characters = [{"variable": c.variable, "name": c.name, "chinese_name": ""}
+        characters = [{"variable": c.variable, "display_name": c.name}
                       for c in char_result['characters']]
 
         def _save_chars():
             db.insert_characters(characters)
-            name_dict = {c.name: '' for c in char_result['characters'] if c.name}
-            db.update_char_dict_batch(name_dict)
 
         await loop.run_in_executor(None, _save_chars)
         progress_bar.value = 0.80
@@ -471,6 +501,19 @@ class ProjectPanel:
             def _save_tl():
                 db.insert_dialogues(tl_result.get('dialogues', []))
                 db.insert_ui_texts(tl_result.get('ui_texts', []))
+
+                # 统计每个角色的台词数并更新 characters 表
+                line_counts = {}
+                for d in tl_result.get('dialogues', []):
+                    char = d.get('character', '')
+                    if char:
+                        line_counts[char] = line_counts.get(char, 0) + 1
+
+                # variable_map: variable -> display_name
+                var_map = db.get_variable_map()
+                for var_name, count in line_counts.items():
+                    display_name = var_map.get(var_name, var_name)
+                    db.update_character_lines_count(display_name, count)
 
             await loop.run_in_executor(None, _save_tl)
 
@@ -537,18 +580,28 @@ class ProjectPanel:
         return {'dialogues': dialogues, 'ui_texts': ui_texts}
 
     def _parse_dialogue_blocks(self, lines, tl_file, game_path, dialogues):
-        """解析对话格式的翻译块"""
+        """解析对话格式的翻译块，提取 label 归属"""
         import re
         current_file = str(tl_file.relative_to(tl_file.parent.parent.parent))
         if current_file.startswith('tl/chinese/'):
             current_file = current_file[len('tl/chinese/'):]
 
+        current_label = ""
         i = 0
         while i < len(lines):
             line = lines[i].rstrip()
             i += 1
-            if not line or line.startswith('translate '):
+            if not line:
                 continue
+
+            # 提取 label：translate chinese label_hash:
+            translate_match = re.match(r'^translate\s+\w+\s+(\w+)\s*:', line)
+            if translate_match:
+                raw_label = translate_match.group(1)
+                # label 格式通常是 "start_abc123"，取下划线前的部分
+                current_label = raw_label.split('_')[0] if '_' in raw_label else raw_label
+                continue
+
             if re.match(r'^\s+#\s+game/', line):
                 continue
 
@@ -577,9 +630,9 @@ class ProjectPanel:
                 full_path = str(game_path / 'game' / current_file)
                 entry = {
                     'file_path': full_path, 'line_number': 0,
+                    'label': current_label,
                     'character': character, 'original_text': text,
                     'translated_text': '', 'is_translated': False,
-                    'context_before': [], 'context_after': []
                 }
                 if any(f in current_file for f in ['screens', 'gui', 'options', 'common']):
                     ui_texts.append(entry)
@@ -609,9 +662,9 @@ class ProjectPanel:
                 full_path = str(game_path / 'game' / current_file) if current_file else ''
                 entry = {
                     'file_path': full_path, 'line_number': current_line or 0,
+                    'label': '',
                     'character': '', 'original_text': current_old,
                     'translated_text': '', 'is_translated': False,
-                    'context_before': [], 'context_after': []
                 }
                 ui_texts.append(entry)
                 current_old = None
@@ -695,7 +748,7 @@ class ProjectPanel:
                 with tempfile.TemporaryDirectory() as temp_dir:
                     with zipfile.ZipFile(import_file_data['path'], 'r') as zf:
                         zf.extractall(temp_dir)
-                    return self.project_manager.import_from_json_file(temp_dir, project_name)
+                    return self.project_manager.import_from_zip(temp_dir, project_name)
 
             result = await loop.run_in_executor(None, _do_import)
 

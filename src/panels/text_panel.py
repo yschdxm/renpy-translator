@@ -1,11 +1,17 @@
 """通用文本翻译面板 - 字符串和对话共用
 
-通过 content_type 参数区分 'ui' 和 'dialogue'，
-单条翻译、翻译本页、翻译全部 共用同一套 TranslationService 逻辑。
+翻译逻辑完全照搬人名面板，只改内容类型和查询方法。
 """
 
 import asyncio
 from nicegui import ui
+
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except (RuntimeError, AttributeError):
+        return None
 
 from database import ProjectDatabase
 from translation_service import TranslationService
@@ -16,11 +22,7 @@ from components.log_panel import LogPanel
 
 
 class TextTranslationPanel:
-    """通用文本翻译面板
-
-    - content_type='ui'  -> 字符串翻译
-    - content_type='dialogue' -> 对话翻译
-    """
+    """通用文本翻译面板 - 字符串和对话共用"""
 
     def __init__(self, content_type: str, title: str,
                  show_character: bool = False,
@@ -29,6 +31,8 @@ class TextTranslationPanel:
         self.title = title
         self.show_character = show_character
         self.logger = logger
+        self._on_task_state_change: callable = None
+        self._processing_ids: set = set()
 
         self.db: ProjectDatabase = None
         self.translation_service: TranslationService = None
@@ -37,29 +41,25 @@ class TextTranslationPanel:
         self.progress: ProgressPanel = None
         self.log_panel: LogPanel = None
 
-        # 按钮
         self.translate_page_btn: ui.button = None
         self.translate_all_btn: ui.button = None
         self.stop_btn: ui.button = None
+        self._cancel = False
 
-        # 角色筛选（对话模式）
+        # 角色筛选
         self.char_filter: ui.select = None
         self._char_filter_value = ''
 
     def set_db(self, db: ProjectDatabase):
-        """设置数据库引用"""
         self.db = db
 
     def set_translation_service(self, service: TranslationService):
-        """设置翻译服务"""
         self.translation_service = service
 
     def create(self, container: ui.column):
-        """创建面板"""
         with container:
-            # 统计和操作栏
             with ui.row().classes('w-full items-center gap-2'):
-                self.stats_label = ui.label(f'请先打开项目').classes('text-subtitle1')
+                self.stats_label = ui.label('请先打开项目').classes('text-subtitle1')
                 ui.space()
                 self.translate_page_btn = ui.button(
                     '🚀 翻译本页', color='primary',
@@ -71,10 +71,10 @@ class TextTranslationPanel:
                 )
                 self.stop_btn = ui.button(
                     '⏹ 停止', color='red',
-                    on_click=self._stop_translation
+                    on_click=self._stop
                 )
-                self.stop_btn.set_visibility(False)
-                ui.button('🔄 刷新', on_click=self.refresh).props('flat dense')
+                _safe(self.stop_btn.set_visibility, False)
+                ui.button('🔄 刷新', on_click=self.async_refresh).props('flat dense')
 
             # 角色筛选（对话模式）
             if self.show_character:
@@ -84,7 +84,6 @@ class TextTranslationPanel:
                     ).classes('w-48')
                     self.char_filter.on_value_change(self._on_char_filter_change)
 
-            # 表格
             columns = [
                 {'name': 'index', 'label': '#', 'field': 'index', 'sortable': True,
                  'style': 'width: 50px'},
@@ -106,7 +105,6 @@ class TextTranslationPanel:
 
             self.table = PaginatedTable(columns=columns, page_size=50, row_key='index')
 
-            # 自定义单元格
             self.table.add_slot('body-cell-translated', '''
                 <q-td :props="props">
                     <q-input v-model="props.row.translated" dense type="textarea" autogrow
@@ -126,7 +124,6 @@ class TextTranslationPanel:
                 self.table.add_slot('body-cell-action', '''
                     <q-td :props="props">
                         <q-btn flat dense color="primary" label="AI翻译"
-                            :disable="props.row.status === '翻译中'"
                             @click="$parent.$emit('translate_item', props.row)" />
                         <q-btn flat dense color="secondary" label="上下文"
                             @click="$parent.$emit('show_context', props.row)" />
@@ -136,21 +133,17 @@ class TextTranslationPanel:
                 self.table.add_slot('body-cell-action', '''
                     <q-td :props="props">
                         <q-btn flat dense color="primary" label="AI翻译"
-                            :disable="props.row.status === '翻译中'"
                             @click="$parent.$emit('translate_item', props.row)" />
                     </q-td>
                 ''')
 
-            # 注册事件
             self.table.on('update:text', self._on_text_update)
             self.table.on('translate_item', self._on_translate_item)
             if self.show_character:
                 self.table.on('show_context', self._on_show_context)
 
-            # 构建 UI
             self.table.build_ui(container)
 
-            # 进度和日志
             self.progress = ProgressPanel()
             self.progress.build_ui(container)
 
@@ -160,37 +153,23 @@ class TextTranslationPanel:
             if self.logger:
                 self.logger.bind_ui(self.content_type, self.log_panel.get_push_callback())
 
+    # ========== 刷新（和人名面板一致） ==========
+
     def refresh(self):
-        """同步刷新（仅在同步上下文中使用）"""
         if not self.db:
             return
         self.table.set_query(self._query_items)
         self.table.refresh()
-        if self.content_type == 'ui':
-            counts = self.db.get_ui_text_count()
-        else:
-            counts = self.db.get_dialogue_count()
-        self.stats_label.text = f'📊 总计: {counts["total"]} | ✅ 已翻译: {counts["translated"]}'
-        if self.show_character and self.char_filter:
-            characters = self.db.get_dialogue_characters()
-            variable_map = self.db.get_variable_map()
-            options = ['全部'] + [variable_map.get(c, c) for c in characters]
-            self.char_filter.set_options(options)
+        self._update_stats()
 
     async def async_refresh(self):
-        """异步刷新（非阻塞）"""
         if not self.db:
             return
         loop = asyncio.get_event_loop()
-
-        if self.content_type == 'ui':
-            counts = await loop.run_in_executor(None, self.db.get_ui_text_count)
-        else:
-            counts = await loop.run_in_executor(None, self.db.get_dialogue_count)
-
+        counts = await loop.run_in_executor(None, self._get_counts)
         self.table.set_query(self._query_items)
-        self.table.refresh()
-        self.stats_label.text = f'📊 总计: {counts["total"]} | ✅ 已翻译: {counts["translated"]}'
+        _safe(self.table.refresh)
+        _safe(setattr, self.stats_label, 'text', f'📊 总计: {counts["total"]} | ✅ 已翻译: {counts["translated"]}')
 
         if self.show_character and self.char_filter:
             characters = await loop.run_in_executor(None, self.db.get_dialogue_characters)
@@ -198,8 +177,20 @@ class TextTranslationPanel:
             options = ['全部'] + [variable_map.get(c, c) for c in characters]
             self.char_filter.set_options(options)
 
-    def _query_items(self, page: int, page_size: int, **filters) -> tuple[list, int]:
-        """从 SQLite 分页查询"""
+    def _get_counts(self):
+        if self.content_type == 'ui':
+            return self.db.get_ui_text_count()
+        return self.db.get_dialogue_count()
+
+    def _update_stats(self):
+        if not self.db:
+            return
+        counts = self._get_counts()
+        _safe(setattr, self.stats_label, 'text', f'📊 总计: {counts["total"]} | ✅ 已翻译: {counts["translated"]}')
+
+    # ========== 查询（和人名面板的 _query_names 一致的结构） ==========
+
+    def _query_items(self, page: int, page_size: int, **filters):
         filter_mode = filters.get('filter_mode', 'all')
         search = filters.get('search', '')
 
@@ -207,17 +198,23 @@ class TextTranslationPanel:
             items, total = self.db.get_ui_texts_page(page, page_size, filter_mode, search)
         else:
             character = filters.get('character', '')
-            items, total = self.db.get_dialogues_page(
-                page, page_size, filter_mode, character, search
-            )
+            items, total = self.db.get_dialogues_page(page, page_size, filter_mode, character, search)
 
         rows = []
         for d in items:
+            is_processing = d['id'] in self._processing_ids
+            if is_processing:
+                status = '翻译中'
+            elif d.get('is_translated'):
+                status = '完成'
+            else:
+                status = '待翻译'
+
             row = {
                 'index': d['id'],
                 'original': d.get('original_text', ''),
                 'translated': d.get('translated_text', ''),
-                'status': '完成' if d.get('is_translated') else '待翻译',
+                'status': status,
                 'action': d['id'],
             }
             if self.show_character:
@@ -226,8 +223,9 @@ class TextTranslationPanel:
 
         return rows, total
 
+    # ========== 事件处理 ==========
+
     def _on_text_update(self, e):
-        """译文输入框更新 -> 立即写入 SQLite"""
         row = e.args
         if row and self.db:
             item_id = row['action']
@@ -237,92 +235,111 @@ class TextTranslationPanel:
                 self.db.update_dialogue(item_id, row['translated'])
 
     async def _on_translate_item(self, e):
-        """AI翻译单条"""
         row = e.args
         if not self.translation_service:
-            ui.notify('请先配置翻译器', type='warning')
+            _safe(ui.notify, '请先配置翻译器', type='warning')
             return
-
         if row:
-            item_id = row['action']
-            await self._do_translate_single(item_id)
+            await self._do_translate_single(row['action'])
 
     async def _do_translate_single(self, item_id: int):
-        """翻译单条"""
-        loop = asyncio.get_event_loop()
-
+        """翻译单条（和人名面板的 _do_translate_and_analyze 结构一致）"""
+        # 获取原文
         if self.content_type == 'ui':
-            item = await loop.run_in_executor(None, self.db.get_ui_text, item_id)
+            item = self.db.get_ui_text(item_id)
         else:
-            item = await loop.run_in_executor(None, self.db.get_dialogue, item_id)
+            item = self.db.get_dialogue(item_id)
 
         if not item:
             return
 
-        ok = await self.translation_service.translate_single(
-            item_id=item_id,
-            content_type=self.content_type,
-            original_text=item['original_text'],
-            character=item.get('character', ''),
-            context_before=item.get('context_before'),
-            context_after=item.get('context_after'),
-        )
+        # 标记处理中
+        self._processing_ids.add(item_id)
+        _safe(self.table.refresh)
 
-        await self.async_refresh()
+        try:
+            ok = await self.translation_service.translate_single(
+                item_id=item_id,
+                content_type=self.content_type,
+                original_text=item['original_text'],
+                character=item.get('character', ''),
+            )
+
+            self._processing_ids.discard(item_id)
+            await self.async_refresh()
+
+        except Exception as e:
+            self.logger.error(f'翻译失败: {e}', panel=self.content_type)
+            self._processing_ids.discard(item_id)
+            await self.async_refresh()
+
+    # ========== 批量翻译（和人名面板的 _translate_all 结构一致） ==========
 
     async def _translate_page(self):
         """翻译当前页"""
         if not self.translation_service:
-            ui.notify('请先配置翻译器', type='warning')
+            _safe(ui.notify, '请先配置翻译器', type='warning')
             return
 
         items = self.table.get_page_items()
         to_translate = [item for item in items if item.get('status') != '完成']
 
         if not to_translate:
-            ui.notify('当前页已全部翻译', type='info')
+            _safe(ui.notify, '当前页已全部翻译', type='info')
             return
 
-        loop = asyncio.get_event_loop()
+        self._cancel = False
+        _safe(self.translate_page_btn.set_visibility, False)
+        _safe(self.stop_btn.set_visibility, True)
+        if self._on_task_state_change:
+            self._on_task_state_change(True)
 
-        # DB 查询在线程池中
-        def _load_items():
-            db_items = []
-            for row in to_translate:
-                if self.content_type == 'ui':
-                    item = self.db.get_ui_text(row['action'])
-                else:
-                    item = self.db.get_dialogue(row['action'])
-                if item:
-                    db_items.append(item)
-            return db_items
+        total = len(to_translate)
+        self.logger.info(f'开始翻译当前页 {total} 条 ({self.content_type})', panel=self.content_type)
 
-        db_items = await loop.run_in_executor(None, _load_items)
+        success = 0
+        for i, row in enumerate(to_translate):
+            if self._cancel:
+                break
 
-        self._set_buttons_translating(True)
+            self.progress.update(i, total, f'翻译中: {i+1}/{total}')
 
-        def on_progress(current, total, status):
-            self.progress.update(current, total, status)
+            # 标记处理中
+            self._processing_ids.add(row['action'])
+            _safe(self.table.refresh)
 
-        result = await self.translation_service.translate_batch(
-            content_type=self.content_type,
-            items=db_items,
-            progress_callback=on_progress
-        )
+            try:
+                ok = await self.translation_service.translate_single(
+                    item_id=row['action'],
+                    content_type=self.content_type,
+                    original_text=row.get('original', ''),
+                    character=row.get('character', ''),
+                )
+                if ok:
+                    success += 1
+            except Exception as e:
+                self.logger.error(f'翻译失败: {e}', panel=self.content_type)
 
-        self._set_buttons_translating(False)
+            self._processing_ids.discard(row['action'])
+            await self.async_refresh()
+
+        self._processing_ids.clear()
+        _safe(self.translate_page_btn.set_visibility, True)
+        _safe(self.stop_btn.set_visibility, False)
         self.progress.reset()
+        if self._on_task_state_change:
+            self._on_task_state_change(False)
         await self.async_refresh()
 
-        if result['stopped']:
-            ui.notify(f'翻译已停止: 成功 {result["success"]}', type='warning')
+        if self._cancel:
+            _safe(ui.notify, f'翻译已停止: 成功 {success}/{total}', type='warning')
         else:
-            ui.notify(f'翻译完成: 成功 {result["success"]}', type='positive')
+            _safe(ui.notify, f'翻译完成: 成功 {success}/{total}', type='positive')
 
     async def _translate_all(self):
-        """翻译全部未翻译"""
+        """翻译全部未翻译（和人名面板的 _translate_all 结构一致）"""
         if not self.translation_service:
-            ui.notify('请先配置翻译器', type='warning')
+            _safe(ui.notify, '请先配置翻译器', type='warning')
             return
 
         # 检查前置条件（对话翻译时检查人名和分析）
@@ -330,28 +347,73 @@ class TextTranslationPanel:
             loop = asyncio.get_event_loop()
             ok, msg = await loop.run_in_executor(None, self._check_prerequisites)
             if not ok:
-                ui.notify(msg, type='warning')
+                _safe(ui.notify, msg, type='warning')
                 return
 
-        self._set_buttons_translating(True)
+        self._cancel = False
+        _safe(self.translate_all_btn.set_visibility, False)
+        _safe(self.stop_btn.set_visibility, True)
+        if self._on_task_state_change:
+            self._on_task_state_change(True)
 
-        def on_progress(current, total, status):
-            self.progress.update(current, total, status)
+        loop = asyncio.get_event_loop()
 
-        result = await self.translation_service.translate_batch(
-            content_type=self.content_type,
-            items=None,
-            progress_callback=on_progress
-        )
+        # 获取所有未翻译
+        if self.content_type == 'ui':
+            to_translate = await loop.run_in_executor(None, self.db.get_untranslated_ui_texts)
+        else:
+            to_translate = await loop.run_in_executor(None, self.db.get_untranslated_dialogues)
 
-        self._set_buttons_translating(False)
+        total = len(to_translate)
+        if total == 0:
+            _safe(ui.notify, '所有内容已翻译', type='info')
+            _safe(self.translate_all_btn.set_visibility, True)
+            _safe(self.stop_btn.set_visibility, False)
+            self.progress.reset()
+            if self._on_task_state_change:
+                self._on_task_state_change(False)
+            return
+
+        self.logger.info(f'开始翻译 {total} 条 ({self.content_type})', panel=self.content_type)
+
+        success = 0
+        for i, item in enumerate(to_translate):
+            if self._cancel:
+                break
+
+            self.progress.update(i, total, f'翻译中: {i+1}/{total}')
+
+            # 标记处理中
+            self._processing_ids.add(item['id'])
+            _safe(self.table.refresh)
+
+            try:
+                ok = await self.translation_service.translate_single(
+                    item_id=item['id'],
+                    content_type=self.content_type,
+                    original_text=item.get('original_text', ''),
+                    character=item.get('character', ''),
+                )
+                if ok:
+                    success += 1
+            except Exception as e:
+                self.logger.error(f'翻译失败: {e}', panel=self.content_type)
+
+            self._processing_ids.discard(item['id'])
+            await self.async_refresh()
+
+        self._processing_ids.clear()
+        _safe(self.translate_all_btn.set_visibility, True)
+        _safe(self.stop_btn.set_visibility, False)
         self.progress.reset()
+        if self._on_task_state_change:
+            self._on_task_state_change(False)
         await self.async_refresh()
 
-        if result['stopped']:
-            ui.notify(f'翻译已停止: 成功 {result["success"]}', type='warning')
+        if self._cancel:
+            _safe(ui.notify, f'翻译已停止: 成功 {success}/{total}', type='warning')
         else:
-            ui.notify(f'翻译完成: 成功 {result["success"]}, 失败 {result["failed"]}', type='positive')
+            _safe(ui.notify, f'翻译完成: 成功 {success}/{total}', type='positive')
 
     def _check_prerequisites(self) -> tuple[bool, str]:
         """检查对话翻译的前置条件（同步，在线程池中调用）"""
@@ -364,25 +426,26 @@ class TextTranslationPanel:
 
         profiles = self.db.get_all_profiles()
         characters = self.db.get_characters()
-        unanalyzed = [c['name'] for c in characters if c.get('name') and c['name'] not in profiles]
+        unanalyzed = [c['display_name'] for c in characters
+                      if c['display_name'] not in profiles and not c['is_placeholder']]
         if unanalyzed:
             return False, f'请先完成人物分析（还有 {len(unanalyzed)} 个未分析）'
 
         return True, ''
 
-    async def _stop_translation(self):
-        """停止翻译"""
+    async def _stop(self):
+        self._cancel = True
         if self.translation_service:
             await self.translation_service.stop()
 
     def _set_buttons_translating(self, translating: bool):
-        """切换按钮状态"""
-        self.translate_page_btn.set_visibility(not translating)
-        self.translate_all_btn.set_visibility(not translating)
-        self.stop_btn.set_visibility(translating)
+        _safe(self.translate_page_btn.set_visibility, not translating)
+        _safe(self.translate_all_btn.set_visibility, not translating)
+        _safe(self.stop_btn.set_visibility, translating)
+
+    # ========== 角色筛选（对话模式） ==========
 
     async def _on_char_filter_change(self, e):
-        """角色筛选变化（对话模式，DB 查询在线程池中）"""
         if self.show_character:
             if e.value == '全部':
                 self._char_filter_value = ''
@@ -396,8 +459,9 @@ class TextTranslationPanel:
             self.table.current_page = 0
             self.table.refresh()
 
+    # ========== 上下文查看（对话模式） ==========
+
     async def _on_show_context(self, e):
-        """显示上下文对话框（DB 查询在线程池中）"""
         row = e.args
         if not row or not self.db:
             return
@@ -409,7 +473,7 @@ class TextTranslationPanel:
             item = self.db.get_dialogue(item_id)
             if not item:
                 return None, [], []
-            ctx_before, ctx_after = self.db.get_dialogue_neighbors(item_id, 5)
+            ctx_before, ctx_after = self.db.get_dialogue_context(item_id, 'dialogue', 5)
             return item, ctx_before, ctx_after
 
         item, context_before, context_after = await loop.run_in_executor(None, _load_context)
@@ -424,8 +488,14 @@ class TextTranslationPanel:
 
             if context_before:
                 ui.label('前文:').classes('text-subtitle2 text-grey')
-                for line in context_before:
-                    ui.label(f'  {line}').classes('text-body2')
+                for ctx in context_before:
+                    char = ctx.get('character', '') or '旁白'
+                    orig = ctx.get('original_text', '')
+                    trans = ctx.get('translated_text', '')
+                    if trans:
+                        ui.label(f'  [已译] {char}: "{orig}" → "{trans}"').classes('text-body2 text-positive')
+                    else:
+                        ui.label(f'  {char}: "{orig}"').classes('text-body2')
 
             ui.separator()
             ui.label(f'>>> 【{current_char}】{current_text} <<<').classes(
@@ -434,8 +504,14 @@ class TextTranslationPanel:
             if context_after:
                 ui.separator()
                 ui.label('后文:').classes('text-subtitle2 text-grey')
-                for line in context_after:
-                    ui.label(f'  {line}').classes('text-body2')
+                for ctx in context_after:
+                    char = ctx.get('character', '') or '旁白'
+                    orig = ctx.get('original_text', '')
+                    trans = ctx.get('translated_text', '')
+                    if trans:
+                        ui.label(f'  [已译] {char}: "{orig}" → "{trans}"').classes('text-body2 text-positive')
+                    else:
+                        ui.label(f'  {char}: "{orig}"').classes('text-body2')
 
             ui.button('关闭', on_click=dialog.close).classes('mt-4')
 

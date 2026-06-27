@@ -1,7 +1,6 @@
-"""SQLite 数据库层 - 替代 JSON 文件存储项目数据
+"""SQLite 数据库层
 
 每个项目一个独立的 .db 文件，使用 WAL 模式支持读写并发。
-单条翻译后保存只需 UPDATE 单行（毫秒级），不再重写整个文件。
 """
 
 import json
@@ -9,6 +8,17 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
+from functools import wraps
+
+
+def _auto_reconnect(method):
+    """装饰器：方法执行前确保数据库连接有效"""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self._conn is None:
+            self.connect()
+        return method(self, *args, **kwargs)
+    return wrapper
 
 
 # 建表 SQL
@@ -24,13 +34,13 @@ CREATE TABLE IF NOT EXISTS dialogues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_path TEXT NOT NULL DEFAULT '',
     line_number INTEGER DEFAULT 0,
+    label TEXT DEFAULT '',
     character TEXT DEFAULT '',
     original_text TEXT NOT NULL,
     translated_text TEXT DEFAULT '',
-    is_translated INTEGER DEFAULT 0,
-    context_before TEXT DEFAULT '[]',
-    context_after TEXT DEFAULT '[]'
+    is_translated INTEGER DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_dialogues_label ON dialogues(label);
 CREATE INDEX IF NOT EXISTS idx_dialogues_translated ON dialogues(is_translated);
 CREATE INDEX IF NOT EXISTS idx_dialogues_character ON dialogues(character);
 CREATE INDEX IF NOT EXISTS idx_dialogues_file ON dialogues(file_path);
@@ -40,40 +50,44 @@ CREATE TABLE IF NOT EXISTS ui_texts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_path TEXT NOT NULL DEFAULT '',
     line_number INTEGER DEFAULT 0,
+    label TEXT DEFAULT '',
     original_text TEXT NOT NULL,
     translated_text TEXT DEFAULT '',
     is_translated INTEGER DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_ui_label ON ui_texts(label);
 CREATE INDEX IF NOT EXISTS idx_ui_translated ON ui_texts(is_translated);
 CREATE INDEX IF NOT EXISTS idx_ui_file ON ui_texts(file_path);
 
--- 人名词典
-CREATE TABLE IF NOT EXISTS char_dict (
-    en_name TEXT PRIMARY KEY,
-    cn_name TEXT DEFAULT ''
-);
-
--- 角色信息
+-- 角色表（合并 characters + char_dict + char_profiles）
 CREATE TABLE IF NOT EXISTS characters (
-    variable TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    chinese_name TEXT DEFAULT ''
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    variable TEXT DEFAULT '',
+    display_name TEXT NOT NULL,
+    cn_name TEXT DEFAULT '',
+    lines_count INTEGER DEFAULT 0,
+    profile_json TEXT DEFAULT '',
+    is_placeholder INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT '',
+    UNIQUE(display_name)
 );
+CREATE INDEX IF NOT EXISTS idx_characters_display ON characters(display_name);
+CREATE INDEX IF NOT EXISTS idx_characters_cn ON characters(cn_name);
 
--- 角色分析档案
-CREATE TABLE IF NOT EXISTS char_profiles (
-    name TEXT PRIMARY KEY,
-    profile_json TEXT NOT NULL
+-- 术语表
+CREATE TABLE IF NOT EXISTS glossary (
+    en_term TEXT PRIMARY KEY,
+    cn_term TEXT DEFAULT '',
+    term_type TEXT DEFAULT 'other',
+    source TEXT DEFAULT '',
+    created_at TEXT DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_glossary_type ON glossary(term_type);
 """
 
 
 class ProjectDatabase:
-    """项目 SQLite 数据库
-
-    使用 WAL 模式，支持读写并发。
-    单条翻译后保存只需 UPDATE 单行（毫秒级）。
-    """
+    """项目 SQLite 数据库"""
 
     def __init__(self, db_path: str):
         self.db_path = Path(db_path)
@@ -86,12 +100,23 @@ class ProjectDatabase:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA cache_size=-64000")  # 64MB 缓存
+        self._conn.execute("PRAGMA cache_size=-64000")
         self._conn.executescript(_SCHEMA_SQL)
+        # 迁移：给已有表补上缺失的列
+        self._migrate_columns()
         self._conn.commit()
 
+    def _migrate_columns(self):
+        """给已有表补上缺失的列（兼容旧数据库）"""
+        for table, col, col_def in [
+            ('dialogues', 'label', "TEXT DEFAULT ''"),
+            ('ui_texts', 'label', "TEXT DEFAULT ''"),
+        ]:
+            existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+
     def close(self):
-        """关闭数据库连接"""
         if self._conn:
             self._conn.close()
             self._conn = None
@@ -102,7 +127,6 @@ class ProjectDatabase:
 
     @contextmanager
     def _transaction(self):
-        """事务上下文管理器"""
         assert self._conn, "数据库未连接"
         try:
             yield self._conn
@@ -113,77 +137,72 @@ class ProjectDatabase:
 
     # ========== 项目元数据 ==========
 
+    @_auto_reconnect
     def get_meta(self, key: str, default: str = "") -> str:
-        """获取元数据"""
         row = self._conn.execute(
             "SELECT value FROM project_meta WHERE key=?", (key,)
         ).fetchone()
         return row["value"] if row else default
 
+    @_auto_reconnect
     def set_meta(self, key: str, value: str):
-        """设置元数据"""
         self._conn.execute(
             "INSERT OR REPLACE INTO project_meta (key, value) VALUES (?, ?)",
             (key, value)
         )
         self._conn.commit()
 
+    @_auto_reconnect
     def get_all_meta(self) -> dict:
-        """获取所有元数据"""
         rows = self._conn.execute("SELECT key, value FROM project_meta").fetchall()
         return {row["key"]: row["value"] for row in rows}
 
-    # ========== 对话操作 ==========
+    # ========== 对话翻译 ==========
 
+    @_auto_reconnect
     def insert_dialogues(self, items: list[dict]):
-        """批量插入对话（创建项目时使用）"""
+        """批量插入对话"""
         with self._transaction():
             self._conn.executemany(
                 """INSERT INTO dialogues
-                   (file_path, line_number, character, original_text,
-                    translated_text, is_translated, context_before, context_after)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (file_path, line_number, label, character, original_text,
+                    translated_text, is_translated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 [(
                     d.get("file_path", ""),
                     d.get("line_number", 0),
+                    d.get("label", ""),
                     d.get("character", ""),
                     d.get("original_text", ""),
                     d.get("translated_text", ""),
                     1 if d.get("is_translated") else 0,
-                    json.dumps(d.get("context_before", []), ensure_ascii=False),
-                    json.dumps(d.get("context_after", []), ensure_ascii=False),
                 ) for d in items]
             )
 
+    @_auto_reconnect
     def update_dialogue(self, item_id: int, translated_text: str):
-        """翻译单条对话后保存（毫秒级）"""
+        """翻译单条对话后保存"""
         self._conn.execute(
             "UPDATE dialogues SET translated_text=?, is_translated=1 WHERE id=?",
             (translated_text, item_id)
         )
         self._conn.commit()
 
+    @_auto_reconnect
     def update_dialogues_batch(self, updates: list[tuple[int, str]]):
-        """批量更新对话翻译（单事务提交）
-
-        Args:
-            updates: [(id, translated_text), ...]
-        """
+        """批量更新对话翻译"""
         with self._transaction():
             self._conn.executemany(
                 "UPDATE dialogues SET translated_text=?, is_translated=1 WHERE id=?",
                 [(text, id_) for id_, text in updates]
             )
 
+    @_auto_reconnect
     def get_dialogues_page(self, page: int = 0, page_size: int = 50,
                            filter_mode: str = 'all',
                            character: str = '',
                            search: str = '') -> tuple[list[dict], int]:
-        """分页查询对话（带筛选）
-
-        Returns:
-            (items, total_count)
-        """
+        """分页查询对话"""
         where_clauses = []
         params = []
 
@@ -202,13 +221,11 @@ class ProjectDatabase:
 
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
-        # 总数
         count_row = self._conn.execute(
             f"SELECT COUNT(*) as cnt FROM dialogues{where_sql}", params
         ).fetchone()
         total = count_row["cnt"]
 
-        # 分页数据
         offset = page * page_size
         rows = self._conn.execute(
             f"SELECT * FROM dialogues{where_sql} ORDER BY id LIMIT ? OFFSET ?",
@@ -218,6 +235,7 @@ class ProjectDatabase:
         items = [self._row_to_dialogue_dict(row) for row in rows]
         return items, total
 
+    @_auto_reconnect
     def get_untranslated_dialogues(self, limit: int = None) -> list[dict]:
         """获取未翻译的对话"""
         sql = "SELECT * FROM dialogues WHERE is_translated=0 ORDER BY id"
@@ -226,6 +244,7 @@ class ProjectDatabase:
         rows = self._conn.execute(sql).fetchall()
         return [self._row_to_dialogue_dict(row) for row in rows]
 
+    @_auto_reconnect
     def get_dialogue(self, item_id: int) -> Optional[dict]:
         """获取单条对话"""
         row = self._conn.execute(
@@ -233,23 +252,76 @@ class ProjectDatabase:
         ).fetchone()
         return self._row_to_dialogue_dict(row) if row else None
 
-    def get_dialogue_neighbors(self, item_id: int, count: int = 3) -> tuple[list[str], list[str]]:
-        """获取对话的上下文（前后的对话文本）"""
-        before_rows = self._conn.execute(
-            "SELECT original_text FROM dialogues WHERE id < ? ORDER BY id DESC LIMIT ?",
-            (item_id, count)
-        ).fetchall()
-        after_rows = self._conn.execute(
-            "SELECT original_text FROM dialogues WHERE id > ? ORDER BY id ASC LIMIT ?",
-            (item_id, count)
-        ).fetchall()
-        return (
-            [r["original_text"] for r in reversed(before_rows)],
-            [r["original_text"] for r in after_rows]
-        )
+    @_auto_reconnect
+    def get_dialogue_context(self, item_id: int, content_type: str,
+                              count: int = 5) -> tuple[list[dict], list[dict]]:
+        """按 label 获取上下文（前后 N 条）
 
+        已翻译的返回 original_text + translated_text + character
+        未翻译的只返回 original_text + character
+        """
+        table = 'dialogues' if content_type == 'dialogue' else 'ui_texts'
+
+        # 获取当前条目的 label 和 line_number
+        current = self._conn.execute(
+            f"SELECT label, file_path, line_number FROM {table} WHERE id=?",
+            (item_id,)
+        ).fetchone()
+
+        if not current:
+            return ([], [])
+
+        label = current['label']
+        line_number = current['line_number']
+
+        # ui_texts 表没有 character 列
+        char_col = "character" if content_type == "dialogue" else "'' as character"
+
+        if label:
+            before_rows = self._conn.execute(
+                f"""SELECT original_text, translated_text, {char_col}
+                    FROM {table}
+                    WHERE label=? AND line_number < ?
+                    ORDER BY line_number DESC LIMIT ?""",
+                (label, line_number, count)
+            ).fetchall()
+
+            after_rows = self._conn.execute(
+                f"""SELECT original_text, translated_text, {char_col}
+                    FROM {table}
+                    WHERE label=? AND line_number > ?
+                    ORDER BY line_number ASC LIMIT ?""",
+                (label, line_number, count)
+            ).fetchall()
+        else:
+            before_rows = self._conn.execute(
+                f"""SELECT original_text, translated_text, {char_col}
+                    FROM {table}
+                    WHERE id < ? ORDER BY id DESC LIMIT ?""",
+                (item_id, count)
+            ).fetchall()
+
+            after_rows = self._conn.execute(
+                f"""SELECT original_text, translated_text, {char_col}
+                    FROM {table}
+                    WHERE id > ? ORDER BY id ASC LIMIT ?""",
+                (item_id, count)
+            ).fetchall()
+
+        def _rows_to_list(rows):
+            return [
+                {
+                    'original_text': r['original_text'],
+                    'translated_text': r['translated_text'] or '',
+                    'character': r['character'] or '',
+                }
+                for r in rows
+            ]
+
+        return (_rows_to_list(list(reversed(before_rows))), _rows_to_list(after_rows))
+
+    @_auto_reconnect
     def get_dialogue_count(self) -> dict:
-        """统计对话数量"""
         row = self._conn.execute(
             "SELECT COUNT(*) as total, SUM(is_translated) as translated FROM dialogues"
         ).fetchone()
@@ -257,6 +329,7 @@ class ProjectDatabase:
         translated = row["translated"] or 0
         return {"total": total, "translated": translated, "untranslated": total - translated}
 
+    @_auto_reconnect
     def get_dialogue_characters(self) -> list[str]:
         """获取所有出现的角色（去重）"""
         rows = self._conn.execute(
@@ -266,57 +339,57 @@ class ProjectDatabase:
 
     @staticmethod
     def _row_to_dialogue_dict(row: sqlite3.Row) -> dict:
-        """将数据库行转为字典"""
         return {
             "id": row["id"],
             "file_path": row["file_path"],
             "line_number": row["line_number"],
+            "label": row["label"],
             "character": row["character"],
             "original_text": row["original_text"],
             "translated_text": row["translated_text"],
             "is_translated": bool(row["is_translated"]),
-            "context_before": json.loads(row["context_before"]) if row["context_before"] else [],
-            "context_after": json.loads(row["context_after"]) if row["context_after"] else [],
         }
 
-    # ========== UI 字符串操作 ==========
+    # ========== UI 字符串翻译 ==========
 
+    @_auto_reconnect
     def insert_ui_texts(self, items: list[dict]):
         """批量插入 UI 字符串"""
         with self._transaction():
             self._conn.executemany(
                 """INSERT INTO ui_texts
-                   (file_path, line_number, original_text, translated_text, is_translated)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (file_path, line_number, label, original_text, translated_text, is_translated)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 [(
                     d.get("file_path", ""),
                     d.get("line_number", 0),
+                    d.get("label", ""),
                     d.get("original_text", ""),
                     d.get("translated_text", ""),
                     1 if d.get("is_translated") else 0,
                 ) for d in items]
             )
 
+    @_auto_reconnect
     def update_ui_text(self, item_id: int, translated_text: str):
-        """翻译单条 UI 字符串后保存（毫秒级）"""
         self._conn.execute(
             "UPDATE ui_texts SET translated_text=?, is_translated=1 WHERE id=?",
             (translated_text, item_id)
         )
         self._conn.commit()
 
+    @_auto_reconnect
     def update_ui_texts_batch(self, updates: list[tuple[int, str]]):
-        """批量更新 UI 字符串翻译（单事务提交）"""
         with self._transaction():
             self._conn.executemany(
                 "UPDATE ui_texts SET translated_text=?, is_translated=1 WHERE id=?",
                 [(text, id_) for id_, text in updates]
             )
 
+    @_auto_reconnect
     def get_ui_texts_page(self, page: int = 0, page_size: int = 50,
                           filter_mode: str = 'all',
                           search: str = '') -> tuple[list[dict], int]:
-        """分页查询 UI 字符串"""
         where_clauses = []
         params = []
 
@@ -345,23 +418,23 @@ class ProjectDatabase:
         items = [self._row_to_ui_dict(row) for row in rows]
         return items, total
 
+    @_auto_reconnect
     def get_untranslated_ui_texts(self, limit: int = None) -> list[dict]:
-        """获取未翻译的 UI 字符串"""
         sql = "SELECT * FROM ui_texts WHERE is_translated=0 ORDER BY id"
         if limit:
             sql += f" LIMIT {limit}"
         rows = self._conn.execute(sql).fetchall()
         return [self._row_to_ui_dict(row) for row in rows]
 
+    @_auto_reconnect
     def get_ui_text(self, item_id: int) -> Optional[dict]:
-        """获取单条 UI 字符串"""
         row = self._conn.execute(
             "SELECT * FROM ui_texts WHERE id=?", (item_id,)
         ).fetchone()
         return self._row_to_ui_dict(row) if row else None
 
+    @_auto_reconnect
     def get_ui_text_count(self) -> dict:
-        """统计 UI 字符串数量"""
         row = self._conn.execute(
             "SELECT COUNT(*) as total, SUM(is_translated) as translated FROM ui_texts"
         ).fetchone()
@@ -371,133 +444,334 @@ class ProjectDatabase:
 
     @staticmethod
     def _row_to_ui_dict(row: sqlite3.Row) -> dict:
-        """将数据库行转为字典"""
         return {
             "id": row["id"],
             "file_path": row["file_path"],
             "line_number": row["line_number"],
+            "label": row["label"],
             "original_text": row["original_text"],
             "translated_text": row["translated_text"],
             "is_translated": bool(row["is_translated"]),
         }
 
-    # ========== 人名词典 ==========
+    # ========== 角色表（合并后） ==========
 
-    def get_char_dict(self) -> dict:
-        """获取人名词典（按插入顺序）"""
-        rows = self._conn.execute("SELECT en_name, cn_name FROM char_dict ORDER BY rowid").fetchall()
-        return {row["en_name"]: row["cn_name"] for row in rows}
+    @_auto_reconnect
+    def insert_characters(self, characters: list[dict]):
+        """批量插入角色（已存在则更新 variable）"""
+        with self._transaction():
+            for c in characters:
+                display_name = c.get("display_name", c.get("name", ""))
+                if not display_name:
+                    continue
+                existing = self._conn.execute(
+                    "SELECT id FROM characters WHERE display_name=?",
+                    (display_name,)
+                ).fetchone()
+                if existing:
+                    if c.get("variable"):
+                        self._conn.execute(
+                            "UPDATE characters SET variable=? WHERE display_name=?",
+                            (c["variable"], display_name)
+                        )
+                else:
+                    self._conn.execute(
+                        """INSERT INTO characters
+                           (variable, display_name, cn_name, lines_count,
+                            profile_json, is_placeholder, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            c.get("variable", ""),
+                            display_name,
+                            c.get("cn_name", ""),
+                            c.get("lines_count", 0),
+                            c.get("profile_json", ""),
+                            1 if c.get("is_placeholder") else 0,
+                            c.get("created_at", ""),
+                        )
+                    )
 
-    def update_char_name(self, en_name: str, cn_name: str):
-        """更新单个人名翻译（已存在则 UPDATE，不存在则 INSERT）"""
+    @_auto_reconnect
+    def get_characters(self) -> list[dict]:
+        """获取所有角色"""
+        rows = self._conn.execute("SELECT * FROM characters ORDER BY id").fetchall()
+        return [self._row_to_character_dict(r) for r in rows]
+
+    @_auto_reconnect
+    def get_character_by_name(self, display_name: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM characters WHERE display_name=?", (display_name,)
+        ).fetchone()
+        return self._row_to_character_dict(row) if row else None
+
+    @_auto_reconnect
+    def update_character_cn_name(self, display_name: str, cn_name: str):
+        """更新角色中文名"""
         existing = self._conn.execute(
-            "SELECT 1 FROM char_dict WHERE en_name=?", (en_name,)
+            "SELECT id FROM characters WHERE display_name=?", (display_name,)
         ).fetchone()
         if existing:
             self._conn.execute(
-                "UPDATE char_dict SET cn_name=? WHERE en_name=?",
-                (cn_name, en_name)
+                "UPDATE characters SET cn_name=? WHERE display_name=?",
+                (cn_name, display_name)
             )
         else:
             self._conn.execute(
-                "INSERT INTO char_dict (en_name, cn_name) VALUES (?, ?)",
-                (en_name, cn_name)
+                "INSERT INTO characters (display_name, cn_name) VALUES (?, ?)",
+                (display_name, cn_name)
             )
         self._conn.commit()
 
-    def update_char_dict_batch(self, name_dict: dict[str, str]):
-        """批量更新人名词典（已存在则 UPDATE，不存在则 INSERT）"""
-        with self._transaction():
-            for en_name, cn_name in name_dict.items():
-                existing = self._conn.execute(
-                    "SELECT 1 FROM char_dict WHERE en_name=?", (en_name,)
-                ).fetchone()
-                if existing:
-                    self._conn.execute(
-                        "UPDATE char_dict SET cn_name=? WHERE en_name=?",
-                        (cn_name, en_name)
-                    )
-                else:
-                    self._conn.execute(
-                        "INSERT INTO char_dict (en_name, cn_name) VALUES (?, ?)",
-                        (en_name, cn_name)
-                    )
+    @_auto_reconnect
+    def update_character_profile(self, display_name: str, profile: dict):
+        """更新角色分析档案"""
+        profile_json = json.dumps(profile, ensure_ascii=False)
+        existing = self._conn.execute(
+            "SELECT id FROM characters WHERE display_name=?", (display_name,)
+        ).fetchone()
+        if existing:
+            self._conn.execute(
+                "UPDATE characters SET profile_json=? WHERE display_name=?",
+                (profile_json, display_name)
+            )
+        else:
+            self._conn.execute(
+                "INSERT INTO characters (display_name, profile_json) VALUES (?, ?)",
+                (display_name, profile_json)
+            )
+        self._conn.commit()
 
-    def get_untranslated_names(self) -> list[tuple[str, str]]:
-        """获取未翻译的人名 -> [(en_name, cn_name), ...]"""
+    @_auto_reconnect
+    def update_character_lines_count(self, display_name: str, count: int):
+        """更新角色台词数"""
+        self._conn.execute(
+            "UPDATE characters SET lines_count=? WHERE display_name=?",
+            (count, display_name)
+        )
+        self._conn.commit()
+
+    @_auto_reconnect
+    def get_characters_for_prompt(self) -> str:
+        """获取人名翻译词典文本（用于提示词，供 AI 参考）"""
         rows = self._conn.execute(
-            "SELECT en_name, cn_name FROM char_dict WHERE cn_name='' OR cn_name IS NULL"
+            "SELECT display_name, cn_name FROM characters "
+            "WHERE cn_name != '' AND cn_name IS NOT NULL AND is_placeholder=0"
         ).fetchall()
-        return [(row["en_name"], row["cn_name"]) for row in rows]
+        if not rows:
+            return ""
+        lines = ["人名对照表（翻译时请使用以下中文名，保持一致性）："]
+        for r in rows:
+            lines.append(f"  {r['display_name']} → {r['cn_name']}")
+        return "\n".join(lines)
 
+    @_auto_reconnect
+    def get_variable_map(self) -> dict[str, str]:
+        """获取变量名 -> 显示名映射"""
+        rows = self._conn.execute(
+            "SELECT variable, display_name FROM characters WHERE variable != ''"
+        ).fetchall()
+        return {r["variable"]: r["display_name"] for r in rows}
+
+    @_auto_reconnect
+    def get_untranslated_characters(self) -> list[dict]:
+        """获取未翻译的角色"""
+        rows = self._conn.execute(
+            "SELECT * FROM characters WHERE (cn_name='' OR cn_name IS NULL) AND is_placeholder=0"
+        ).fetchall()
+        return [self._row_to_character_dict(r) for r in rows]
+
+    @_auto_reconnect
     def get_char_dict_count(self) -> dict:
-        """统计人名词典"""
+        """统计角色翻译"""
         row = self._conn.execute(
-            "SELECT COUNT(*) as total, SUM(CASE WHEN cn_name != '' AND cn_name IS NOT NULL THEN 1 ELSE 0 END) as translated FROM char_dict"
+            """SELECT COUNT(*) as total,
+               SUM(CASE WHEN cn_name != '' AND cn_name IS NOT NULL THEN 1 ELSE 0 END) as translated
+               FROM characters WHERE is_placeholder=0"""
         ).fetchone()
         total = row["total"] or 0
         translated = row["translated"] or 0
         return {"total": total, "translated": translated, "untranslated": total - translated}
 
-    # ========== 角色信息 ==========
-
-    def insert_characters(self, characters: list[dict]):
-        """批量插入角色信息"""
-        with self._transaction():
-            self._conn.executemany(
-                "INSERT OR IGNORE INTO characters (variable, name, chinese_name) VALUES (?, ?, ?)",
-                [(c.get("variable", ""), c.get("name", ""), c.get("chinese_name", ""))
-                 for c in characters]
-            )
-
-    def get_characters(self) -> list[dict]:
-        """获取所有角色信息"""
-        rows = self._conn.execute("SELECT * FROM characters ORDER BY name").fetchall()
-        return [{"variable": r["variable"], "name": r["name"],
-                 "chinese_name": r["chinese_name"]} for r in rows]
-
-    def get_variable_map(self) -> dict[str, str]:
-        """获取变量名 -> 显示名映射"""
-        rows = self._conn.execute("SELECT variable, name FROM characters").fetchall()
-        return {r["variable"]: r["name"] for r in rows}
-
-    # ========== 角色分析档案 ==========
-
-    def get_profile(self, name: str) -> Optional[dict]:
+    @_auto_reconnect
+    def get_profile(self, display_name: str) -> Optional[dict]:
         """获取角色分析档案"""
         row = self._conn.execute(
-            "SELECT profile_json FROM char_profiles WHERE name=?", (name,)
+            "SELECT profile_json FROM characters WHERE display_name=?",
+            (display_name,)
         ).fetchone()
-        return json.loads(row["profile_json"]) if row else None
+        if row and row["profile_json"]:
+            return json.loads(row["profile_json"])
+        return None
 
-    def save_profile(self, name: str, profile: dict):
+    @_auto_reconnect
+    def save_profile(self, display_name: str, profile: dict):
         """保存角色分析档案"""
+        self.update_character_profile(display_name, profile)
+
+    @_auto_reconnect
+    def get_all_profiles(self) -> dict[str, dict]:
+        """获取所有角色分析档案"""
+        rows = self._conn.execute(
+            "SELECT display_name, profile_json FROM characters WHERE profile_json != ''"
+        ).fetchall()
+        result = {}
+        for r in rows:
+            try:
+                result[r["display_name"]] = json.loads(r["profile_json"])
+            except json.JSONDecodeError:
+                pass
+        return result
+
+    @staticmethod
+    def _row_to_character_dict(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "variable": row["variable"],
+            "display_name": row["display_name"],
+            "cn_name": row["cn_name"],
+            "lines_count": row["lines_count"],
+            "profile_json": row["profile_json"],
+            "is_placeholder": bool(row["is_placeholder"]),
+            "created_at": row["created_at"],
+        }
+
+    # ========== 术语表 ==========
+
+    @_auto_reconnect
+    def get_glossary(self, term_type: str = None) -> dict[str, str]:
+        """获取术语表"""
+        if term_type:
+            rows = self._conn.execute(
+                "SELECT en_term, cn_term FROM glossary WHERE term_type=?",
+                (term_type,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT en_term, cn_term FROM glossary"
+            ).fetchall()
+        return {r["en_term"]: r["cn_term"] for r in rows}
+
+    @_auto_reconnect
+    def add_glossary_term(self, en: str, cn: str, term_type: str = 'other',
+                           source: str = 'manual'):
+        """添加术语"""
+        from datetime import datetime
         self._conn.execute(
-            "INSERT OR REPLACE INTO char_profiles (name, profile_json) VALUES (?, ?)",
-            (name, json.dumps(profile, ensure_ascii=False))
+            """INSERT OR REPLACE INTO glossary
+               (en_term, cn_term, term_type, source, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (en, cn, term_type, source, datetime.now().isoformat())
         )
         self._conn.commit()
 
-    def get_all_profiles(self) -> dict[str, dict]:
-        """获取所有角色分析档案"""
-        rows = self._conn.execute("SELECT name, profile_json FROM char_profiles").fetchall()
-        return {row["name"]: json.loads(row["profile_json"]) for row in rows}
+    @_auto_reconnect
+    def add_glossary_batch(self, terms: list[dict]):
+        """批量添加术语（去重，不覆盖已有）"""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        with self._transaction():
+            for t in terms:
+                en = t.get("en_term", "").strip()
+                cn = t.get("cn_term", "").strip()
+                if not en or not cn:
+                    continue
+                # 大小写不敏感去重
+                existing = self._conn.execute(
+                    "SELECT en_term, cn_term FROM glossary WHERE LOWER(en_term)=LOWER(?)",
+                    (en,)
+                ).fetchone()
+                if existing:
+                    continue
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO glossary
+                       (en_term, cn_term, term_type, source, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (en, cn, t.get("term_type", "other"),
+                     t.get("source", "auto"), now)
+                )
 
-    # ========== JSON 兼容（导入导出） ==========
+    # 常见游戏 UI 标准翻译（静态参考，不存入数据库）
+    UI_GLOSSARY = {
+        # 菜单
+        "Start Game": "开始游戏", "New Game": "新游戏", "Load Game": "读取游戏",
+        "Save Game": "保存游戏", "Main Menu": "主菜单", "Options": "选项",
+        "Settings": "设置", "Preferences": "偏好设置", "Quit": "退出",
+        "Exit": "退出", "About": "关于", "Help": "帮助",
+        # 存档
+        "Save": "保存", "Load": "读取", "Delete": "删除",
+        "Auto Save": "自动保存", "Quick Save": "快速保存", "Quick Load": "快速读取",
+        "Save Slot": "存档位", "Save Page": "存档页", "Load Page": "读取页",
+        "No saves found.": "未找到存档。", "Save your game?": "保存游戏？",
+        "Load your game?": "读取游戏？",
+        # 通用按钮
+        "OK": "确定", "Yes": "是", "No": "否", "Cancel": "取消",
+        "Back": "返回", "Next": "下一页", "Previous": "上一页",
+        "Close": "关闭", "Confirm": "确认", "Apply": "应用",
+        "Reset": "重置", "Default": "默认",
+        # 显示设置
+        "Display": "显示", "Window": "窗口", "Fullscreen": "全屏",
+        "Resolution": "分辨率", "Text Speed": "文字速度",
+        "Auto-Forward Time": "自动前进时间", "Skip": "跳过",
+        "Unseen Text": "未读文本", "After Choices": "选项后",
+        "Transitions": "转场效果",
+        # 音量
+        "Music Volume": "音乐音量", "Sound Volume": "音效音量",
+        "Voice Volume": "语音音量", "Mute All": "全部静音",
+        # 对话
+        "History": "历史", "Auto": "自动", "Quick": "快速",
+        "Click to continue": "点击继续", "Click to dismiss": "点击关闭",
+        # 辅助功能
+        "Self-voicing": "自动朗读", "Self-voicing disabled": "自动朗读已禁用",
+        "Self-voicing enabled": "自动朗读已启用",
+        # 其他
+        "Are you sure?": "确定吗？", "Loading...": "加载中...",
+        "Please wait": "请稍候", "Error": "错误", "Warning": "警告",
+        "Language": "语言", "Rollback Side": "回滚方向",
+        "Disable": "禁用", "Enable": "启用",
+        "Left": "左", "Right": "右",
+    }
 
+    @_auto_reconnect
+    def get_glossary_for_prompt(self) -> str:
+        """获取术语表文本（用于提示词，供 AI 参考）"""
+        # 数据库中的术语（用户手动添加/自动提取）
+        db_rows = self._conn.execute(
+            "SELECT en_term, cn_term, term_type FROM glossary WHERE cn_term != '' AND cn_term IS NOT NULL"
+        ).fetchall()
+
+        lines = ["已有术语表（以下术语已有翻译，请直接使用，不要重复提取）："]
+
+        # 静态 UI 术语
+        lines.append("")
+        lines.append("【UI/菜单文字】")
+        for en, cn in self.UI_GLOSSARY.items():
+            lines.append(f"  {en} → {cn}")
+
+        # 数据库中的游戏术语
+        game_terms = [r for r in db_rows if r["term_type"] != "ui"]
+        if game_terms:
+            lines.append("")
+            lines.append("【游戏术语】")
+            for r in game_terms:
+                lines.append(f"  {r['en_term']} → {r['cn_term']}")
+
+        return "\n".join(lines)
+
+    # ========== JSON 导出（兼容） ==========
+
+    @_auto_reconnect
     def to_json_dict(self) -> dict:
-        """导出为 JSON 字典（兼容旧格式）"""
+        """导出为 JSON 字典"""
         meta = self.get_all_meta()
         dialogues = self._conn.execute("SELECT * FROM dialogues ORDER BY id").fetchall()
         ui_texts = self._conn.execute("SELECT * FROM ui_texts ORDER BY id").fetchall()
-        char_dict = self.get_char_dict()
         characters = self.get_characters()
-        profiles = self.get_all_profiles()
+        glossary_rows = self._conn.execute("SELECT * FROM glossary").fetchall()
 
-        # 将 profiles 合并到 char_dict 中（兼容旧格式）
-        char_dict_with_extras = dict(char_dict)
-        char_dict_with_extras["__profiles__"] = profiles
-        char_dict_with_extras["__variable_map__"] = self.get_variable_map()
+        char_dict = {}
+        for c in characters:
+            if c["cn_name"]:
+                char_dict[c["display_name"]] = c["cn_name"]
 
         return {
             "name": meta.get("name", ""),
@@ -506,44 +780,13 @@ class ProjectDatabase:
             "dialogues": [self._row_to_dialogue_dict(r) for r in dialogues],
             "ui_texts": [self._row_to_ui_dict(r) for r in ui_texts],
             "characters": characters,
-            "char_dict": char_dict_with_extras,
+            "char_dict": char_dict,
+            "glossary": [
+                {"en_term": r["en_term"], "cn_term": r["cn_term"],
+                 "term_type": r["term_type"], "source": r["source"]}
+                for r in glossary_rows
+            ],
             "last_position": json.loads(meta.get("last_position", "{}")),
             "created_at": meta.get("created_at", ""),
             "updated_at": meta.get("updated_at", ""),
         }
-
-    @classmethod
-    def from_json_dict(cls, db_path: str, data: dict) -> "ProjectDatabase":
-        """从 JSON 字典导入到 SQLite"""
-        db = cls(db_path)
-        db.connect()
-
-        # 元数据
-        from datetime import datetime
-        db.set_meta("name", data.get("name", ""))
-        db.set_meta("game_dir", data.get("game_dir", ""))
-        db.set_meta("model_config_name", data.get("model_config_name", ""))
-        db.set_meta("created_at", data.get("created_at", datetime.now().isoformat()))
-        db.set_meta("updated_at", data.get("updated_at", datetime.now().isoformat()))
-        db.set_meta("last_position", json.dumps(data.get("last_position", {}), ensure_ascii=False))
-
-        # 对话
-        db.insert_dialogues(data.get("dialogues", []))
-
-        # UI 字符串
-        db.insert_ui_texts(data.get("ui_texts", []))
-
-        # 角色信息
-        db.insert_characters(data.get("characters", []))
-
-        # 人名词典
-        char_dict = data.get("char_dict", {})
-        name_dict = {k: v for k, v in char_dict.items() if not k.startswith("__")}
-        db.update_char_dict_batch(name_dict)
-
-        # 角色分析档案
-        profiles = char_dict.get("__profiles__", {})
-        for name, profile in profiles.items():
-            db.save_profile(name, profile)
-
-        return db

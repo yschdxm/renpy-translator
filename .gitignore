@@ -1,16 +1,40 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+*.egg
 
 # Virtual environments
-.venv
+.venv/
+venv/
 
-config/
+# NiceGUI
+.nicegui/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 项目数据（用户数据，不提交）
 projects/
-renpy-*-sdk/
-fonts/
 exports/
+config/
+fonts/
+
+# Ren'Py SDK
+renpy-*-sdk/
+
+# 日志
+*.log
+
+# 锁文件
+uv.lock

@@ -1,6 +1,6 @@
 """AI翻译器 - 使用OpenAI兼容接口进行翻译"""
 
-import json
+import re
 from typing import List, Optional, Dict, Any
 from openai import OpenAI
 from dataclasses import dataclass
@@ -14,7 +14,7 @@ class TranslationConfig:
     model: str = "gpt-3.5-turbo"
     temperature: float = 0.3
     max_tokens: int = 1000
-    context_lines: int = 3  # 上下文行数
+    context_lines: int = 3
     timeout: int = 30
 
 
@@ -24,10 +24,11 @@ class AITranslator:
     def __init__(self, config: TranslationConfig):
         self.config = config
         self.client: Optional[OpenAI] = None
+        self.prompt_callback: Optional[Callable[[str, str, str], None]] = None
+        # prompt_callback(system_prompt, user_prompt, task_type)
         self._init_client()
 
     def _init_client(self):
-        """初始化OpenAI客户端"""
         if self.config.api_key:
             self.client = OpenAI(
                 api_key=self.config.api_key,
@@ -35,17 +36,17 @@ class AITranslator:
             )
 
     def update_config(self, config: TranslationConfig):
-        """更新配置"""
         self.config = config
         self._init_client()
 
-    def _build_system_prompt(self, character_dict: Dict[str, str] = None, character: str = "") -> str:
+    def _build_system_prompt(self, character: str = "",
+                              glossary_text: str = "",
+                              character_profile: str = "") -> str:
         """构建系统提示词"""
         prompt = """你是一位资深的游戏本地化翻译家。请将以下文本翻译成简体中文。
 
 核心规则：
 - 只翻译【请翻译以下文本】中的内容，【前文参考】和【后文参考】不翻译
-- 只返回翻译结果，不要添加解释、标注或原文
 - 如果原文只有标点符号或空白，直接原样返回，不要翻译
 
 代码标记规则（以下内容直接保留原样，不翻译、不删除、不修改）：
@@ -61,116 +62,191 @@ class AITranslator:
 - 俚语、咒骂、感叹等按中文习惯本土化，保留原始情感强度
 - 避免翻译腔，善用中文成语、俗语、语气词
 
-人名处理：
-- 使用用户提供的翻译词典中的人名
-- 词典中没有的人名保留原文"""
+术语提取规则：
+- 只提取游戏内出现的专有名词：地名、物品名、技能名、组织名、种族名、特殊称呼等
+- 不要提取：通用词汇、UI文字、技术术语、许可证名称、框架名称、软件名称
+- 如果术语表中已有该词的翻译，不要重复添加
+- 如果没有新的游戏专有名词，不输出术语部分"""
 
-        # 添加人名词典和角色特征
-        if character_dict:
-            # 获取变量名映射
-            variable_map = character_dict.get('__variable_map__', {})
+        # 术语表
+        if glossary_text:
+            prompt += f"\n\n{glossary_text}"
 
-            # 人名词典（只包含有翻译的人名）
-            dict_text = "\n\n人名翻译词典（翻译时必须使用这些中文名）：\n"
-            has_names = False
-            for en_name, cn_name in character_dict.items():
-                # 跳过所有特殊键
-                if en_name.startswith('__'):
-                    continue
-                # 只显示有翻译的人名（确保是字符串且非空）
-                if not isinstance(cn_name, str) or not cn_name.strip():
-                    continue
-                # 跳过占位符（如 [mc_name] 但不是 [Mika]）
-                if en_name.startswith('[') and en_name.endswith(']') and '_name' in en_name:
-                    continue
-                dict_text += f"- {en_name} → {cn_name}\n"
-                has_names = True
-            if has_names:
-                prompt += dict_text
-
-            # 当前角色的特征
-            profiles = character_dict.get('__profiles__', {})
-            variable_map = character_dict.get('__variable_map__', {})
-
-            if character and profiles:
-                # 尝试多种方式查找角色特征
-                profile = None
-                matched_key = None
-
-                # 1. 直接匹配
-                if character in profiles:
-                    profile = profiles[character]
-                    matched_key = character
-                # 2. 尝试匹配 [character_name] 格式
-                elif f'[{character}_name]' in profiles:
-                    profile = profiles[f'[{character}_name]']
-                    matched_key = f'[{character}_name]'
-                # 3. 通过变量名映射查找显示名
-                elif character in variable_map:
-                    display_name = variable_map[character]
-                    if display_name in profiles:
-                        profile = profiles[display_name]
-                        matched_key = display_name
-                # 4. 遍历查找包含character的键
-                else:
-                    for key in profiles:
-                        if character.lower() in key.lower() or key.lower() in character.lower():
-                            profile = profiles[key]
-                            matched_key = key
-                            break
-
-                if profile:
-                    prompt += f"\n\n当前说话角色 [{matched_key}] 的人物特征：\n"
-                    for key, value in profile.items():
-                        if value:
-                            prompt += f"- {key}：{value}\n"
-                    prompt += "\n请根据该角色的特点进行翻译，保持其说话风格和性格特征。"
+        # 角色特征
+        if character_profile:
+            prompt += f"\n\n{character_profile}"
 
         return prompt
 
     def _build_user_prompt(self, text: str, character: str = "",
-                          context_before: List[str] = None,
-                          context_after: List[str] = None) -> str:
-        """构建用户提示词"""
+                           context_before: List[dict] = None,
+                           context_after: List[dict] = None) -> str:
+        """构建用户提示词
+
+        context_before/after 格式：
+        [{'original_text': '...', 'translated_text': '...', 'character': '...'}]
+        """
         prompt = ""
 
-        # 添加前文上下文（仅供理解上下文，不需要翻译）
+        # 前文参考（已翻译 + 未翻译）
         if context_before:
-            prompt += "【前文参考 - 用于理解场景和角色情感】\n"
-            for line in context_before[-self.config.context_lines:]:
-                prompt += f"{line}\n"
+            prompt += "【前文参考 - 用于理解剧情和翻译风格】\n"
+            for item in context_before:
+                char = item.get('character', '') or '旁白'
+                orig = item.get('original_text', '')
+                trans = item.get('translated_text', '')
+                if trans:
+                    prompt += f"[已译] {char}: \"{orig}\" → \"{trans}\"\n"
+                else:
+                    prompt += f"{char}: \"{orig}\"\n"
             prompt += "\n"
 
-        # 添加需要翻译的文本
+        # 待翻译文本
         prompt += f"【请翻译以下文本】\n{text}"
 
-        # 添加角色信息和翻译指引
+        # 角色信息
         if character:
             prompt += f"\n\n【角色信息】\n说话角色：{character}"
             prompt += "\n请根据该角色的身份和性格，使用符合其特点的语言风格翻译。"
 
-        # 添加后文上下文（仅供理解上下文，不需要翻译）
+        # 后文参考
         if context_after:
             prompt += "\n\n【后文参考 - 用于理解剧情走向】\n"
-            for line in context_after[:self.config.context_lines]:
-                prompt += f"{line}\n"
+            for item in context_after:
+                char = item.get('character', '') or '旁白'
+                orig = item.get('original_text', '')
+                trans = item.get('translated_text', '')
+                if trans:
+                    prompt += f"[已译] {char}: \"{orig}\" → \"{trans}\"\n"
+                else:
+                    prompt += f"{char}: \"{orig}\"\n"
 
-        prompt += "\n\n请翻译【请翻译以下文本】中的内容，追求信达雅的翻译质量："
+        prompt += """
+
+【输出格式】
+第一行：翻译结果（只输出译文，不要加任何前缀）
+如果原文中有新的游戏专有名词（地名、物品名、技能名等，且术语表中没有），在译文后空一行输出：
+【术语】
+原文1 → 译文1
+原文2 → 译文2
+如果术语表中已有，或没有新的游戏专有名词，不输出【术语】部分。"""
+
         return prompt
 
-    def translate_name(self, name: str, debug: bool = False) -> str:
-        """翻译人名（简洁提示词）"""
+    def translate_text(self, text: str, character: str = "",
+                       context_before: List[dict] = None,
+                       context_after: List[dict] = None,
+                       glossary_text: str = "",
+                       character_profile: str = "",
+                       debug: bool = False) -> tuple[str, list[dict]]:
+        """翻译单行文本，返回 (译文, 术语列表)
+
+        术语列表格式: [{'en_term': '...', 'cn_term': '...'}]
+        """
+        if not self.client:
+            raise ValueError("请先配置API Key")
+
+        if not text.strip():
+            return "", []
+
+        # 标点符号或空白直接返回
+        if not any(c.isalnum() for c in text):
+            return text, []
+
+        system_prompt = self._build_system_prompt(
+            character=character,
+            glossary_text=glossary_text,
+            character_profile=character_profile
+        )
+        user_prompt = self._build_user_prompt(
+            text, character, context_before, context_after
+        )
+
+        if self.prompt_callback:
+            self.prompt_callback(system_prompt, user_prompt, 'dialogue')
+
+        if debug:
+            print(f'\n{"="*50}')
+            print(f'[翻译] 角色: {character or "旁白"}')
+            print(f'[翻译] 原文: {text}')
+            print(f'[翻译] 系统提示词:\n{system_prompt[:500]}...')
+            print(f'[翻译] 用户提示词:\n{user_prompt}')
+            print(f'{"="*50}\n')
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                timeout=self.config.timeout
+            )
+
+            raw = response.choices[0].message.content.strip()
+            translated, terms = self._parse_translation_response(raw)
+
+            if debug:
+                print(f'[翻译] 翻译结果: {translated}')
+                if terms:
+                    print(f'[翻译] 术语: {terms}')
+
+            return translated, terms
+
+        except Exception as e:
+            raise Exception(f"翻译失败: {str(e)}")
+
+    @staticmethod
+    def _parse_translation_response(raw: str) -> tuple[str, list[dict]]:
+        """解析 AI 翻译响应，分离译文和术语
+
+        AI 返回格式：
+        翻译结果
+
+        【术语】
+        原文1 → 译文1
+        原文2 → 译文2
+        """
+        terms = []
+
+        # 检查是否有术语部分
+        if '【术语】' in raw:
+            parts = raw.split('【术语】', 1)
+            translated = parts[0].strip()
+            terms_text = parts[1].strip()
+
+            for line in terms_text.split('\n'):
+                line = line.strip()
+                if not line or '→' not in line:
+                    continue
+                term_parts = line.split('→', 1)
+                if len(term_parts) == 2:
+                    en = term_parts[0].strip()
+                    cn = term_parts[1].strip()
+                    if en and cn:
+                        terms.append({'en_term': en, 'cn_term': cn})
+        else:
+            translated = raw
+
+        return translated, terms
+
+    def translate_name(self, name: str, glossary_text: str = "",
+                       debug: bool = False) -> str:
+        """翻译人名"""
         if not self.client:
             raise ValueError("请先配置API Key")
 
         if not name.strip():
             return ""
 
-        # 检查是否是占位符（如 [mc_name]）
         if name.startswith('[') and name.endswith(']'):
-            if debug:
-                print(f'\n[人名翻译] 占位符，直接返回: {name}')
-            return name  # 占位符直接返回，不翻译
+            return name
+
+        # 标点符号直接返回
+        if not any(c.isalnum() for c in name):
+            return name
 
         system_prompt = """你是一位游戏翻译专家。请将以下人名翻译成中文，只返回中文名。
 
@@ -181,14 +257,17 @@ class AITranslator:
 - $ 开头是代码变量，直接返回原文
 - 只翻译真正的人名"""
 
+        if glossary_text:
+            system_prompt += f"\n\n{glossary_text}"
+
         user_prompt = f"请将以下人名翻译成中文，只返回中文名：\n{name}"
 
-        # 打印提示词到日志
+        if self.prompt_callback:
+            self.prompt_callback(system_prompt, user_prompt, 'name')
+
         if debug:
             print(f'\n{"="*50}')
             print(f'[人名翻译] 原文: {name}')
-            print(f'[人名翻译] 系统提示词:\n{system_prompt}')
-            print(f'[人名翻译] 用户提示词:\n{user_prompt}')
             print(f'{"="*50}\n')
 
         try:
@@ -203,14 +282,9 @@ class AITranslator:
                 timeout=self.config.timeout
             )
 
-            if debug:
-                print(f'[人名翻译] 响应: {response}')
-
             result = response.choices[0].message.content
             if result:
-                result = result.strip()
-                # 清理结果，只保留名字
-                result = result.replace('"', '').replace("'", '').replace('。', '')
+                result = result.strip().replace('"', '').replace("'", '').replace('。', '')
             else:
                 result = ''
 
@@ -220,22 +294,25 @@ class AITranslator:
             return result
 
         except Exception as e:
-            if debug:
-                print(f'[人名翻译] 异常: {e}')
             raise Exception(f"人名翻译失败: {str(e)}")
 
-    def translate_ui(self, text: str, character_dict: Dict[str, str] = None, debug: bool = False) -> str:
-        """翻译UI文字（简洁提示词）"""
+    def translate_ui(self, text: str, glossary_text: str = "",
+                     character_dict: Dict[str, str] = None,
+                     debug: bool = False) -> tuple[str, list[dict]]:
+        """翻译UI文字，返回 (译文, 术语列表)"""
         if not self.client:
             raise ValueError("请先配置API Key")
 
         if not text.strip():
             return ""
 
+        # 标点符号直接返回
+        if not any(c.isalnum() for c in text):
+            return text
+
         system_prompt = """你是一位游戏本地化翻译家。请将以下文本翻译成简体中文。
 
 核心规则：
-- 只返回翻译结果，不要添加解释或标注
 - 如果原文只有标点符号或空白，直接原样返回
 - 按钮和菜单文字要简洁，符合中文游戏用语习惯
 
@@ -248,40 +325,28 @@ class AITranslator:
 翻译风格：
 - 简洁明了，符合中文表达习惯
 - 专业术语保持一致
-- 适当本地化，保留原意"""
+- 适当本地化，保留原意
 
-        # 添加人名词典
-        if character_dict:
-            # 获取变量名映射
-            variable_map = character_dict.get('__variable_map__', {})
+术语提取规则：
+- 只提取游戏内出现的专有名词：地名、物品名、技能名、组织名、种族名、特殊称呼等
+- 不要提取：通用词汇、UI文字、技术术语
+- 如果术语表中已有该词的翻译，不要重复添加
+- 如果没有新的游戏专有名词，不输出术语部分"""
 
-            # 人名词典（只包含有翻译的人名）
-            dict_text = "\n\n人名翻译词典（翻译时必须使用这些中文名）：\n"
-            has_names = False
-            for en_name, cn_name in character_dict.items():
-                # 跳过所有特殊键
-                if en_name.startswith('__'):
-                    continue
-                # 只显示有翻译的人名（确保是字符串且非空）
-                if not isinstance(cn_name, str) or not cn_name.strip():
-                    continue
-                # 跳过占位符（如 [mc_name] 但不是 [Mika]）
-                if en_name.startswith('[') and en_name.endswith(']') and '_name' in en_name:
-                    continue
-                dict_text += f"- {en_name} → {cn_name}\n"
-                has_names = True
-            if has_names:
-                system_prompt += dict_text
+        if glossary_text:
+            system_prompt += f"\n\n{glossary_text}"
 
-        user_prompt = f"请翻译：\n{text}"
+        user_prompt = f"""请翻译：\n{text}
 
-        # 打印提示词到日志
-        if debug:
-            print(f'\n{"="*50}')
-            print(f'[UI翻译] 原文: {text}')
-            print(f'[UI翻译] 系统提示词:\n{system_prompt}')
-            print(f'[UI翻译] 用户提示词:\n{user_prompt}')
-            print(f'{"="*50}\n')
+【输出格式】
+第一行：翻译结果（只输出译文）
+如果原文中有专有名词，空一行输出：
+【术语】
+原文1 → 译文1
+没有专有名词则不输出【术语】部分。"""
+
+        if self.prompt_callback:
+            self.prompt_callback(system_prompt, user_prompt, 'ui')
 
         try:
             response = self.client.chat.completions.create(
@@ -295,12 +360,9 @@ class AITranslator:
                 timeout=self.config.timeout
             )
 
-            result = response.choices[0].message.content.strip()
-
-            if debug:
-                print(f'[UI翻译] 翻译结果: {result}')
-
-            return result
+            raw = response.choices[0].message.content.strip()
+            translated, terms = self._parse_translation_response(raw)
+            return translated, terms
 
         except Exception as e:
             raise Exception(f"UI翻译失败: {str(e)}")
@@ -313,14 +375,10 @@ class AITranslator:
         if not prompt.strip():
             return ""
 
-        # 分析任务使用简单的系统提示词
         system_prompt = "你是一个专业的文本分析师。请按照用户的要求进行分析，直接输出分析结果，不要添加额外的解释。"
 
-        # 打印提示词到日志
-        print(f'\n{"="*50}')
-        print(f'[分析] 系统提示词:\n{system_prompt}')
-        print(f'\n[分析] 用户提示词:\n{prompt[:500]}...' if len(prompt) > 500 else f'\n[分析] 用户提示词:\n{prompt}')
-        print(f'{"="*50}\n')
+        if self.prompt_callback:
+            self.prompt_callback(system_prompt, prompt, 'analysis')
 
         try:
             response = self.client.chat.completions.create(
@@ -334,131 +392,20 @@ class AITranslator:
                 timeout=self.config.timeout
             )
 
-            result = response.choices[0].message.content.strip()
-            print(f'[分析] 返回结果:\n{result[:500]}...' if len(result) > 500 else f'[分析] 返回结果:\n{result}')
-            return result
+            return response.choices[0].message.content.strip()
 
         except Exception as e:
             raise Exception(f"分析失败: {str(e)}")
 
-    def translate_text(self, text: str, character: str = "",
-                      context_before: List[str] = None,
-                      context_after: List[str] = None,
-                      character_dict: Dict[str, str] = None,
-                      debug: bool = False) -> str:
-        """翻译单行文本"""
-        if not self.client:
-            raise ValueError("请先配置API Key")
-
-        if not text.strip():
-            return ""
-
-        system_prompt = self._build_system_prompt(character_dict, character)
-        user_prompt = self._build_user_prompt(
-            text, character, context_before, context_after
-        )
-
-        # 打印提示词到日志（便于调试）
-        if debug:
-            print(f'\n{"="*50}')
-            print(f'[翻译] 角色: {character or "旁白"}')
-            print(f'[翻译] 原文: {text}')
-
-            # 显示人名词典部分
-            dict_start = system_prompt.find('人名翻译词典')
-            if dict_start >= 0:
-                dict_end = system_prompt.find('\n\n', dict_start + 1)
-                if dict_end < 0:
-                    dict_end = len(system_prompt)
-                print(f'\n[翻译] 人名词典:\n{system_prompt[dict_start:dict_end]}')
-
-            # 检查是否有人物特征
-            if '人物特征' in system_prompt:
-                # 提取人物特征部分
-                profile_start = system_prompt.find('当前说话角色')
-                if profile_start >= 0:
-                    print(f'\n[翻译] 人物特征:\n{system_prompt[profile_start:]}')
-
-            print(f'\n[翻译] 用户提示词:\n{user_prompt}')
-            print(f'{"="*50}\n')
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                timeout=self.config.timeout
-            )
-
-            translated = response.choices[0].message.content.strip()
-
-            if debug:
-                print(f'[翻译] 翻译结果: {translated}')
-
-            return translated
-
-        except Exception as e:
-            raise Exception(f"翻译失败: {str(e)}")
-
-    def translate_batch(self, texts: List[Dict[str, Any]],
-                       character_dict: Dict[str, str] = None,
-                       progress_callback=None) -> List[Dict[str, Any]]:
-        """批量翻译文本"""
-        results = []
-        total = len(texts)
-
-        for i, item in enumerate(texts):
-            try:
-                translated = self.translate_text(
-                    text=item['original_text'],
-                    character=item.get('character', ''),
-                    context_before=item.get('context_before'),
-                    context_after=item.get('context_after'),
-                    character_dict=character_dict
-                )
-
-                result = {
-                    **item,
-                    'translated_text': translated,
-                    'is_translated': True,
-                    'error': None
-                }
-                results.append(result)
-
-            except Exception as e:
-                result = {
-                    **item,
-                    'translated_text': '',
-                    'is_translated': False,
-                    'error': str(e)
-                }
-                results.append(result)
-
-            # 回调进度
-            if progress_callback:
-                progress_callback(i + 1, total)
-
-        return results
-
     def test_connection(self) -> Dict[str, Any]:
         """测试API连接"""
         if not self.client:
-            return {
-                'success': False,
-                'error': '请先配置API Key'
-            }
+            return {'success': False, 'error': '请先配置API Key'}
 
         try:
-            # 发送一个简单的测试请求
             response = self.client.chat.completions.create(
                 model=self.config.model,
-                messages=[
-                    {"role": "user", "content": "Hello, this is a test."}
-                ],
+                messages=[{"role": "user", "content": "Hello, this is a test."}],
                 max_tokens=10
             )
 
@@ -469,62 +416,5 @@ class AITranslator:
             }
 
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
+            return {'success': False, 'error': str(e)}
 
-
-class CharacterDictionary:
-    """人名词典管理"""
-
-    def __init__(self, dict_file: str = "character_dict.json"):
-        self.dict_file = dict_file
-        self.dictionary: Dict[str, str] = {}
-        self.load()
-
-    def load(self):
-        """加载词典"""
-        try:
-            with open(self.dict_file, 'r', encoding='utf-8') as f:
-                self.dictionary = json.load(f)
-        except FileNotFoundError:
-            self.dictionary = {}
-
-    def save(self):
-        """保存词典"""
-        with open(self.dict_file, 'w', encoding='utf-8') as f:
-            json.dump(self.dictionary, f, ensure_ascii=False, indent=2)
-
-    def add(self, english_name: str, chinese_name: str):
-        """添加人名翻译"""
-        self.dictionary[english_name] = chinese_name
-        self.save()
-
-    def remove(self, english_name: str):
-        """删除人名翻译"""
-        if english_name in self.dictionary:
-            del self.dictionary[english_name]
-            self.save()
-
-    def update_from_characters(self, characters: List[Any]):
-        """从角色列表更新词典"""
-        for char in characters:
-            if char.name not in self.dictionary:
-                # 默认使用原名
-                self.dictionary[char.name] = char.name
-        self.save()
-
-    def get_dict(self) -> Dict[str, str]:
-        """获取词典"""
-        return self.dictionary.copy()
-
-    def get_formatted(self) -> str:
-        """获取格式化的词典文本"""
-        if not self.dictionary:
-            return "暂无人名词典"
-
-        lines = ["人名词典："]
-        for en, cn in sorted(self.dictionary.items()):
-            lines.append(f"  {en} → {cn}")
-        return "\n".join(lines)

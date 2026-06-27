@@ -4,6 +4,13 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from nicegui import ui
 
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except (RuntimeError, AttributeError):
+        return None
+
 from database import ProjectDatabase
 from translator import AITranslator
 from logger import TranslationLogger
@@ -124,15 +131,15 @@ class AnalysisPanel:
             })
 
         self.analysis_table.rows = rows
-        self.analysis_table.update()
+        _safe(self.analysis_table.update)
         analyzed = sum(1 for r in rows if r['status'] == '已完成')
-        self.stats_label.text = f'📊 共 {len(rows)} 个角色，已分析 {analyzed} 个'
+        _safe(setattr, self.stats_label, 'text', f'📊 共 {len(rows)} 个角色，已分析 {analyzed} 个')
 
     async def _on_analyze(self, e):
         """分析单个角色"""
         row = e.args
         if not row or not self.translator:
-            ui.notify('请先配置翻译器', type='warning')
+            _safe(ui.notify, '请先配置翻译器', type='warning')
             return
         await self._do_analyze(row['name'])
 
@@ -146,7 +153,7 @@ class AnalysisPanel:
         profile = await loop.run_in_executor(None, self.db.get_profile, row['name'])
 
         if not profile:
-            ui.notify('该角色尚未分析', type='warning')
+            _safe(ui.notify, '该角色尚未分析', type='warning')
             return
 
         with ui.dialog() as dialog, ui.card().classes('w-full max-w-2xl'):
@@ -163,7 +170,7 @@ class AnalysisPanel:
     async def _analyze_all(self):
         """分析所有角色"""
         if not self.translator:
-            ui.notify('请先配置翻译器', type='warning')
+            _safe(ui.notify, '请先配置翻译器', type='warning')
             return
 
         loop = asyncio.get_event_loop()
@@ -173,8 +180,8 @@ class AnalysisPanel:
 
         characters, profiles = await loop.run_in_executor(None, _load)
 
-        self.analyze_all_btn.disable()
-        self.analyze_all_btn.text = '分析中...'
+        _safe(self.analyze_all_btn.disable)
+        _safe(setattr, self.analyze_all_btn, 'text', '分析中...')
 
         success = 0
         for i, char in enumerate(characters):
@@ -188,8 +195,8 @@ class AnalysisPanel:
                 success += 1
             await self.async_refresh()
 
-        self.analyze_all_btn.enable()
-        self.analyze_all_btn.text = '🤖 分析所有角色'
+        _safe(self.analyze_all_btn.enable)
+        _safe(setattr, self.analyze_all_btn, 'text', '🤖 分析所有角色')
         self.logger.info(f'分析完成！成功: {success}/{len(characters)}', panel='analysis')
 
     async def _do_analyze(self, name: str) -> bool:
