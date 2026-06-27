@@ -3,6 +3,13 @@
 from pathlib import Path
 from nicegui import ui
 
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except (RuntimeError, AttributeError):
+        return None
+
 from config_manager import ConfigManager, ModelConfig
 from translator import AITranslator, TranslationConfig
 from sdk_manager import SDKManager
@@ -113,7 +120,7 @@ class ConfigPanel:
         """保存配置"""
         name = self.name_input.value
         if not name:
-            ui.notify('请输入配置名称', type='warning')
+            _safe(ui.notify,'请输入配置名称', type='warning')
             return
 
         config = ModelConfig(
@@ -130,10 +137,10 @@ class ConfigPanel:
         existing = self.config_manager.get_config_by_name(name)
         if existing:
             self.config_manager.update_config(name, config)
-            ui.notify(f'配置已更新: {name}', type='positive')
+            _safe(ui.notify,f'配置已更新: {name}', type='positive')
         else:
             self.config_manager.add_config(config)
-            ui.notify(f'配置已保存: {name}', type='positive')
+            _safe(ui.notify,f'配置已保存: {name}', type='positive')
 
         self.refresh()
 
@@ -141,7 +148,7 @@ class ConfigPanel:
         """编辑配置"""
         config = self.config_manager.get_config_by_name(name)
         if not config:
-            ui.notify('配置不存在', type='negative')
+            _safe(ui.notify,'配置不存在', type='negative')
             return
 
         self.name_input.value = config.name
@@ -153,7 +160,7 @@ class ConfigPanel:
         self.context_lines.value = config.context_lines
         self.max_context.value = getattr(config, 'max_context', 8)
 
-        ui.notify(f'已加载配置: {name}', type='info')
+        _safe(ui.notify,f'已加载配置: {name}', type='info')
 
     def _delete_config(self, name: str):
         """删除配置"""
@@ -165,7 +172,7 @@ class ConfigPanel:
                     ui.button('删除', color='red', on_click=lambda: (
                         self.config_manager.delete_config(name),
                         self.refresh(),
-                        ui.notify(f'已删除配置: {name}', type='positive'),
+                        _safe(ui.notify,f'已删除配置: {name}', type='positive'),
                         dialog.close()
                     ))
         dialog.props('persistent')

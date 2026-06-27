@@ -251,13 +251,13 @@ class ProjectPanel:
 
                 # 基础校验
                 if not name:
-                    ui.notify('请填写项目名称', type='warning')
+                    _safe(ui.notify,'请填写项目名称', type='warning')
                     return
                 if input_method.value == '上传zip' and not zip_data.get('zip_path'):
-                    ui.notify('请先上传zip文件', type='warning')
+                    _safe(ui.notify,'请先上传zip文件', type='warning')
                     return
                 if input_method.value == '路径输入' and not game_dir:
-                    ui.notify('请填写游戏目录', type='warning')
+                    _safe(ui.notify,'请填写游戏目录', type='warning')
                     return
 
                 # 立即关闭对话框，显示进度条
@@ -380,7 +380,7 @@ class ProjectPanel:
                         self.logger.error(f'关闭进度对话框失败: {close_err}')
 
                     try:
-                        ui.notify(f'创建失败: {str(e)}', type='negative')
+                        _safe(ui.notify,f'创建失败: {str(e)}', type='negative')
                     except Exception as notify_err:
                         self.logger.error(f'发送通知失败: {notify_err}')
 
@@ -567,7 +567,7 @@ class ProjectPanel:
         await asyncio.sleep(0.5)
         progress_dialog.close()
 
-        ui.notify(f'项目 "{name}" 创建成功！', type='positive')
+        _safe(ui.notify,f'项目 "{name}" 创建成功！', type='positive')
         await self.async_refresh_projects()
 
         if self.on_project_open:
@@ -789,10 +789,10 @@ class ProjectPanel:
             await asyncio.sleep(0.5)
 
             if result['success']:
-                ui.notify(result['message'], type='positive')
+                _safe(ui.notify, result['message'], type='positive')
                 await self.async_refresh_projects()
             else:
-                ui.notify(result['message'], type='negative')
+                _safe(ui.notify, result['message'], type='negative')
 
             # 清理临时文件（在线程池中）
             try:
@@ -805,7 +805,7 @@ class ProjectPanel:
 
         except Exception as e:
             self.logger.error(f'导入项目失败: {e}')
-            ui.notify(f'导入失败: {str(e)}', type='negative')
+            _safe(ui.notify, f'导入失败: {str(e)}', type='negative')
         finally:
             await asyncio.sleep(0)
             try:
@@ -840,7 +840,7 @@ class ProjectPanel:
     async def _save_edit(self, old_name, new_name, model, dialog):
         """保存编辑（所有阻塞操作在线程池中）"""
         if not new_name:
-            ui.notify('项目名称不能为空', type='warning')
+            _safe(ui.notify,'项目名称不能为空', type='warning')
             return
 
         loop = asyncio.get_event_loop()
@@ -848,7 +848,7 @@ class ProjectPanel:
         if old_name != new_name:
             exists = await loop.run_in_executor(None, self.project_manager.project_exists, new_name)
             if exists:
-                ui.notify('项目名称已存在', type='negative')
+                _safe(ui.notify,'项目名称已存在', type='negative')
                 return
 
             def _rename():
@@ -868,7 +868,7 @@ class ProjectPanel:
 
         await loop.run_in_executor(None, _update_meta)
 
-        ui.notify('项目已更新', type='positive')
+        _safe(ui.notify,'项目已更新', type='positive')
         dialog.close()
         await self.async_refresh_projects()
 
@@ -938,7 +938,7 @@ class ProjectPanel:
         await asyncio.sleep(0.5)
         progress_dialog.close()
 
-        ui.notify(f'项目 "{name}" 已删除', type='positive')
+        _safe(ui.notify,f'项目 "{name}" 已删除', type='positive')
         await self.async_refresh_projects()
 
     # ========== 导出项目 ==========
@@ -1003,7 +1003,7 @@ class ProjectPanel:
             except Exception as ui_err:
                 self.logger.warning(f'更新导出进度UI失败: {ui_err}')
             try:
-                ui.notify(f'导出失败: {str(e)}', type='negative')
+                _safe(ui.notify,f'导出失败: {str(e)}', type='negative')
             except Exception as notify_err:
                 self.logger.warning(f'发送导出失败通知失败: {notify_err}')
             await asyncio.sleep(2)
