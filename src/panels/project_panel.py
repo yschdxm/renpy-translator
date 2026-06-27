@@ -8,6 +8,13 @@ import asyncio
 import os
 import zipfile
 import shutil
+
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except (RuntimeError, AttributeError):
+        return None
 import json
 import tempfile
 from pathlib import Path
@@ -69,11 +76,33 @@ class ProjectPanel:
     async def _run_open_project(self, name: str):
         await self._open_project(name)
 
-    async def _run_export_project(self, name: str):
-        await self._export_project(name)
+    def _run_export_project(self, name: str):
+        """导出项目（创建 UI 后调用 async 方法）"""
+        # 在 slot 上下文中创建进度对话框
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('📦 导出项目').classes('text-h6')
+            progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+            progress_label = ui.label('准备中...').classes('text-caption')
+        dialog.props('persistent')
+        dialog.open()
+        asyncio.create_task(self._export_project(name, dialog, progress_bar, progress_label))
 
-    async def _run_edit_project(self, name: str):
-        await self._show_edit_dialog(name)
+    def _run_edit_project(self, name: str):
+        """编辑项目（先创建对话框，再异步加载数据）"""
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('✏️ 编辑项目').classes('text-h6')
+            name_input = ui.input(label='项目名称').classes('w-full')
+            model_names = self.get_model_names() if self.get_model_names else []
+            model_select = ui.select(
+                options=model_names, label='AI模型'
+            ).classes('w-full')
+            with ui.row().classes('gap-2'):
+                ui.button('取消', on_click=dialog.close)
+                async def _run_save():
+                    await self._save_edit(name, name_input.value, model_select.value, dialog)
+                ui.button('保存', color='primary', on_click=_run_save)
+        dialog.props('persistent')
+        asyncio.create_task(self._load_edit_data(name, dialog, name_input, model_select))
 
     def _load_initial_projects(self):
         """初始加载项目列表（同步，在 create 调用，有 slot 上下文）"""
@@ -711,31 +740,34 @@ class ProjectPanel:
 
             import_name = ui.input(label='项目名称（可选）', placeholder='留空使用原名称')
 
+            # 预创建进度对话框（在 slot 上下文中）
+            with ui.dialog() as progress_dialog, ui.card().classes('w-96'):
+                ui.label('📥 导入项目').classes('text-h6')
+                progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+                progress_label = ui.label('正在导入...').classes('text-caption')
+            progress_dialog.props('persistent')
+
             with ui.row().classes('gap-2'):
                 ui.button('取消', on_click=dialog.close)
-                async def _run_import():
-                    await self._do_import(import_name.value, import_file_data, dialog)
+                def _run_import():
+                    dialog.close()
+                    progress_dialog.open()
+                    asyncio.create_task(self._do_import(
+                        import_name.value, import_file_data,
+                        progress_dialog, progress_bar, progress_label
+                    ))
                 ui.button('导入', color='primary', on_click=_run_import)
 
         dialog.props('persistent')
         dialog.open()
 
-    async def _do_import(self, project_name, import_file_data, dialog):
+    async def _do_import(self, project_name, import_file_data,
+                         progress_dialog, progress_bar, progress_label):
         """执行导入（所有阻塞操作在线程池中）"""
         if not import_file_data.get('path'):
-            ui.notify('请先选择zip文件', type='warning')
+            _safe(ui.notify, '请先选择zip文件', type='warning')
+            progress_dialog.close()
             return
-
-        dialog.close()
-        await asyncio.sleep(0)
-
-        with ui.dialog() as progress_dialog, ui.card().classes('w-96'):
-            ui.label('📥 导入项目').classes('text-h6')
-            progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
-            progress_label = ui.label('正在导入...').classes('text-caption')
-
-        progress_dialog.props('persistent')
-        progress_dialog.open()
 
         try:
             loop = asyncio.get_event_loop()
@@ -783,8 +815,8 @@ class ProjectPanel:
 
     # ========== 编辑项目 ==========
 
-    async def _show_edit_dialog(self, name: str):
-        """显示编辑项目对话框（DB 查询在线程池中）"""
+    async def _load_edit_data(self, name, dialog, name_input, model_select):
+        """异步加载编辑数据并填充表单"""
         loop = asyncio.get_event_loop()
 
         def _load_meta():
@@ -797,26 +829,12 @@ class ProjectPanel:
 
         meta = await loop.run_in_executor(None, _load_meta)
         if not meta:
-            ui.notify('项目不存在', type='negative')
+            _safe(ui.notify, '项目不存在', type='negative')
+            dialog.close()
             return
 
-        with ui.dialog() as dialog, ui.card().classes('w-96'):
-            ui.label('✏️ 编辑项目').classes('text-h6')
-            name_input = ui.input(label='项目名称', value=meta.get('name', '')).classes('w-full')
-
-            model_names = self.get_model_names() if self.get_model_names else []
-            model_select = ui.select(
-                options=model_names, label='AI模型',
-                value=meta.get('model_config_name', '')
-            ).classes('w-full')
-
-            with ui.row().classes('gap-2'):
-                ui.button('取消', on_click=dialog.close)
-                async def _run_save():
-                    await self._save_edit(name, name_input.value, model_select.value, dialog)
-                ui.button('保存', color='primary', on_click=_run_save)
-
-        dialog.props('persistent')
+        name_input.value = meta.get('name', '')
+        model_select.value = meta.get('model_config_name', '')
         dialog.open()
 
     async def _save_edit(self, old_name, new_name, model, dialog):
@@ -925,15 +943,8 @@ class ProjectPanel:
 
     # ========== 导出项目 ==========
 
-    async def _export_project(self, name: str):
+    async def _export_project(self, name: str, dialog, progress_bar, progress_label):
         """导出项目为 ZIP 包（所有阻塞操作在线程池中）"""
-        with ui.dialog() as dialog, ui.card().classes('w-96'):
-            ui.label('📦 导出项目').classes('text-h6')
-            progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
-            progress_label = ui.label('准备中...').classes('text-caption')
-
-        dialog.props('persistent')
-        dialog.open()
 
         try:
             loop = asyncio.get_event_loop()
@@ -983,15 +994,7 @@ class ProjectPanel:
             progress_label.text = f'✅ 导出成功: {result_path.name}'
             await asyncio.sleep(0.5)
             dialog.close()
-
-            with ui.dialog() as result_dialog, ui.card().classes('w-96'):
-                ui.label('✅ 导出成功').classes('text-h6')
-                ui.label(f'文件: {result_path}').classes('text-body2 text-grey')
-                with ui.row().classes('w-full justify-end gap-2 mt-4'):
-                    ui.button('打开文件夹',
-                              on_click=lambda: os.startfile(str(result_path.parent)))
-                    ui.button('关闭', on_click=result_dialog.close)
-            result_dialog.open()
+            _safe(ui.notify, f'✅ 导出成功: {result_path}', type='positive')
 
         except Exception as e:
             self.logger.error(f'导出项目失败: {e}')
