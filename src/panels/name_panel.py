@@ -542,50 +542,68 @@ class NamePanel:
         chars_todo, profiles = await loop.run_in_executor(None, _get_todo)
 
         total = len(chars_todo)
-        if total == 0:
-            # 没有未翻译的人名，检查是否需要重新分析
-            all_chars = self.db.get_characters()
-            unanalyzed = [c['display_name'] for c in all_chars
-                          if c['display_name'] not in profiles and not c['is_placeholder']]
-            if unanalyzed:
-                total = len(unanalyzed)
-                self.logger.info(f'人名已全部翻译，补充分析 {total} 个角色', panel='names')
 
-                for i, name in enumerate(unanalyzed):
+        try:
+            if total == 0:
+                # 没有未翻译的人名，检查是否需要重新分析
+                all_chars = self.db.get_characters()
+                unanalyzed = [c['display_name'] for c in all_chars
+                              if c['display_name'] not in profiles and not c['is_placeholder']]
+                if unanalyzed:
+                    total = len(unanalyzed)
+                    self.logger.info(f'人名已全部翻译，补充分析 {total} 个角色', panel='names')
+
+                    for i, name in enumerate(unanalyzed):
+                        if self._cancel:
+                            break
+                        self.progress.update(i, total, f'分析中: {i+1}/{total} {name}')
+                        try:
+                            await self._do_translate_and_analyze(name)
+                            completed_count += 1
+                        except Exception as e:
+                            self.logger.error(f'{name} 分析失败: {e}', panel='names')
+                else:
+                    _safe(ui.notify, '所有人名已翻译并分析', type='info')
+            else:
+                # 融合流程：顺序处理，同时翻译人名+分析角色
+                self.logger.info(f'开始翻译+分析 {total} 个角色', panel='names')
+
+                for i, c in enumerate(chars_todo):
                     if self._cancel:
                         break
-                    self.progress.update(i, total, f'分析中: {i+1}/{total} {name}')
-                    await self._do_translate_and_analyze(name)
-                    completed_count += 1
-            else:
-                _safe(ui.notify, '所有人名已翻译并分析', type='info')
-        else:
-            # 融合流程：顺序处理，同时翻译人名+分析角色
-            self.logger.info(f'开始翻译+分析 {total} 个角色', panel='names')
+                    name = c['display_name']
+                    self.progress.update(i, total, f'翻译+分析: {i+1}/{total} {name}')
+                    try:
+                        await self._do_translate_and_analyze(name)
+                        completed_count += 1
+                    except Exception as e:
+                        self.logger.error(f'{name} 翻译+分析失败: {e}', panel='names')
 
-            for i, c in enumerate(chars_todo):
-                if self._cancel:
-                    break
-                name = c['display_name']
-                self.progress.update(i, total, f'翻译+分析: {i+1}/{total} {name}')
-                await self._do_translate_and_analyze(name)
-                completed_count += 1
+                    try:
+                        await self.async_refresh()
+                    except Exception as e:
+                        self.logger.warning(f'刷新表格失败: {e}')
 
+                self.logger.info(f'翻译+分析完成: {completed_count}/{total}', panel='names')
+
+        except Exception as e:
+            self.logger.error(f'批量翻译异常中断: {e}', panel='names')
+
+        finally:
+            _safe(self.translate_all_btn.set_visibility, True)
+            _safe(self.stop_btn.set_visibility, False)
+            self.progress.reset()
+            if self._on_task_state_change:
+                self._on_task_state_change(False)
+            try:
                 await self.async_refresh()
+            except Exception:
+                pass
 
-            self.logger.info(f'翻译+分析完成: {completed_count}/{total}', panel='names')
-
-        _safe(self.translate_all_btn.set_visibility, True)
-        _safe(self.stop_btn.set_visibility, False)
-        self.progress.reset()
-        if self._on_task_state_change:
-            self._on_task_state_change(False)
-        await self.async_refresh()
-
-        if self._cancel:
-            _safe(ui.notify, '已停止', type='warning')
-        else:
-            _safe(ui.notify, '全部完成', type='positive')
+            if self._cancel:
+                _safe(ui.notify, '已停止', type='warning')
+            else:
+                _safe(ui.notify, '全部完成', type='positive')
 
     async def _stop(self):
         self._cancel = True

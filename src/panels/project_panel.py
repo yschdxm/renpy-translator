@@ -127,7 +127,7 @@ class ProjectPanel:
                         ui.space()
                         with ui.row().classes('gap-xs items-center'):
                             ui.button('打开', on_click=lambda n=p.name: asyncio.create_task(self._run_open_project(n))).props('dense flat no-caps')
-                            ui.button('导出', on_click=lambda n=p.name: asyncio.create_task(self._run_export_project(n))).props('dense flat no-caps')
+                            ui.button('导出', on_click=lambda n=p.name: self._run_export_project(n)).props('dense flat no-caps')
                             ui.button(icon='edit', on_click=lambda n=p.name: asyncio.create_task(self._run_edit_project(n))).props('flat dense round size=sm')
                             ui.button(icon='delete', on_click=lambda n=p.name: self._confirm_delete(n)).props('flat dense round size=sm color=negative')
                 self._project_cards[p.name] = {
@@ -784,15 +784,16 @@ class ProjectPanel:
 
             result = await loop.run_in_executor(None, _do_import)
 
-            progress_bar.value = 1.0
-            progress_label.text = '导入完成！'
-            await asyncio.sleep(0.5)
-
             if result['success']:
-                _safe(ui.notify, result['message'], type='positive')
+                progress_bar.value = 1.0
+                progress_label.text = f'✅ {result["message"]}'
+                self.logger.info(f'导入成功: {result["message"]}')
                 await self.async_refresh_projects()
             else:
-                _safe(ui.notify, result['message'], type='negative')
+                progress_label.text = f'❌ {result["message"]}'
+                self.logger.error(f'导入失败: {result["message"]}')
+
+            await asyncio.sleep(2)
 
             # 清理临时文件（在线程池中）
             try:
@@ -805,7 +806,10 @@ class ProjectPanel:
 
         except Exception as e:
             self.logger.error(f'导入项目失败: {e}')
-            _safe(ui.notify, f'导入失败: {str(e)}', type='negative')
+            try:
+                progress_label.text = f'❌ 导入失败: {str(e)}'
+            except Exception:
+                pass
         finally:
             await asyncio.sleep(0)
             try:
@@ -944,57 +948,106 @@ class ProjectPanel:
     # ========== 导出项目 ==========
 
     async def _export_project(self, name: str, dialog, progress_bar, progress_label):
-        """导出项目为 ZIP 包（所有阻塞操作在线程池中）"""
+        """导出项目为 ZIP 包（分步执行，每步更新进度）"""
 
         try:
             loop = asyncio.get_event_loop()
+            project_dir = self.project_manager._get_project_dir(name)
+            db_file = project_dir / 'project.db'
 
-            progress_bar.value = 0.1
-            progress_label.text = '正在读取项目数据...'
-            await asyncio.sleep(0)
+            if not db_file.exists():
+                progress_label.text = '❌ 项目数据库不存在'
+                await asyncio.sleep(2)
+                dialog.close()
+                return
 
-            def _do_export():
-                export_dir = Path(self.project_manager.projects_dir).parent / 'exports'
-                export_dir.mkdir(exist_ok=True)
-                export_path = export_dir / f'{name}.zip'
+            export_dir = Path(self.project_manager.projects_dir).parent / 'exports'
+            export_dir.mkdir(exist_ok=True)
+            export_path = export_dir / f'{name}.zip'
 
-                data = self.project_manager.export_project_json(name)
-                if not data:
-                    raise Exception('项目不存在')
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_project = Path(temp_dir) / name
+                temp_project.mkdir()
 
-                project_dir = self.project_manager._get_project_dir(name)
+                # 步骤1: 复制数据库（很快）
+                progress_bar.value = 0.1
+                progress_label.text = '正在复制数据库...'
+                await asyncio.sleep(0)
+                await loop.run_in_executor(None, shutil.copy2, db_file, temp_project / 'project.db')
 
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_project = Path(temp_dir) / name
-                    temp_project.mkdir()
+                # 步骤2: 复制游戏文件（逐文件，带进度）
+                game_dir = project_dir / 'game'
+                if game_dir.exists():
+                    copy_progress = {'current': 0, 'total': 0, 'done': False}
 
-                    with open(temp_project / 'project.json', 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    def _copy_game():
+                        try:
+                            total = sum(1 for _ in game_dir.rglob('*') if _.is_file())
+                            copy_progress['total'] = total if total > 0 else 1
+                            for root, dirs, files in os.walk(game_dir):
+                                rel = Path(root).relative_to(game_dir)
+                                dst = temp_project / 'game' / rel
+                                dst.mkdir(parents=True, exist_ok=True)
+                                for f in files:
+                                    shutil.copy2(Path(root) / f, dst / f)
+                                    copy_progress['current'] += 1
+                        finally:
+                            copy_progress['done'] = True
 
-                    game_dir = project_dir / 'game'
-                    if game_dir.exists():
-                        shutil.copytree(game_dir, temp_project / 'game')
+                    copy_task = loop.run_in_executor(None, _copy_game)
+                    while not copy_progress['done']:
+                        total = copy_progress['total']
+                        current = copy_progress['current']
+                        if total > 0:
+                            progress_bar.value = 0.1 + (current / total) * 0.4
+                            progress_label.text = f'正在复制游戏文件... ({current}/{total})'
+                        await asyncio.sleep(0.3)
+                    await copy_task
 
-                    fonts_dir = Path(__file__).parent.parent.parent / 'fonts'
-                    if fonts_dir.exists():
-                        shutil.copytree(fonts_dir, temp_project / 'fonts')
+                # 步骤3: 复制字体
+                fonts_dir = Path(__file__).parent.parent.parent / 'fonts'
+                if fonts_dir.exists():
+                    progress_bar.value = 0.5
+                    progress_label.text = '正在复制字体...'
+                    await asyncio.sleep(0)
+                    await loop.run_in_executor(None, shutil.copytree, fonts_dir, temp_project / 'fonts')
 
-                    with zipfile.ZipFile(export_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                        for root, dirs, files in os.walk(temp_project):
-                            for file in files:
-                                file_path = Path(root) / file
-                                arcname = file_path.relative_to(temp_dir)
-                                zf.write(file_path, arcname)
+                # 步骤4: 打包 ZIP（逐文件，带进度）
+                progress_bar.value = 0.6
+                progress_label.text = '正在打包...'
+                await asyncio.sleep(0)
 
-                return export_path
+                all_files = []
+                for root, dirs, files in os.walk(temp_project):
+                    for f in files:
+                        all_files.append((Path(root) / f, Path(root).relative_to(temp_dir)))
 
-            result_path = await loop.run_in_executor(None, _do_export)
+                zip_progress = {'current': 0, 'total': len(all_files), 'done': False}
+
+                def _create_zip():
+                    try:
+                        with zipfile.ZipFile(export_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                            for i, (file_path, arc_dir) in enumerate(all_files):
+                                zf.write(file_path, arc_dir / file_path.name)
+                                zip_progress['current'] = i + 1
+                    finally:
+                        zip_progress['done'] = True
+
+                zip_task = loop.run_in_executor(None, _create_zip)
+                while not zip_progress['done']:
+                    total = zip_progress['total']
+                    current = zip_progress['current']
+                    if total > 0:
+                        progress_bar.value = 0.6 + (current / total) * 0.4
+                        progress_label.text = f'正在打包... ({current}/{total})'
+                    await asyncio.sleep(0.3)
+                await zip_task
 
             progress_bar.value = 1.0
-            progress_label.text = f'✅ 导出成功: {result_path.name}'
+            progress_label.text = f'✅ 导出成功: {export_path.name}'
             await asyncio.sleep(0.5)
             dialog.close()
-            _safe(ui.notify, f'✅ 导出成功: {result_path}', type='positive')
+            _safe(ui.notify, f'✅ 导出成功: {export_path}', type='positive')
 
         except Exception as e:
             self.logger.error(f'导出项目失败: {e}')

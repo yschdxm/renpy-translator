@@ -298,38 +298,49 @@ class TextTranslationPanel:
         self.logger.info(f'开始翻译当前页 {total} 条 ({self.content_type})', panel=self.content_type)
 
         success = 0
-        for i, row in enumerate(to_translate):
-            if self._cancel:
-                break
+        try:
+            for i, row in enumerate(to_translate):
+                if self._cancel:
+                    break
 
-            self.progress.update(i, total, f'翻译中: {i+1}/{total}')
+                self.progress.update(i, total, f'翻译中: {i+1}/{total}')
 
-            # 标记处理中
-            self._processing_ids.add(row['action'])
-            _safe(self.table.refresh)
+                # 标记处理中
+                self._processing_ids.add(row['action'])
+                _safe(self.table.refresh)
 
+                try:
+                    ok = await self.translation_service.translate_single(
+                        item_id=row['action'],
+                        content_type=self.content_type,
+                        original_text=row.get('original', ''),
+                        character=row.get('character', ''),
+                    )
+                    if ok:
+                        success += 1
+                except Exception as e:
+                    self.logger.error(f'翻译失败: {e}', panel=self.content_type)
+
+                self._processing_ids.discard(row['action'])
+                try:
+                    await self.async_refresh()
+                except Exception as e:
+                    self.logger.warning(f'刷新表格失败: {e}')
+
+        except Exception as e:
+            self.logger.error(f'批量翻译异常中断: {e}', panel=self.content_type)
+
+        finally:
+            self._processing_ids.clear()
+            _safe(self.translate_page_btn.set_visibility, True)
+            _safe(self.stop_btn.set_visibility, False)
+            self.progress.reset()
+            if self._on_task_state_change:
+                self._on_task_state_change(False)
             try:
-                ok = await self.translation_service.translate_single(
-                    item_id=row['action'],
-                    content_type=self.content_type,
-                    original_text=row.get('original', ''),
-                    character=row.get('character', ''),
-                )
-                if ok:
-                    success += 1
-            except Exception as e:
-                self.logger.error(f'翻译失败: {e}', panel=self.content_type)
-
-            self._processing_ids.discard(row['action'])
-            await self.async_refresh()
-
-        self._processing_ids.clear()
-        _safe(self.translate_page_btn.set_visibility, True)
-        _safe(self.stop_btn.set_visibility, False)
-        self.progress.reset()
-        if self._on_task_state_change:
-            self._on_task_state_change(False)
-        await self.async_refresh()
+                await self.async_refresh()
+            except Exception:
+                pass
 
         if self._cancel:
             _safe(ui.notify, f'翻译已停止: 成功 {success}/{total}', type='warning')
@@ -377,43 +388,54 @@ class TextTranslationPanel:
         self.logger.info(f'开始翻译 {total} 条 ({self.content_type})', panel=self.content_type)
 
         success = 0
-        for i, item in enumerate(to_translate):
-            if self._cancel:
-                break
+        try:
+            for i, item in enumerate(to_translate):
+                if self._cancel:
+                    break
 
-            self.progress.update(i, total, f'翻译中: {i+1}/{total}')
+                self.progress.update(i, total, f'翻译中: {i+1}/{total}')
 
-            # 标记处理中
-            self._processing_ids.add(item['id'])
-            _safe(self.table.refresh)
+                # 标记处理中
+                self._processing_ids.add(item['id'])
+                _safe(self.table.refresh)
 
+                try:
+                    ok = await self.translation_service.translate_single(
+                        item_id=item['id'],
+                        content_type=self.content_type,
+                        original_text=item.get('original_text', ''),
+                        character=item.get('character', ''),
+                    )
+                    if ok:
+                        success += 1
+                except Exception as e:
+                    self.logger.error(f'翻译失败: {e}', panel=self.content_type)
+
+                self._processing_ids.discard(item['id'])
+                try:
+                    await self.async_refresh()
+                except Exception as e:
+                    self.logger.warning(f'刷新表格失败: {e}')
+
+        except Exception as e:
+            self.logger.error(f'批量翻译异常中断: {e}', panel=self.content_type)
+
+        finally:
+            self._processing_ids.clear()
+            _safe(self.translate_all_btn.set_visibility, True)
+            _safe(self.stop_btn.set_visibility, False)
+            self.progress.reset()
+            if self._on_task_state_change:
+                self._on_task_state_change(False)
             try:
-                ok = await self.translation_service.translate_single(
-                    item_id=item['id'],
-                    content_type=self.content_type,
-                    original_text=item.get('original_text', ''),
-                    character=item.get('character', ''),
-                )
-                if ok:
-                    success += 1
-            except Exception as e:
-                self.logger.error(f'翻译失败: {e}', panel=self.content_type)
+                await self.async_refresh()
+            except Exception:
+                pass
 
-            self._processing_ids.discard(item['id'])
-            await self.async_refresh()
-
-        self._processing_ids.clear()
-        _safe(self.translate_all_btn.set_visibility, True)
-        _safe(self.stop_btn.set_visibility, False)
-        self.progress.reset()
-        if self._on_task_state_change:
-            self._on_task_state_change(False)
-        await self.async_refresh()
-
-        if self._cancel:
-            _safe(ui.notify, f'翻译已停止: 成功 {success}/{total}', type='warning')
-        else:
-            _safe(ui.notify, f'翻译完成: 成功 {success}/{total}', type='positive')
+            if self._cancel:
+                _safe(ui.notify, f'翻译已停止: 成功 {success}/{total}', type='warning')
+            else:
+                _safe(ui.notify, f'翻译完成: 成功 {success}/{total}', type='positive')
 
     def _check_prerequisites(self) -> tuple[bool, str]:
         """检查对话翻译的前置条件（同步，在线程池中调用）"""
