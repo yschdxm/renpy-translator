@@ -1004,15 +1004,7 @@ class ProjectPanel:
                         await asyncio.sleep(0.3)
                     await copy_task
 
-                # 步骤3: 复制字体
-                fonts_dir = Path(__file__).parent.parent.parent / 'fonts'
-                if fonts_dir.exists():
-                    progress_bar.value = 0.5
-                    progress_label.text = '正在复制字体...'
-                    await asyncio.sleep(0)
-                    await loop.run_in_executor(None, shutil.copytree, fonts_dir, temp_project / 'fonts')
-
-                # 步骤4: 打包 ZIP（逐文件，带进度）
+                # 步骤3: 打包 ZIP（逐文件，带进度）
                 progress_bar.value = 0.6
                 progress_label.text = '正在打包...'
                 await asyncio.sleep(0)

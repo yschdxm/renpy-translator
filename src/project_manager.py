@@ -205,23 +205,18 @@ class ProjectManager:
                     i += 1
                 project_name = f"{project_name}_{i}"
 
+            # db_file 所在目录就是项目包的根目录
+            package_dir = db_file.parent
+
             # 复制数据库文件
             project_dir = self._get_project_dir(project_name)
             project_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(db_file, project_dir / "project.db")
-            game_src = extract_path / "game"
-            if game_src.exists():
-                shutil.copytree(game_src, project_dir / "game")
 
             # 复制游戏文件
-            game_src = extract_path / "game"
+            game_src = package_dir / "game"
             if game_src.exists():
                 shutil.copytree(game_src, project_dir / "game")
-
-            # 复制字体
-            fonts_src = extract_path / "fonts"
-            if fonts_src.exists():
-                shutil.copytree(fonts_src, project_dir / "fonts")
 
             return {
                 'success': True,
