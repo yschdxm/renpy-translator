@@ -386,6 +386,13 @@ class TextTranslationPanel:
                     self._update_rows({i: '待翻译' for i in batch_ids})
                     self._cancel = True
                     break
+                except Exception as e:
+                    # 批次失败（重试耗尽/解析失败），中止整个批量任务
+                    self.logger.error(f'批次翻译失败，批量翻译中止: {e}', panel=self.content_type)
+                    _safe(ui.notify, str(e), type='negative', timeout=10000)
+                    self._update_rows({i: '待翻译' for i in batch_ids})
+                    self._cancel = True
+                    break
 
                 # 批完成：回写译文 + 状态（一次表格更新）
                 status_map = {i: ('完成' if i in results else '待翻译') for i in batch_ids}
@@ -476,6 +483,13 @@ class TextTranslationPanel:
                 except FatalAPIError as e:
                     # 不可重试的致命错误，中止整个批量任务
                     self.logger.error(f'API 致命错误，批量翻译中止: {e}', panel=self.content_type)
+                    _safe(ui.notify, str(e), type='negative', timeout=10000)
+                    self._update_rows({i: '待翻译' for i in batch_ids})
+                    self._cancel = True
+                    break
+                except Exception as e:
+                    # 批次失败（重试耗尽/解析失败），中止整个批量任务
+                    self.logger.error(f'批次翻译失败，批量翻译中止: {e}', panel=self.content_type)
                     _safe(ui.notify, str(e), type='negative', timeout=10000)
                     self._update_rows({i: '待翻译' for i in batch_ids})
                     self._cancel = True

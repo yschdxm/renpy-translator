@@ -9,7 +9,7 @@ import asyncio
 from typing import Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
-from translator import AITranslator, FatalAPIError
+from translator import AITranslator, FatalAPIError, _count_tokens
 from database import ProjectDatabase
 from logger import TranslationLogger
 
@@ -50,11 +50,12 @@ class TranslationService:
         """
         total_tokens = self.max_context_k * 1024
 
-        # 估算已占用的 token（中文约 3 字符/token，英文约 4 字符/token）
-        glossary_chars = len(glossary_text) if glossary_text else 0
-        profile_chars = len(character_profile) if character_profile else 0
-        system_chars = 800
-        fixed_overhead = (system_chars + glossary_chars + profile_chars) // 3
+        # 估算已占用的 token（系统提示词模板约 270 token，加上术语表与角色特征实测值）
+        fixed_overhead = 270
+        if glossary_text:
+            fixed_overhead += _count_tokens(glossary_text)
+        if character_profile:
+            fixed_overhead += _count_tokens(character_profile)
 
         # 每行上下文约 50 token（原文 + 译文 + 角色名）
         tokens_per_line = 50
@@ -110,7 +111,7 @@ class TranslationService:
 
     # ===== 批次翻译 =====
 
-    _BATCH_FIXED_CHARS = 3000  # 系统提示词模板 + 用户提示词模板/格式说明 + 前文参考 的估算开销
+    _BATCH_FIXED_TOKENS = 1000  # 系统提示词模板 + 用户提示词模板/格式说明 + 前文参考 + tool schema 的估算开销
 
     def group_into_batches(self, items: list, glossary_text: str = "",
                            character_profiles: str = "") -> list:
@@ -121,8 +122,12 @@ class TranslationService:
         3. 估算输出 ≤ 模型声明 max_tokens
         """
         window_tokens = self.max_context_k * 1024
-        fixed_chars = self._BATCH_FIXED_CHARS + len(glossary_text) + len(character_profiles)
-        fixed_tokens = fixed_chars // 3
+        # 固定开销：模板常量 + 术语表/角色特征实测 token
+        fixed_tokens = self._BATCH_FIXED_TOKENS
+        if glossary_text:
+            fixed_tokens += _count_tokens(glossary_text)
+        if character_profiles:
+            fixed_tokens += _count_tokens(character_profiles)
 
         # fixed + src + src×1.2+300 ≤ window  →  src ≤ (window − fixed − 300) / 2.2
         window_cap = int((window_tokens - fixed_tokens - 300) / 2.2)
@@ -134,8 +139,8 @@ class TranslationService:
         for item in items:
             char = item.get('character', '')
             # 编号 + [角色] 标记 + 格式开销
-            line_tokens = (len(item.get('original_text', ''))
-                           + (len(char) + 4 if char else 0) + 8) // 3
+            line_tokens = _count_tokens(item.get('original_text', '')) \
+                + (_count_tokens(char) + 2 if char else 0) + 4
             if current and (len(current) >= self.batch_lines
                             or used + line_tokens > budget):
                 batches.append(current)
@@ -158,8 +163,8 @@ class TranslationService:
             if cfg:
                 self.max_context_k, self.max_tokens, self.batch_lines = cfg
         glossary_text = await loop.run_in_executor(None, self._get_glossary_text)
-        # 对话批次需携带批内角色特征，预留约 2000 字符；UI 无此开销
-        profile_placeholder = ' ' * 2000 if content_type == 'dialogue' else ''
+        # 对话批次需携带批内角色特征，预留 ~700 token（2000 字符的中文/混排）；UI 无此开销
+        profile_placeholder = '预' * 2000 if content_type == 'dialogue' else ''
         return self.group_into_batches(items, glossary_text, profile_placeholder)
 
     async def translate_batch(self, items: list, content_type: str) -> dict:
@@ -212,16 +217,12 @@ class TranslationService:
                 # 不可重试的致命错误，向上传递以中止批量任务
                 raise
             except Exception as e:
-                self.logger.error(f"批次翻译失败（{len(items)} 条）: {e}", panel=content_type)
-                return {}
+                # 重试耗尽：向上抛出，由面板中断整个批量任务（不做单句回退）
+                raise RuntimeError(f"批次翻译失败（{len(items)} 条，已重试 {self.translator.MAX_RETRIES} 次）: {e}") from e
 
         if translated_list is None:
-            # 解析失败（句数不匹配）：整批记失败，继续下一批
-            self.logger.warning(
-                f"批次解析失败（句数不匹配），{len(items)} 条记为失败",
-                panel=content_type
-            )
-            return {}
+            # 解析失败（句数不匹配）：向上抛出，由面板中断整个批量任务（不做单句回退）
+            raise RuntimeError(f"批次解析失败（句数不匹配），{len(items)} 条")
 
         # 逐句写库 + 术语入库
         def _save_all():

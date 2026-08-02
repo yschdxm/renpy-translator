@@ -633,6 +633,7 @@ class ProjectPanel:
             current_file = current_file[len('tl/chinese/'):]
 
         current_label = ""
+        current_line_no = 0
         i = 0
         while i < len(lines):
             line = lines[i].rstrip()
@@ -644,14 +645,20 @@ class ProjectPanel:
             translate_match = re.match(r'^translate\s+\w+\s+(\w+)\s*:', line)
             if translate_match:
                 raw_label = translate_match.group(1)
-                # label 格式通常是 "start_abc123"，取下划线前的部分
-                current_label = raw_label.split('_')[0] if '_' in raw_label else raw_label
+                # 去掉末尾的 hex hash 段（如 luna_gallery_intro_71d6afad → luna_gallery_intro）
+                current_label = re.sub(r'_[0-9a-f]{6,}$', '', raw_label)
                 continue
 
-            if re.match(r'^\s+#\s+game/', line):
+            # 提取行号注释：# game/xxx.rpy:15（在 translate 行之前，作为后续 block 的行号）
+            game_line_match = re.match(r'^\s*#\s+game/.+:(\d+)\s*$', line)
+            if game_line_match:
+                current_line_no = int(game_line_match.group(1))
                 continue
 
-            comment_match = re.match(r'^\s+#\s*(.*)', line)
+            if re.match(r'^\s*#\s+game/', line):
+                continue
+
+            comment_match = re.match(r'^\s*#\s*(.*)', line)
             if comment_match:
                 comment_text = comment_match.group(1).strip()
                 if not comment_text:
@@ -675,7 +682,7 @@ class ProjectPanel:
 
                 full_path = str(game_path / 'game' / current_file)
                 entry = {
-                    'file_path': full_path, 'line_number': 0,
+                    'file_path': full_path, 'line_number': current_line_no,
                     'label': current_label,
                     'character': character, 'original_text': text,
                     'translated_text': '', 'is_translated': False,

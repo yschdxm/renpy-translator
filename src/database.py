@@ -240,7 +240,7 @@ class ProjectDatabase:
     @_auto_reconnect
     def get_untranslated_dialogues(self, limit: int = None) -> list[dict]:
         """获取未翻译的对话（按剧情书写顺序：文件 + 行号）"""
-        sql = "SELECT * FROM dialogues WHERE is_translated=0 ORDER BY file_path, line_number"
+        sql = "SELECT * FROM dialogues WHERE is_translated=0 ORDER BY file_path, line_number, id"
         if limit:
             sql += f" LIMIT {limit}"
         rows = self._conn.execute(sql).fetchall()
@@ -423,7 +423,7 @@ class ProjectDatabase:
     @_auto_reconnect
     def get_untranslated_ui_texts(self, limit: int = None) -> list[dict]:
         """获取未翻译的 UI 字符串（按文件 + 行号顺序，同文件字符串相邻成批）"""
-        sql = "SELECT * FROM ui_texts WHERE is_translated=0 ORDER BY file_path, line_number"
+        sql = "SELECT * FROM ui_texts WHERE is_translated=0 ORDER BY file_path, line_number, id"
         if limit:
             sql += f" LIMIT {limit}"
         rows = self._conn.execute(sql).fetchall()

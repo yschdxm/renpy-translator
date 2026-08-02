@@ -7,6 +7,16 @@ from typing import List, Optional, Dict, Any, Callable
 import openai
 from openai import OpenAI
 from dataclasses import dataclass
+import tiktoken
+
+# 模块级 BPE 编码器（cl100k_base，对 GPT 系列精确，对国产模型是误差 <15% 的近似，
+# 远好于 len//3 对中文的 3 倍失真）。加载一次复用。
+_ENC = tiktoken.get_encoding("cl100k_base")
+
+
+def _count_tokens(text: str) -> int:
+    """估算文本 token 数"""
+    return len(_ENC.encode(text or ""))
 
 
 class FatalAPIError(Exception):
@@ -52,7 +62,7 @@ class TranslationConfig:
 class AITranslator:
     """AI翻译器"""
 
-    MAX_RETRIES = 5  # 可重试错误的最大尝试次数
+    MAX_RETRIES = 3  # 可重试错误的最大尝试次数
 
     def __init__(self, config: TranslationConfig):
         self.config = config
@@ -160,6 +170,7 @@ class AITranslator:
 术语提取规则：
 - 只提取游戏内出现的专有名词：地名、物品名、技能名、组织名、种族名、特殊称呼等
 - 不要提取：通用词汇、UI文字、技术术语、许可证名称、框架名称、软件名称
+- 人名对照表中已有的人物名不要放入术语；但只在台词中被提及、未作为角色出场的人物名，可以作为专有名词放入术语
 - 如果术语表中已有该词的翻译，不要重复添加
 - 如果没有新的游戏专有名词，不输出术语部分"""
 
@@ -406,6 +417,7 @@ class AITranslator:
 术语提取规则：
 - 只提取游戏内出现的专有名词：地名、物品名、技能名、组织名、种族名、特殊称呼等
 - 不要提取：通用词汇、UI文字、技术术语
+- 人名对照表中已有的人物名不要放入术语；但只在台词中被提及、未作为角色出场的人物名，可以作为专有名词放入术语
 - 如果术语表中已有该词的翻译，不要重复添加
 - 如果没有新的游戏专有名词，不输出术语部分"""
 
@@ -424,11 +436,11 @@ class AITranslator:
             raise ValueError("请先配置API Key")
 
         if not text.strip():
-            return ""
+            return "", []
 
         # 标点符号直接返回
         if not any(c.isalnum() for c in text):
-            return text
+            return text, []
 
         system_prompt = self._build_ui_system_prompt(glossary_text, style_guide=style_guide)
 
@@ -456,10 +468,11 @@ class AITranslator:
     def _build_batch_user_prompt(self, items: List[dict],
                                  context_before: List[dict] = None,
                                  content_type: str = 'dialogue') -> str:
-        """构建批次翻译用户提示词（编号输入、编号输出）
+        """构建批次翻译用户提示词（JSON 结构化输入）
 
-        dialogue：相邻 item 的 label 变化时插入不占编号的【场景: xxx】分隔行。
-        ui：有 context_hint 的条目标注出处（(出处) 原文），帮助模型推断词义。
+        待译文本以 JSON 数组给出，每项含 id/speaker/text/scene/hint，
+        speaker 在独立字段中，模型不会把它当待译文本翻译。
+        输出靠 id 对齐，不要求位置对应。
         """
         prompt = ""
 
@@ -476,31 +489,39 @@ class AITranslator:
             prompt += "\n"
 
         n = len(items)
-        prompt += f"【请翻译以下文本，共 {n} 句，按编号顺序逐句翻译】\n"
-        last_label = None
+        structured = []
         for i, item in enumerate(items, 1):
-            # 场景分隔行（不占编号）
+            entry = {"id": i, "text": item.get('original_text', '').replace('\n', ' ')}
+            char = item.get('character', '')
+            if char:
+                entry["speaker"] = char
             if content_type == 'dialogue':
                 label = item.get('label', '')
-                if label and label != last_label:
-                    prompt += f"【场景: {label}】\n"
-                last_label = label
-
-            char = item.get('character', '')
-            text = item.get('original_text', '').replace('\n', ' ')
-            hint = item.get('context_hint', '') if content_type == 'ui' else ''
-            prefix = f"({hint}) " if hint else ''
-            if char:
-                prompt += f"{i}. [{char}] {prefix}{text}\n"
+                if label:
+                    entry["scene"] = label
             else:
-                prompt += f"{i}. {prefix}{text}\n"
+                hint = item.get('context_hint', '')
+                if hint:
+                    entry["hint"] = hint
+            structured.append(entry)
+
+        prompt += f"【请翻译以下 JSON 数组中每一项的 text 字段，共 {n} 条】\n"
+        prompt += json.dumps(structured, ensure_ascii=False, indent=None)
 
         prompt += f"""
+
+【字段说明】
+- id：条目编号，输出时用它与译文一一对应
+- text：待翻译的原文（唯一需要翻译的字段）
+- speaker：说话人（仅参考语气，不要翻译，不要放进译文）
+- scene：所属场景标签（仅提供语境，不要翻译）
+- hint：字符串出处提示（仅帮助推断词义，不要翻译）
+
 【输出要求】
 - 调用 submit_translations 函数提交结果
-- translations 数组必须恰好包含 {n} 条译文，顺序与输入编号 1 到 {n} 一一对应，不要合并、拆分或跳过任何一句
-- [角色] 是说话人标记，不要翻译，也不要出现在译文中；【场景:】和(出处)只是上下文提示，同样不要出现在译文中
-- 原文中新出现的游戏专有名词（地名、物品名、技能名等，且术语表中没有的）放入 terms 数组；术语表中已有或没有新名词时传空数组"""
+- translations 数组必须恰好包含 {n} 条，每条用 id 对应输入条目的译文，不要合并、拆分或跳过任何一条
+- 只翻译 text 字段；speaker/scene/hint 只是上下文，绝不翻译也不出现在译文中
+- 原文中新出现的游戏专有名词（地名、物品名、技能名等，且术语表中没有的）放入 terms 数组；人名对照表中已有的人物名不要放入，但只在台词中被提及、未出场的人物名可以放入；术语表中已有或没有新名词时传空数组"""
 
         return prompt
 
@@ -508,7 +529,8 @@ class AITranslator:
     def _parse_tool_response(message, expected: int) -> tuple[Optional[List[str]], List[dict]]:
         """解析 tool calls 响应
 
-        translations 数组长度必须恰好等于 expected，否则返回 (None, [])。
+        translations 是 [{id, translation}, ...]，按 id 放回位置（id 从 1 开始）。
+        数量不足/id 越界/重复 → 返回 (None, [])。
         """
         calls = getattr(message, 'tool_calls', None)
         if not calls:
@@ -518,8 +540,25 @@ class AITranslator:
         except (json.JSONDecodeError, TypeError, AttributeError):
             return None, []
 
-        translations = args.get('translations')
-        if not isinstance(translations, list) or len(translations) != expected:
+        raw = args.get('translations')
+        if not isinstance(raw, list):
+            return None, []
+
+        # 按 id 对齐（兼容模型乱序返回）
+        result = [None] * expected
+        seen = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                return None, []
+            idx = entry.get('id')
+            text = entry.get('translation')
+            if not isinstance(idx, int) or not (1 <= idx <= expected) or idx in seen:
+                return None, []
+            seen.add(idx)
+            result[idx - 1] = text if isinstance(text, str) else ''
+
+        # 必须覆盖全部 id
+        if len(seen) != expected or any(r is None for r in result):
             return None, []
 
         terms = []
@@ -527,7 +566,7 @@ class AITranslator:
             if isinstance(t, dict) and t.get('en_term') and t.get('cn_term'):
                 terms.append({'en_term': str(t['en_term']), 'cn_term': str(t['cn_term'])})
 
-        return [t if isinstance(t, str) else '' for t in translations], terms
+        return result, terms
 
     def translate_batch(self, items: List[dict], content_type: str = 'dialogue',
                         glossary_text: str = "", character_profiles: str = "",
@@ -563,27 +602,34 @@ class AITranslator:
             print(f'{"="*50}\n')
 
         # 输出长度按批放大：译文长度通常不超过原文（英→中会缩短），1.2 倍余量确保不被截断
-        est_input_tokens = sum(len(it.get('original_text', '')) for it in items) // 3
+        est_input_tokens = sum(_count_tokens(it.get('original_text', '')) for it in items)
         max_tokens = max(self.config.max_tokens, int(est_input_tokens * 1.2) + 300)
         if context_window_tokens:
             # 输入 + 输出不得超出模型上下文窗口（deepseek 等服务超限直接返回 400）
-            est_total_input = (len(system_prompt) + len(user_prompt)) // 3
+            est_total_input = _count_tokens(system_prompt) + _count_tokens(user_prompt)
             max_tokens = min(max_tokens, max(1000, context_window_tokens - est_total_input))
 
-        # Tool Calls：schema 强制 translations 恰好 n 条，避免编号文本的格式污染
+        # Tool Calls：translations 用 {id, translation} 对象数组，靠 id 对齐
         n = len(items)
         tools = [{
             "type": "function",
             "function": {
                 "name": "submit_translations",
-                "description": "按输入编号顺序提交全部译文，以及原文中新出现的游戏专有名词术语",
+                "description": "按 id 提交全部译文，以及原文中新出现的游戏专有名词术语",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "translations": {
                             "type": "array",
-                            "description": f"恰好 {n} 条译文，顺序与输入编号 1 到 {n} 一一对应",
-                            "items": {"type": "string"},
+                            "description": f"恰好 {n} 条译文，每条用 id 对应输入条目的 text 译文",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "integer", "description": "输入条目的 id"},
+                                    "translation": {"type": "string", "description": "该条 text 的译文"},
+                                },
+                                "required": ["id", "translation"],
+                            },
                             "minItems": n,
                             "maxItems": n,
                         },
