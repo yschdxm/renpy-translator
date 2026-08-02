@@ -23,7 +23,8 @@ class LogPanel:
         """构建 UI"""
         with container:
             ui.label(label).classes('text-subtitle2')
-            self.log_widget = ui.log().classes(f'w-full {self.height}')
+            # max_lines 让 NiceGUI 在客户端自动裁剪历史消息，避免 DOM 无界增长
+            self.log_widget = ui.log(max_lines=self.max_lines).classes(f'w-full {self.height}')
 
     def push(self, message: str):
         """推送到日志
@@ -35,11 +36,6 @@ class LogPanel:
             return
 
         self.log_widget.push(message)
-        self._line_count += 1
-
-        # 超过最大行数时清理（NiceGUI ui.log 自动管理，此处仅计数）
-        if self._line_count > self.max_lines * 2:
-            self._line_count = self.max_lines
 
     def clear(self):
         """清空日志"""

@@ -7,6 +7,9 @@
 import asyncio
 import os
 import sys
+import threading
+from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,6 +58,11 @@ class App:
         self.db: ProjectDatabase = None
         self.translator: AITranslator = None
         self.translation_service: TranslationService = None
+
+        # 提示词日志（环境变量 PROMPT_LOG 控制，默认关闭）
+        self._prompt_log_enabled = os.environ.get('PROMPT_LOG', '').lower() in ('1', 'true', 'yes', 'on')
+        self._prompt_log_path = Path(__file__).parent.parent / 'logs' / 'prompt.log'
+        self._prompt_log_lock = threading.Lock()
 
         self.project_panel = ProjectPanel(
             project_manager=self.project_manager,
@@ -133,11 +141,6 @@ class App:
                                     with ui.item_section():
                                         ui.item_label(label).classes('text-body2')
 
-                        ui.separator()
-                        with ui.expansion('📜 当前提示词', value=False).classes('full-width'):
-                            prompt_log = ui.log().classes('w-full').style('max-height: 40vh; font-size: 11px;')
-                            ui.button('清空', icon='delete', on_click=lambda: safe_ui(prompt_log.clear)).props('flat dense size=sm')
-
                 with splitter.after:
                     splitter.props(':model-value=15')
                     with ui.column().classes('full-width').style('overflow-y: auto; height: 100%;'):
@@ -169,7 +172,6 @@ class App:
         self._panels = panels
         self.header_project_select = header_select
         self.header_progress = header_progress
-        self.prompt_display = prompt_log
 
         self._refresh_header_options()
         self.config_panel.refresh()
@@ -235,7 +237,7 @@ class App:
                 None, self.config_panel.create_translator, model_name
             )
 
-        if self.translator and hasattr(self, 'prompt_display'):
+        if self.translator:
             self.translator.prompt_callback = self._on_prompt
 
         # 获取模型配置
@@ -311,14 +313,30 @@ class App:
             self.dialogue_panel._set_buttons_translating(True)
 
     def _on_prompt(self, system_prompt: str, user_prompt: str, task_type: str):
-        if not hasattr(self, 'prompt_display') or not self.prompt_display:
+        """提示词回调：写入独立的提示词日志文件（完整内容，不截断）
+
+        由环境变量 PROMPT_LOG 控制开关，默认关闭。
+        注意：该回调在翻译线程中触发，文件写入需加锁。
+        """
+        if not self._prompt_log_enabled:
             return
         type_labels = {'name': '人名翻译', 'ui': '字符串翻译', 'dialogue': '对话翻译', 'analysis': '分析'}
         label = type_labels.get(task_type, task_type)
-        safe_ui(self.prompt_display.clear)
-        safe_ui(self.prompt_display.push, f'───── {label} ─────')
-        safe_ui(self.prompt_display.push, f'[系统]\n{system_prompt}')
-        safe_ui(self.prompt_display.push, f'[用户]\n{user_prompt}')
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        entry = (
+            f'{"=" * 70}\n'
+            f'[{timestamp}] {label}\n'
+            f'{"=" * 70}\n'
+            f'[系统]\n{system_prompt}\n\n'
+            f'[用户]\n{user_prompt}\n\n'
+        )
+        with self._prompt_log_lock:
+            try:
+                self._prompt_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._prompt_log_path, 'a', encoding='utf-8') as f:
+                    f.write(entry)
+            except OSError as e:
+                print(f'[提示词日志] 写入失败: {e}')
 
 
 _app_instance = None

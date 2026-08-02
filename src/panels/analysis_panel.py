@@ -14,7 +14,6 @@ def _safe(fn, *args, **kwargs):
 from database import ProjectDatabase
 from translator import AITranslator
 from logger import TranslationLogger
-from components.log_panel import LogPanel
 
 
 class AnalysisPanel:
@@ -29,7 +28,7 @@ class AnalysisPanel:
         self.stats_label: ui.label = None
         self.analyze_all_btn: ui.button = None
         self.analyze_btn: ui.button = None
-        self.log_panel: LogPanel = None
+        self.log_panel = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
     def set_db(self, db: ProjectDatabase):
@@ -84,12 +83,6 @@ class AnalysisPanel:
 
             self.analysis_table.on('analyze_character', self._on_analyze)
             self.analysis_table.on('view_character', self._on_view)
-
-            ui.separator()
-            self.log_panel = LogPanel(height='h-48')
-            self.log_panel.build_ui(container, label='分析日志')
-
-            self.logger.bind_ui('analysis', self.log_panel.get_push_callback())
 
     def refresh(self):
         """同步刷新（仅在同步上下文中使用）"""

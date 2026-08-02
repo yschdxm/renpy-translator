@@ -18,7 +18,6 @@ from translator import AITranslator
 from logger import TranslationLogger
 from components.paginated_table import PaginatedTable
 from components.progress_panel import ProgressPanel
-from components.log_panel import LogPanel
 
 
 class NamePanel:
@@ -38,7 +37,6 @@ class NamePanel:
 
         self.table: PaginatedTable = None
         self.progress: ProgressPanel = None
-        self.log_panel: LogPanel = None
 
         self.translate_all_btn: ui.button = None
         self.stop_btn: ui.button = None
@@ -149,10 +147,6 @@ class NamePanel:
             self.progress = ProgressPanel()
             self.progress.build_ui(container)
 
-            self.log_panel = LogPanel(height='h-32')
-            self.log_panel.build_ui(container, label='翻译日志')
-            self.logger.bind_ui('names', self.log_panel.get_push_callback())
-
     def refresh(self):
         if not self.db:
             return
@@ -167,9 +161,51 @@ class NamePanel:
         counts = await loop.run_in_executor(None, self.db.get_char_dict_count)
         profiles = await loop.run_in_executor(None, self.db.get_all_profiles)
         self.table.set_query(self._query_names)
-        _safe(self.table.refresh)
+        # 表格刷新含同步 SQLite 查询，放入线程池避免阻塞事件循环
+        await loop.run_in_executor(None, self.table.refresh)
         analyzed = len(profiles)
         _safe(setattr, self.stats_label, 'text', f'📊 {counts["total"]} 人名，翻译 {counts["translated"]}，分析 {analyzed}')
+
+    def _update_name_row(self, en_name: str, name_status: str = None,
+                         translated: str = None, analysis_status: str = None):
+        """实时更新当前页中某一人名行（不重查整页，不阻塞事件循环）"""
+        t = self.table.table if self.table else None
+        if not t:
+            return
+        for row in t.rows:
+            if row.get('action') == en_name:
+                if name_status is not None:
+                    row['name_status'] = name_status
+                if translated is not None:
+                    row['translated'] = translated
+                if analysis_status is not None:
+                    row['analysis_status'] = analysis_status
+                _safe(t.update)
+                break
+
+    async def _refresh_name_row(self, en_name: str):
+        """从数据库重新读取单个人名并实时更新该行"""
+        loop = asyncio.get_event_loop()
+        c = await loop.run_in_executor(None, self.db.get_character_by_name, en_name)
+        if not c:
+            return
+        is_processing = en_name in self._processing_names
+        cn = c['cn_name']
+        name_ok = bool(cn and cn.strip())
+        if is_processing:
+            name_status = '处理中'
+        elif name_ok:
+            name_status = '完成'
+        else:
+            name_status = '待翻译'
+        if is_processing:
+            analysis_status = '处理中'
+        elif c['profile_json']:
+            analysis_status = '已完成'
+        else:
+            analysis_status = '未分析'
+        self._update_name_row(en_name, name_status=name_status,
+                              translated=cn or '', analysis_status=analysis_status)
 
     def _update_stats(self):
         if not self.db:
@@ -238,6 +274,8 @@ class NamePanel:
             return
         if row:
             await self._do_translate_and_analyze(row['original'])
+            # 单条操作结束后强制刷新，确保最终状态可见
+            await self.async_refresh()
 
     async def _on_view_profile(self, e):
         row = e.args
@@ -274,12 +312,12 @@ class NamePanel:
         is_placeholder = en_name.startswith('[') and en_name.endswith(']')
         if is_placeholder:
             self.logger.info(f'占位符 {en_name}，跳过人名翻译，仅分析角色', panel='names')
-            # 占位符直接填入原值作为"翻译"
-            self.db.update_character_cn_name(en_name, en_name)
+            # 占位符直接填入原值作为"翻译"（DB 写入放入线程池，避免阻塞事件循环）
+            await loop.run_in_executor(None, self.db.update_character_cn_name, en_name, en_name)
 
-        # 标记为处理中
+        # 标记为处理中并实时更新该行状态
         self._processing_names.add(en_name)
-        await self.async_refresh()
+        self._update_name_row(en_name, name_status='处理中', analysis_status='处理中')
 
         try:
             # 加载该角色的台词
@@ -305,17 +343,21 @@ class NamePanel:
                 empty_profile = {'性格特征': '该角色没有台词', '说话风格': '无', '背景': '无'}
                 await loop.run_in_executor(None, self.db.save_profile, en_name, empty_profile)
                 self._processing_names.discard(en_name)
-                await self.async_refresh()
+                await self._refresh_name_row(en_name)
                 return
 
-            # 获取人名词典用于参考
-            glossary_text = self.db.get_glossary_for_prompt()
-            char_prompt = self.db.get_characters_for_prompt()
-            dict_text = ""
-            if char_prompt:
-                dict_text += char_prompt + "\n"
-            if glossary_text:
-                dict_text += glossary_text
+            # 获取人名词典用于参考（DB 读取放入线程池）
+            def _load_dict_text():
+                glossary_text = self.db.get_glossary_for_prompt()
+                char_prompt = self.db.get_characters_for_prompt()
+                text = ""
+                if char_prompt:
+                    text += char_prompt + "\n"
+                if glossary_text:
+                    text += glossary_text
+                return text
+
+            dict_text = await loop.run_in_executor(None, _load_dict_text)
 
             # 根据模型上下文动态计算每段台词数
             batch_size = self._calc_batch_size(len(char_lines))
@@ -427,9 +469,9 @@ class NamePanel:
                     cn_name = self._extract_name(result)
                 summaries.append(result)
 
-            # 保存人名翻译（占位符不翻译）
+            # 保存人名翻译（占位符不翻译；DB 写入放入线程池）
             if cn_name and not is_placeholder:
-                self.db.update_character_cn_name(en_name, cn_name)
+                await loop.run_in_executor(None, self.db.update_character_cn_name, en_name, cn_name)
                 self.logger.info(f'人名: {en_name} -> {cn_name}', panel='names')
 
             # 合并所有分析结果
@@ -440,16 +482,16 @@ class NamePanel:
                     profile = await self._merge_summaries(en_name, summaries)
 
                 if profile:
-                    self.db.save_profile(en_name, profile)
+                    await loop.run_in_executor(None, self.db.save_profile, en_name, profile)
                     self.logger.info(f'{en_name} 分析完成', panel='names')
 
             self._processing_names.discard(en_name)
-            await self.async_refresh()
+            await self._refresh_name_row(en_name)
 
         except Exception as e:
             self.logger.error(f'{en_name} 翻译+分析失败: {e}', panel='names')
             self._processing_names.discard(en_name)
-            await self.async_refresh()
+            await self._refresh_name_row(en_name)
 
     async def _merge_summaries(self, name: str, summaries: list[str]) -> dict:
         """合并多段分析结果为最终人物特征"""
@@ -578,11 +620,6 @@ class NamePanel:
                         completed_count += 1
                     except Exception as e:
                         self.logger.error(f'{name} 翻译+分析失败: {e}', panel='names')
-
-                    try:
-                        await self.async_refresh()
-                    except Exception as e:
-                        self.logger.warning(f'刷新表格失败: {e}')
 
                 self.logger.info(f'翻译+分析完成: {completed_count}/{total}', panel='names')
 

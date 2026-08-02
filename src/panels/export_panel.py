@@ -18,7 +18,6 @@ def _safe(fn, *args, **kwargs):
 from database import ProjectDatabase
 from project_manager import ProjectManager
 from logger import TranslationLogger
-from components.log_panel import LogPanel
 
 
 class ExportPanel:
@@ -31,7 +30,7 @@ class ExportPanel:
 
         self.stats_label: ui.label = None
         self.export_btn: ui.button = None
-        self.log_panel: LogPanel = None
+        self.log_panel = None
 
     def set_db(self, db: ProjectDatabase):
         self.db = db
@@ -58,12 +57,6 @@ class ExportPanel:
                     on_click=self._export_game
                 ).classes('px-8')
                 ui.button('🔄 刷新统计', on_click=self.refresh_stats)
-
-            ui.separator()
-            self.log_panel = LogPanel(height='h-64')
-            self.log_panel.build_ui(container, label='导出日志')
-
-            self.logger.bind_ui('export', self.log_panel.get_push_callback())
 
     def refresh(self):
         """同步刷新"""
@@ -120,7 +113,6 @@ class ExportPanel:
         log_queue = Queue()
 
         try:
-            self.log_panel.clear()
             self.logger.info('开始导出游戏...', panel='export')
 
             async def process_log_queue():

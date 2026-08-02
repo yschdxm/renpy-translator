@@ -18,7 +18,6 @@ from translation_service import TranslationService
 from logger import TranslationLogger
 from components.paginated_table import PaginatedTable
 from components.progress_panel import ProgressPanel
-from components.log_panel import LogPanel
 
 
 class TextTranslationPanel:
@@ -39,7 +38,6 @@ class TextTranslationPanel:
 
         self.table: PaginatedTable = None
         self.progress: ProgressPanel = None
-        self.log_panel: LogPanel = None
 
         self.translate_page_btn: ui.button = None
         self.translate_all_btn: ui.button = None
@@ -147,12 +145,6 @@ class TextTranslationPanel:
             self.progress = ProgressPanel()
             self.progress.build_ui(container)
 
-            self.log_panel = LogPanel(height='h-32')
-            self.log_panel.build_ui(container, label=f'{self.title}日志')
-
-            if self.logger:
-                self.logger.bind_ui(self.content_type, self.log_panel.get_push_callback())
-
     # ========== 刷新（和人名面板一致） ==========
 
     def refresh(self):
@@ -168,7 +160,8 @@ class TextTranslationPanel:
         loop = asyncio.get_event_loop()
         counts = await loop.run_in_executor(None, self._get_counts)
         self.table.set_query(self._query_items)
-        _safe(self.table.refresh)
+        # 表格刷新含同步 SQLite 查询，放入线程池避免阻塞事件循环
+        await loop.run_in_executor(None, self.table.refresh)
         _safe(setattr, self.stats_label, 'text', f'📊 总计: {counts["total"]} | ✅ 已翻译: {counts["translated"]}')
 
         if self.show_character and self.char_filter:
@@ -176,6 +169,25 @@ class TextTranslationPanel:
             variable_map = await loop.run_in_executor(None, self.db.get_variable_map)
             options = ['全部'] + [variable_map.get(c, c) for c in characters]
             self.char_filter.set_options(options)
+
+    def _update_row_status(self, item_id: int, status: str = None, translated: str = None):
+        """实时更新当前页中某一行的状态/译文（不重查整页，不阻塞事件循环）"""
+        t = self.table.table if self.table else None
+        if not t:
+            return
+        for row in t.rows:
+            if row.get('index') == item_id:
+                if status is not None:
+                    row['status'] = status
+                if translated is not None:
+                    row['translated'] = translated
+                _safe(t.update)
+                break
+
+    def _get_item(self, item_id: int):
+        if self.content_type == 'ui':
+            return self.db.get_ui_text(item_id)
+        return self.db.get_dialogue(item_id)
 
     def _get_counts(self):
         if self.content_type == 'ui':
@@ -297,6 +309,7 @@ class TextTranslationPanel:
         total = len(to_translate)
         self.logger.info(f'开始翻译当前页 {total} 条 ({self.content_type})', panel=self.content_type)
 
+        loop = asyncio.get_event_loop()
         success = 0
         try:
             for i, row in enumerate(to_translate):
@@ -305,9 +318,9 @@ class TextTranslationPanel:
 
                 self.progress.update(i, total, f'翻译中: {i+1}/{total}')
 
-                # 标记处理中
+                # 标记处理中并实时更新该行状态
                 self._processing_ids.add(row['action'])
-                _safe(self.table.refresh)
+                self._update_row_status(row['action'], status='翻译中')
 
                 try:
                     ok = await self.translation_service.translate_single(
@@ -318,14 +331,18 @@ class TextTranslationPanel:
                     )
                     if ok:
                         success += 1
+                        # 实时回写该行译文
+                        saved = await loop.run_in_executor(None, self._get_item, row['action'])
+                        if saved:
+                            self._update_row_status(
+                                row['action'], status='完成',
+                                translated=saved.get('translated_text', '')
+                            )
                 except Exception as e:
                     self.logger.error(f'翻译失败: {e}', panel=self.content_type)
+                    self._update_row_status(row['action'], status='待翻译')
 
                 self._processing_ids.discard(row['action'])
-                try:
-                    await self.async_refresh()
-                except Exception as e:
-                    self.logger.warning(f'刷新表格失败: {e}')
 
         except Exception as e:
             self.logger.error(f'批量翻译异常中断: {e}', panel=self.content_type)
@@ -395,9 +412,9 @@ class TextTranslationPanel:
 
                 self.progress.update(i, total, f'翻译中: {i+1}/{total}')
 
-                # 标记处理中
+                # 标记处理中并实时更新该行状态
                 self._processing_ids.add(item['id'])
-                _safe(self.table.refresh)
+                self._update_row_status(item['id'], status='翻译中')
 
                 try:
                     ok = await self.translation_service.translate_single(
@@ -408,14 +425,18 @@ class TextTranslationPanel:
                     )
                     if ok:
                         success += 1
+                        # 实时回写该行译文
+                        saved = await loop.run_in_executor(None, self._get_item, item['id'])
+                        if saved:
+                            self._update_row_status(
+                                item['id'], status='完成',
+                                translated=saved.get('translated_text', '')
+                            )
                 except Exception as e:
                     self.logger.error(f'翻译失败: {e}', panel=self.content_type)
+                    self._update_row_status(item['id'], status='待翻译')
 
                 self._processing_ids.discard(item['id'])
-                try:
-                    await self.async_refresh()
-                except Exception as e:
-                    self.logger.warning(f'刷新表格失败: {e}')
 
         except Exception as e:
             self.logger.error(f'批量翻译异常中断: {e}', panel=self.content_type)
