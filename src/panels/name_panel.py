@@ -14,7 +14,7 @@ def _safe(fn, *args, **kwargs):
 
 from database import ProjectDatabase
 from translation_service import TranslationService
-from translator import AITranslator
+from translator import AITranslator, FatalAPIError
 from logger import TranslationLogger
 from components.paginated_table import PaginatedTable
 from components.progress_panel import ProgressPanel
@@ -273,7 +273,11 @@ class NamePanel:
             _safe(ui.notify, '请先配置翻译器', type='warning')
             return
         if row:
-            await self._do_translate_and_analyze(row['original'])
+            try:
+                await self._do_translate_and_analyze(row['original'])
+            except FatalAPIError as e:
+                self.logger.error(f'API 致命错误: {e}', panel='names')
+                _safe(ui.notify, str(e), type='negative', timeout=10000)
             # 单条操作结束后强制刷新，确保最终状态可见
             await self.async_refresh()
 
@@ -488,6 +492,11 @@ class NamePanel:
             self._processing_names.discard(en_name)
             await self._refresh_name_row(en_name)
 
+        except FatalAPIError:
+            # 不可重试的致命错误，向上传递以中止批量任务
+            self._processing_names.discard(en_name)
+            await self._refresh_name_row(en_name)
+            raise
         except Exception as e:
             self.logger.error(f'{en_name} 翻译+分析失败: {e}', panel='names')
             self._processing_names.discard(en_name)
@@ -602,6 +611,11 @@ class NamePanel:
                         try:
                             await self._do_translate_and_analyze(name)
                             completed_count += 1
+                        except FatalAPIError as e:
+                            self.logger.error(f'API 致命错误，批量任务中止: {e}', panel='names')
+                            _safe(ui.notify, str(e), type='negative', timeout=10000)
+                            self._cancel = True
+                            break
                         except Exception as e:
                             self.logger.error(f'{name} 分析失败: {e}', panel='names')
                 else:
@@ -618,6 +632,11 @@ class NamePanel:
                     try:
                         await self._do_translate_and_analyze(name)
                         completed_count += 1
+                    except FatalAPIError as e:
+                        self.logger.error(f'API 致命错误，批量任务中止: {e}', panel='names')
+                        _safe(ui.notify, str(e), type='negative', timeout=10000)
+                        self._cancel = True
+                        break
                     except Exception as e:
                         self.logger.error(f'{name} 翻译+分析失败: {e}', panel='names')
 

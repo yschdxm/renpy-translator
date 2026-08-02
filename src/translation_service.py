@@ -9,7 +9,7 @@ import asyncio
 from typing import Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
-from translator import AITranslator
+from translator import AITranslator, FatalAPIError
 from database import ProjectDatabase
 from logger import TranslationLogger
 
@@ -152,6 +152,9 @@ class TranslationService:
                     self.logger.warning(f"翻译返回空结果: {original_text[:30]}", panel=content_type)
                     return False
 
+            except FatalAPIError:
+                # 不可重试的致命错误（认证失败、余额不足等），向上传递以中止批量任务
+                raise
             except Exception as e:
                 self.logger.error(f"翻译失败: {original_text[:30]} - {e}", panel=content_type)
                 return False

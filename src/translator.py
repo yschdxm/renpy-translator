@@ -1,9 +1,39 @@
 """AI翻译器 - 使用OpenAI兼容接口进行翻译"""
 
 import re
-from typing import List, Optional, Dict, Any
+import time
+from typing import List, Optional, Dict, Any, Callable
+import openai
 from openai import OpenAI
 from dataclasses import dataclass
+
+
+class FatalAPIError(Exception):
+    """不可重试的 API 错误（认证失败、余额不足等），批量任务应立即中止"""
+
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(message)
+
+
+# 致命错误码（不可重试）及中文说明
+_FATAL_REASONS = {
+    400: '请求格式错误（请检查模型名称是否正确、参数是否合法、消息格式是否符合接口要求）',
+    401: 'API Key 无效或认证失败（请检查 API Key 与 Base URL 是否匹配、请求头格式是否正确）',
+    402: '账户余额不足，请及时充值',
+    403: '拒绝访问（服务暂不支持当前地区，或 API Key 被风控，请尝试新建 API Key）',
+    404: '接口或模型不存在（请检查模型名称与 Base URL 是否正确）',
+}
+
+# 可重试错误码及中文说明
+_RETRYABLE_REASONS = {
+    421: '内容审核拦截',
+    429: '请求频率超限',
+    500: '服务器内部故障',
+    502: '网关错误',
+    503: '服务器负载过高',
+    504: '网关超时',
+}
 
 
 @dataclass
@@ -21,6 +51,8 @@ class TranslationConfig:
 class AITranslator:
     """AI翻译器"""
 
+    MAX_RETRIES = 5  # 可重试错误的最大尝试次数
+
     def __init__(self, config: TranslationConfig):
         self.config = config
         self.client: Optional[OpenAI] = None
@@ -32,12 +64,52 @@ class AITranslator:
         if self.config.api_key:
             self.client = OpenAI(
                 api_key=self.config.api_key,
-                base_url=self.config.api_base
+                base_url=self.config.api_base,
+                max_retries=0,  # 关闭 SDK 自带重试，由 _call_api 统一控制
             )
 
     def update_config(self, config: TranslationConfig):
         self.config = config
         self._init_client()
+
+    def _call_api(self, messages: list, temperature: float, max_tokens: int) -> str:
+        """统一的 API 调用：按错误码分类处理
+
+        - 致命错误（400/401/402/403/404）：抛出 FatalAPIError，批量任务应立即中止
+        - 可重试错误（421/429/5xx/超时/连接错误/空内容拦截）：指数退避重试，最多 MAX_RETRIES 次
+        - 重试耗尽：抛出普通异常，调用方记失败并跳过该条目
+        """
+        reason = '未知错误'
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=self.config.timeout,
+                )
+                content = response.choices[0].message.content
+                if content is not None:
+                    return content.strip()
+                # 内容审核拦截时部分服务返回空内容，按可重试错误处理
+                reason = '内容审核拦截（返回空内容）'
+            except openai.APIStatusError as e:
+                code = e.status_code
+                if code in _FATAL_REASONS:
+                    raise FatalAPIError(code, f'API 错误 {code}：{_FATAL_REASONS[code]}') from e
+                reason = _RETRYABLE_REASONS.get(code, f'HTTP {code} 错误')
+            except openai.APITimeoutError:
+                reason = '请求超时'
+            except openai.APIConnectionError:
+                reason = '网络连接错误'
+
+            if attempt < self.MAX_RETRIES:
+                delay = min(2 ** attempt, 30)
+                print(f'[API] {reason}，{delay} 秒后进行第 {attempt + 1}/{self.MAX_RETRIES} 次尝试...')
+                time.sleep(delay)
+
+        raise Exception(f'API 调用失败（已重试 {self.MAX_RETRIES} 次）：{reason}')
 
     def _build_system_prompt(self, character: str = "",
                               glossary_text: str = "",
@@ -173,30 +245,22 @@ class AITranslator:
             print(f'[翻译] 用户提示词:\n{user_prompt}')
             print(f'{"="*50}\n')
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                timeout=self.config.timeout
-            )
+        raw = self._call_api(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        )
+        translated, terms = self._parse_translation_response(raw)
 
-            raw = response.choices[0].message.content.strip()
-            translated, terms = self._parse_translation_response(raw)
+        if debug:
+            print(f'[翻译] 翻译结果: {translated}')
+            if terms:
+                print(f'[翻译] 术语: {terms}')
 
-            if debug:
-                print(f'[翻译] 翻译结果: {translated}')
-                if terms:
-                    print(f'[翻译] 术语: {terms}')
-
-            return translated, terms
-
-        except Exception as e:
-            raise Exception(f"翻译失败: {str(e)}")
+        return translated, terms
 
     @staticmethod
     def _parse_translation_response(raw: str) -> tuple[str, list[dict]]:
@@ -270,31 +334,20 @@ class AITranslator:
             print(f'[人名翻译] 原文: {name}')
             print(f'{"="*50}\n')
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=self.config.max_tokens,
-                timeout=self.config.timeout
-            )
+        raw = self._call_api(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=self.config.max_tokens,
+        )
+        result = raw.replace('"', '').replace("'", '').replace('。', '')
 
-            result = response.choices[0].message.content
-            if result:
-                result = result.strip().replace('"', '').replace("'", '').replace('。', '')
-            else:
-                result = ''
+        if debug:
+            print(f'[人名翻译] 翻译结果: {result}')
 
-            if debug:
-                print(f'[人名翻译] 翻译结果: {result}')
-
-            return result
-
-        except Exception as e:
-            raise Exception(f"人名翻译失败: {str(e)}")
+        return result
 
     def translate_ui(self, text: str, glossary_text: str = "",
                      character_dict: Dict[str, str] = None,
@@ -348,24 +401,16 @@ class AITranslator:
         if self.prompt_callback:
             self.prompt_callback(system_prompt, user_prompt, 'ui')
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=self.config.max_tokens,
-                timeout=self.config.timeout
-            )
-
-            raw = response.choices[0].message.content.strip()
-            translated, terms = self._parse_translation_response(raw)
-            return translated, terms
-
-        except Exception as e:
-            raise Exception(f"UI翻译失败: {str(e)}")
+        raw = self._call_api(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=self.config.max_tokens,
+        )
+        translated, terms = self._parse_translation_response(raw)
+        return translated, terms
 
     def analyze_text(self, prompt: str) -> str:
         """分析文本（不使用翻译系统提示词）"""
@@ -380,22 +425,14 @@ class AITranslator:
         if self.prompt_callback:
             self.prompt_callback(system_prompt, prompt, 'analysis')
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                timeout=self.config.timeout
-            )
-
-            return response.choices[0].message.content.strip()
-
-        except Exception as e:
-            raise Exception(f"分析失败: {str(e)}")
+        return self._call_api(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        )
 
     def test_connection(self) -> Dict[str, Any]:
         """测试API连接"""
@@ -403,18 +440,16 @@ class AITranslator:
             return {'success': False, 'error': '请先配置API Key'}
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
+            content = self._call_api(
                 messages=[{"role": "user", "content": "Hello, this is a test."}],
-                max_tokens=10
+                temperature=0.0,
+                max_tokens=10,
             )
-
             return {
                 'success': True,
                 'model': self.config.model,
-                'response': response.choices[0].message.content
+                'response': content
             }
-
         except Exception as e:
             return {'success': False, 'error': str(e)}
 

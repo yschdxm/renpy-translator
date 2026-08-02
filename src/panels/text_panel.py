@@ -15,6 +15,7 @@ def _safe(fn, *args, **kwargs):
 
 from database import ProjectDatabase
 from translation_service import TranslationService
+from translator import FatalAPIError
 from logger import TranslationLogger
 from components.paginated_table import PaginatedTable
 from components.progress_panel import ProgressPanel
@@ -280,6 +281,11 @@ class TextTranslationPanel:
             self._processing_ids.discard(item_id)
             await self.async_refresh()
 
+        except FatalAPIError as e:
+            self.logger.error(f'API 致命错误: {e}', panel=self.content_type)
+            _safe(ui.notify, str(e), type='negative', timeout=10000)
+            self._processing_ids.discard(item_id)
+            await self.async_refresh()
         except Exception as e:
             self.logger.error(f'翻译失败: {e}', panel=self.content_type)
             self._processing_ids.discard(item_id)
@@ -338,6 +344,13 @@ class TextTranslationPanel:
                                 row['action'], status='完成',
                                 translated=saved.get('translated_text', '')
                             )
+                except FatalAPIError as e:
+                    # 不可重试的致命错误，中止整个批量任务
+                    self.logger.error(f'API 致命错误，批量翻译中止: {e}', panel=self.content_type)
+                    _safe(ui.notify, str(e), type='negative', timeout=10000)
+                    self._update_row_status(row['action'], status='待翻译')
+                    self._cancel = True
+                    break
                 except Exception as e:
                     self.logger.error(f'翻译失败: {e}', panel=self.content_type)
                     self._update_row_status(row['action'], status='待翻译')
@@ -432,6 +445,13 @@ class TextTranslationPanel:
                                 item['id'], status='完成',
                                 translated=saved.get('translated_text', '')
                             )
+                except FatalAPIError as e:
+                    # 不可重试的致命错误，中止整个批量任务
+                    self.logger.error(f'API 致命错误，批量翻译中止: {e}', panel=self.content_type)
+                    _safe(ui.notify, str(e), type='negative', timeout=10000)
+                    self._update_row_status(item['id'], status='待翻译')
+                    self._cancel = True
+                    break
                 except Exception as e:
                     self.logger.error(f'翻译失败: {e}', panel=self.content_type)
                     self._update_row_status(item['id'], status='待翻译')
