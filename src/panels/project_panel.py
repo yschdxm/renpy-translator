@@ -471,6 +471,34 @@ class ProjectPanel:
         result = await loop.run_in_executor(None, _parse)
         progress_bar.value = 0.50
 
+        # 步骤3.5: 检测官方中文翻译，弹窗确认后删除（否则与 SDK 模板重复入库）
+        # 必须在解包后（官中可能在 rpa 里）、SDK 生成前检测
+        official_tl = await loop.run_in_executor(
+            None, self._detect_official_chinese, game_work_dir
+        )
+        if official_tl:
+            progress_label.text = '检测到游戏自带中文翻译...'
+            use_sdk = await self._confirm_remove_official_chinese(official_tl)
+            if not use_sdk:
+                # 用户取消：先关闭 db 连接，再删除已生成的项目目录，优雅退出
+                progress_label.text = '已取消创建'
+                await loop.run_in_executor(None, db.close)
+                await loop.run_in_executor(
+                    None, self.project_manager.delete_project, name
+                )
+                await asyncio.sleep(1)
+                progress_dialog.close()
+                _safe(ui.notify, '已取消创建（检测到游戏自带中文翻译）', type='info')
+                self.logger.info('用户取消创建：检测到游戏自带中文翻译', panel='projects')
+                return
+            progress_label.text = '正在删除官方中文翻译...'
+            await asyncio.sleep(0)
+            await loop.run_in_executor(
+                None, self._remove_official_chinese, game_work_dir
+            )
+            self.logger.info(f'已删除官方中文翻译（{official_tl} 个文件）', panel='projects')
+            progress_bar.value = 0.50
+
         # 步骤4: SDK 生成翻译文件
         sdk_path = self.get_sdk_path() if self.get_sdk_path else ''
         if sdk_path:
@@ -589,6 +617,80 @@ class ProjectPanel:
 
         if self.on_project_open:
             await self.on_project_open(name)
+
+    # ========== 官方中文翻译检测与删除 ==========
+
+    # 中文相关语言目录名（小写匹配）
+    _CHINESE_LANG_NAMES = {
+        'chinese', 'zh', 'ch', 'chs', 'cht', 'zhs', 'zht',
+        'schinese', 'tchinese', 'cn', 'zh-cn', 'zh-tw', 'zh-hans', 'zh-hant',
+        'simplified_chinese', 'traditional_chinese',
+    }
+
+    def _detect_official_chinese(self, game_work_dir: Path) -> int:
+        """检测游戏 tl 目录下是否已有中文相关翻译目录（同步，在线程池中调用）
+
+        解压后、SDK 生成前调用。tl 下若存在中文相关目录（Chinese/zh/ch/zhs 等）
+        且其中有 .rpy，即判定存在官中/第三方汉化。
+        返回中文目录中的 .rpy 文件数，0 表示无官中。
+        """
+        tl_root = game_work_dir / 'game' / 'tl'
+        if not tl_root.exists():
+            return 0
+        count = 0
+        for lang_dir in tl_root.iterdir():
+            if not lang_dir.is_dir():
+                continue
+            if lang_dir.name.lower() in self._CHINESE_LANG_NAMES:
+                count += sum(1 for _ in lang_dir.rglob('*.rpy'))
+        return count
+
+    async def _confirm_remove_official_chinese(self, file_count: int) -> bool:
+        """弹窗询问是否删除官方中文翻译，返回用户选择（True=删除并用SDK模板）"""
+        import asyncio as _aio
+        result = _aio.Event()
+        choice = {'ok': False}
+
+        with ui.dialog() as dlg, ui.card().classes('w-full max-w-lg'):
+            ui.label('⚠️ 检测到游戏自带中文翻译').classes('text-h6')
+            ui.label(
+                f'该游戏的 tl 目录下已存在中文翻译（{file_count} 个文件），'
+                '可能是官方中文或第三方汉化。\n\n'
+                '如果保留，其中的译文会与 SDK 生成的待翻译模板重复导入，'
+                '导致对话条目翻倍、翻译混乱。\n\n'
+                '建议删除该中文目录，使用 SDK 模板重新翻译。'
+            ).classes('text-body2').style('white-space: pre-line')
+
+            with ui.row().classes('gap-2 mt-4'):
+                ui.button('取消创建', on_click=lambda: (choice.update(ok=False),
+                                                       result.set(), dlg.close()))
+                ui.button('删除并继续', color='negative',
+                          on_click=lambda: (choice.update(ok=True),
+                                            result.set(), dlg.close()))
+
+        dlg.props('persistent')
+        dlg.open()
+        await result.wait()
+        return choice['ok']
+
+    def _remove_official_chinese(self, game_work_dir: Path):
+        """删除 tl 下的中文相关翻译目录（同步，在线程池中调用）
+
+        整个删除中文目录（含 .rpy/.rpyc/图片等），SDK 之后会重建干净的模板目录。
+        """
+        import shutil as _shutil
+        tl_root = game_work_dir / 'game' / 'tl'
+        if not tl_root.exists():
+            return
+        for lang_dir in tl_root.iterdir():
+            if not lang_dir.is_dir():
+                continue
+            if lang_dir.name.lower() in self._CHINESE_LANG_NAMES:
+                try:
+                    _shutil.rmtree(lang_dir)
+                    self.logger.info(f'已删除中文翻译目录: tl/{lang_dir.name}', panel='projects')
+                except OSError as e:
+                    self.logger.warning(f'删除中文目录失败 {lang_dir.name}: {e}', panel='projects')
 
     # ========== 解析翻译文件（纯同步，在线程池中调用） ==========
 
