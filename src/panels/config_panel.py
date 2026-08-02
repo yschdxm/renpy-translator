@@ -36,6 +36,8 @@ class ConfigPanel:
         self.max_tokens: ui.number = None
         self.context_lines: ui.number = None
         self.max_context: ui.number = None
+        self.timeout: ui.number = None
+        self.batch_lines: ui.number = None
 
         # SDK 组件
         self.sdk_path_input: ui.input = None
@@ -69,6 +71,8 @@ class ConfigPanel:
                     self.max_tokens = ui.number(label='最大输出Token数', value=4096, min=1)
                     self.context_lines = ui.number(label='翻译上下文行数', value=3, min=0)
                     self.max_context = ui.number(label='模型最大上下文(K)', value=8, min=1)
+                    self.timeout = ui.number(label='请求超时(秒)', value=300, min=10)
+                    self.batch_lines = ui.number(label='每批翻译句数', value=100, min=1)
 
                 with ui.row().classes('gap-2'):
                     ui.button('💾 保存配置', color='primary', on_click=self._save_config)
@@ -131,7 +135,11 @@ class ConfigPanel:
             temperature=float(self.temp_slider.value),
             max_tokens=int(self.max_tokens.value),
             context_lines=int(self.context_lines.value),
-            max_context=int(self.max_context.value or 8)
+            max_context=int(self.max_context.value or 8),
+            timeout=int(self.timeout.value or 300),
+            batch_lines=int(self.batch_lines.value or 100),
+            sdk_path=self.get_sdk_path() or getattr(
+                self.config_manager.get_config_by_name(name), 'sdk_path', '')
         )
 
         existing = self.config_manager.get_config_by_name(name)
@@ -159,6 +167,8 @@ class ConfigPanel:
         self.max_tokens.value = config.max_tokens
         self.context_lines.value = config.context_lines
         self.max_context.value = getattr(config, 'max_context', 8)
+        self.timeout.value = getattr(config, 'timeout', 300)
+        self.batch_lines.value = getattr(config, 'batch_lines', 100)
 
         _safe(ui.notify,f'已加载配置: {name}', type='info')
 
@@ -243,6 +253,7 @@ class ConfigPanel:
             model=config.model,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
-            context_lines=config.context_lines
+            context_lines=config.context_lines,
+            timeout=config.timeout
         )
         return AITranslator(trans_config)

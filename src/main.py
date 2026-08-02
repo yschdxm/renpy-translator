@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -59,10 +60,10 @@ class App:
         self.translator: AITranslator = None
         self.translation_service: TranslationService = None
 
-        # 提示词日志（环境变量 PROMPT_LOG 控制，默认关闭）
-        self._prompt_log_enabled = os.environ.get('PROMPT_LOG', '').lower() in ('1', 'true', 'yes', 'on')
-        self._prompt_log_path = Path(__file__).parent.parent / 'logs' / 'prompt.log'
-        self._prompt_log_lock = threading.Lock()
+        # API 请求/返回体日志（环境变量 API_LOG 控制，默认关闭）
+        self._api_log_enabled = os.environ.get('API_LOG', '').lower() in ('1', 'true', 'yes', 'on')
+        self._api_log_path = Path(__file__).parent.parent / 'logs' / 'api.log'
+        self._api_log_lock = threading.Lock()
 
         self.project_panel = ProjectPanel(
             project_manager=self.project_manager,
@@ -238,16 +239,18 @@ class App:
             )
 
         if self.translator:
-            self.translator.prompt_callback = self._on_prompt
+            self.translator.api_log_callback = self._on_api_log
 
         # 获取模型配置
         max_context_k = 8
         max_tokens = 1000
+        batch_lines = 100
         if model_name:
             model_config = self.config_manager.get_config_by_name(model_name)
             if model_config:
                 max_context_k = getattr(model_config, 'max_context', 8)
                 max_tokens = getattr(model_config, 'max_tokens', 1000)
+                batch_lines = getattr(model_config, 'batch_lines', 100)
 
         if self.translator:
             self.translation_service = TranslationService(
@@ -256,7 +259,20 @@ class App:
                 logger=self.logger,
                 max_context_k=max_context_k,
                 max_tokens=max_tokens,
+                batch_lines=batch_lines,
             )
+            # 每次批量翻译前重读模型配置，配置面板保存后立即生效
+            def _service_config_provider():
+                if not self.db:
+                    return None
+                name = self.db.get_meta('model_config_name')
+                mc = self.config_manager.get_config_by_name(name) if name else None
+                if not mc:
+                    return None
+                return (getattr(mc, 'max_context', 8),
+                        getattr(mc, 'max_tokens', 1000),
+                        getattr(mc, 'batch_lines', 100))
+            self.translation_service.config_provider = _service_config_provider
         else:
             self.translation_service = None
 
@@ -312,31 +328,32 @@ class App:
         if self._task_states.get('dialogue'):
             self.dialogue_panel._set_buttons_translating(True)
 
-    def _on_prompt(self, system_prompt: str, user_prompt: str, task_type: str):
-        """提示词回调：写入独立的提示词日志文件（完整内容，不截断）
+    def _on_api_log(self, request_body: dict, response_body: dict, task_type: str):
+        """API 日志回调：将完整请求体和返回体写入日志文件（不截断）
 
-        由环境变量 PROMPT_LOG 控制开关，默认关闭。
+        由环境变量 API_LOG 控制开关，默认关闭。
         注意：该回调在翻译线程中触发，文件写入需加锁。
         """
-        if not self._prompt_log_enabled:
+        if not self._api_log_enabled:
             return
-        type_labels = {'name': '人名翻译', 'ui': '字符串翻译', 'dialogue': '对话翻译', 'analysis': '分析'}
+        type_labels = {'name': '人名翻译', 'ui': '字符串翻译', 'dialogue': '对话翻译',
+                       'analysis': '分析', 'test': '连接测试'}
         label = type_labels.get(task_type, task_type)
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         entry = (
             f'{"=" * 70}\n'
             f'[{timestamp}] {label}\n'
             f'{"=" * 70}\n'
-            f'[系统]\n{system_prompt}\n\n'
-            f'[用户]\n{user_prompt}\n\n'
+            f'[请求体]\n{json.dumps(request_body, ensure_ascii=False, indent=2)}\n\n'
+            f'[返回体]\n{json.dumps(response_body, ensure_ascii=False, indent=2)}\n\n'
         )
-        with self._prompt_log_lock:
+        with self._api_log_lock:
             try:
-                self._prompt_log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self._prompt_log_path, 'a', encoding='utf-8') as f:
+                self._api_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._api_log_path, 'a', encoding='utf-8') as f:
                     f.write(entry)
             except OSError as e:
-                print(f'[提示词日志] 写入失败: {e}')
+                print(f'[API日志] 写入失败: {e}')
 
 
 _app_instance = None

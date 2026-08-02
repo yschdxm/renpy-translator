@@ -185,10 +185,21 @@ class TextTranslationPanel:
                 _safe(t.update)
                 break
 
-    def _get_item(self, item_id: int):
-        if self.content_type == 'ui':
-            return self.db.get_ui_text(item_id)
-        return self.db.get_dialogue(item_id)
+    def _update_rows(self, status_map: dict, translated_map: dict = None):
+        """批量更新当前页中多行的状态/译文（合并为一次 table.update）"""
+        t = self.table.table if self.table else None
+        if not t:
+            return
+        changed = False
+        for row in t.rows:
+            rid = row.get('index')
+            if rid in status_map:
+                row['status'] = status_map[rid]
+                if translated_map and rid in translated_map:
+                    row['translated'] = translated_map[rid]
+                changed = True
+        if changed:
+            _safe(t.update)
 
     def _get_counts(self):
         if self.content_type == 'ui':
@@ -300,11 +311,23 @@ class TextTranslationPanel:
             return
 
         items = self.table.get_page_items()
-        to_translate = [item for item in items if item.get('status') != '完成']
+        to_translate_rows = [item for item in items if item.get('status') != '完成']
 
-        if not to_translate:
+        if not to_translate_rows:
             _safe(ui.notify, '当前页已全部翻译', type='info')
             return
+
+        # 表格行映射为翻译条目
+        to_translate = []
+        for row in to_translate_rows:
+            char = row.get('character', '') or ''
+            if char == '旁白':
+                char = ''
+            to_translate.append({
+                'id': row['action'],
+                'original_text': row.get('original', ''),
+                'character': char,
+            })
 
         self._cancel = False
         _safe(self.translate_page_btn.set_visibility, False)
@@ -315,47 +338,37 @@ class TextTranslationPanel:
         total = len(to_translate)
         self.logger.info(f'开始翻译当前页 {total} 条 ({self.content_type})', panel=self.content_type)
 
-        loop = asyncio.get_event_loop()
         success = 0
         try:
-            for i, row in enumerate(to_translate):
+            batches = await self.translation_service.prepare_batches(to_translate, self.content_type)
+            processed = 0
+            for batch in batches:
                 if self._cancel:
                     break
 
-                self.progress.update(i, total, f'翻译中: {i+1}/{total}')
+                self.progress.update(processed, total, f'翻译中: {processed}/{total}')
 
-                # 标记处理中并实时更新该行状态
-                self._processing_ids.add(row['action'])
-                self._update_row_status(row['action'], status='翻译中')
+                # 批内所有行标记为翻译中（一次表格更新）
+                batch_ids = [it['id'] for it in batch]
+                self._processing_ids.update(batch_ids)
+                self._update_rows({i: '翻译中' for i in batch_ids})
 
                 try:
-                    ok = await self.translation_service.translate_single(
-                        item_id=row['action'],
-                        content_type=self.content_type,
-                        original_text=row.get('original', ''),
-                        character=row.get('character', ''),
-                    )
-                    if ok:
-                        success += 1
-                        # 实时回写该行译文
-                        saved = await loop.run_in_executor(None, self._get_item, row['action'])
-                        if saved:
-                            self._update_row_status(
-                                row['action'], status='完成',
-                                translated=saved.get('translated_text', '')
-                            )
+                    results = await self.translation_service.translate_batch(batch, self.content_type)
                 except FatalAPIError as e:
                     # 不可重试的致命错误，中止整个批量任务
                     self.logger.error(f'API 致命错误，批量翻译中止: {e}', panel=self.content_type)
                     _safe(ui.notify, str(e), type='negative', timeout=10000)
-                    self._update_row_status(row['action'], status='待翻译')
+                    self._update_rows({i: '待翻译' for i in batch_ids})
                     self._cancel = True
                     break
-                except Exception as e:
-                    self.logger.error(f'翻译失败: {e}', panel=self.content_type)
-                    self._update_row_status(row['action'], status='待翻译')
 
-                self._processing_ids.discard(row['action'])
+                # 批完成：回写译文 + 状态（一次表格更新）
+                status_map = {i: ('完成' if i in results else '待翻译') for i in batch_ids}
+                self._update_rows(status_map, translated_map=results)
+                success += len(results)
+                processed += len(batch)
+                self._processing_ids.difference_update(batch_ids)
 
         except Exception as e:
             self.logger.error(f'批量翻译异常中断: {e}', panel=self.content_type)
@@ -419,44 +432,37 @@ class TextTranslationPanel:
 
         success = 0
         try:
-            for i, item in enumerate(to_translate):
+            # 按句数（≤100）与 token 上限（输入+输出不超窗口）动态分组
+            batches = await self.translation_service.prepare_batches(to_translate, self.content_type)
+            self.logger.info(f'共 {total} 条，分为 {len(batches)} 个批次', panel=self.content_type)
+            processed = 0
+            for batch in batches:
                 if self._cancel:
                     break
 
-                self.progress.update(i, total, f'翻译中: {i+1}/{total}')
+                self.progress.update(processed, total, f'翻译中: {processed}/{total}')
 
-                # 标记处理中并实时更新该行状态
-                self._processing_ids.add(item['id'])
-                self._update_row_status(item['id'], status='翻译中')
+                # 批内所有行标记为翻译中（一次表格更新）
+                batch_ids = [it['id'] for it in batch]
+                self._processing_ids.update(batch_ids)
+                self._update_rows({i: '翻译中' for i in batch_ids})
 
                 try:
-                    ok = await self.translation_service.translate_single(
-                        item_id=item['id'],
-                        content_type=self.content_type,
-                        original_text=item.get('original_text', ''),
-                        character=item.get('character', ''),
-                    )
-                    if ok:
-                        success += 1
-                        # 实时回写该行译文
-                        saved = await loop.run_in_executor(None, self._get_item, item['id'])
-                        if saved:
-                            self._update_row_status(
-                                item['id'], status='完成',
-                                translated=saved.get('translated_text', '')
-                            )
+                    results = await self.translation_service.translate_batch(batch, self.content_type)
                 except FatalAPIError as e:
                     # 不可重试的致命错误，中止整个批量任务
                     self.logger.error(f'API 致命错误，批量翻译中止: {e}', panel=self.content_type)
                     _safe(ui.notify, str(e), type='negative', timeout=10000)
-                    self._update_row_status(item['id'], status='待翻译')
+                    self._update_rows({i: '待翻译' for i in batch_ids})
                     self._cancel = True
                     break
-                except Exception as e:
-                    self.logger.error(f'翻译失败: {e}', panel=self.content_type)
-                    self._update_row_status(item['id'], status='待翻译')
 
-                self._processing_ids.discard(item['id'])
+                # 批完成：回写译文 + 状态（一次表格更新）
+                status_map = {i: ('完成' if i in results else '待翻译') for i in batch_ids}
+                self._update_rows(status_map, translated_map=results)
+                success += len(results)
+                processed += len(batch)
+                self._processing_ids.difference_update(batch_ids)
 
         except Exception as e:
             self.logger.error(f'批量翻译异常中断: {e}', panel=self.content_type)
