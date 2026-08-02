@@ -60,6 +60,7 @@ class App:
             project_manager=self.project_manager,
             logger=self.logger,
             on_project_open=self._open_project,
+            on_project_close=self._close_project,
             get_sdk_path=lambda: self.config_panel.get_sdk_path() if hasattr(self, 'config_panel') else '',
             get_model_names=lambda: self.config_manager.get_config_names(),
         )
@@ -196,6 +197,21 @@ class App:
         options = {p.name: p.name for p in projects}
         self.header_project_select.options = options
         safe_ui(self.header_project_select.update)
+
+    async def _close_project(self, name: str):
+        """关闭当前打开的项目（删除项目前调用，释放数据库连接）"""
+        if not self.db or app.storage.user.get('current_project') != name:
+            return
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.db.close)
+        self.db = None
+        self.translator = None
+        self.translation_service = None
+        self.name_panel.set_db(None)
+        self.strings_panel.set_db(None)
+        self.dialogue_panel.set_db(None)
+        self.export_panel.set_db(None)
+        app.storage.user.pop('current_project', None)
 
     async def _open_project(self, name: str, switch_to_names: bool = True):
         loop = asyncio.get_event_loop()

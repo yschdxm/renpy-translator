@@ -32,11 +32,13 @@ class ProjectPanel:
     def __init__(self, project_manager: ProjectManager,
                  logger: TranslationLogger,
                  on_project_open: callable = None,
+                 on_project_close: callable = None,
                  get_sdk_path: callable = None,
                  get_model_names: callable = None):
         self.project_manager = project_manager
         self.logger = logger
         self.on_project_open = on_project_open
+        self.on_project_close = on_project_close
         self.get_sdk_path = get_sdk_path
         self.get_model_names = get_model_names
 
@@ -600,7 +602,7 @@ class ProjectPanel:
                         dialogue_lines.append(line)
 
                 if dialogue_lines:
-                    self._parse_dialogue_blocks(dialogue_lines, tl_file, game_path, dialogues)
+                    self._parse_dialogue_blocks(dialogue_lines, tl_file, game_path, dialogues, ui_texts)
                 if strings_lines:
                     self._parse_strings_block(strings_lines, tl_file, game_path, ui_texts)
             except Exception as e:
@@ -608,7 +610,7 @@ class ProjectPanel:
 
         return {'dialogues': dialogues, 'ui_texts': ui_texts}
 
-    def _parse_dialogue_blocks(self, lines, tl_file, game_path, dialogues):
+    def _parse_dialogue_blocks(self, lines, tl_file, game_path, dialogues, ui_texts):
         """解析对话格式的翻译块，提取 label 归属"""
         import re
         current_file = str(tl_file.relative_to(tl_file.parent.parent.parent))
@@ -663,7 +665,9 @@ class ProjectPanel:
                     'character': character, 'original_text': text,
                     'translated_text': '', 'is_translated': False,
                 }
-                if any(f in current_file for f in ['screens', 'gui', 'options', 'common']):
+                # 只按文件名判断是否为界面文本文件，避免目录名（如 *_screens/）误判
+                file_name = current_file.replace('\\', '/').rsplit('/', 1)[-1]
+                if any(f in file_name for f in ['screens', 'gui', 'options', 'common']):
                     ui_texts.append(entry)
                 else:
                     dialogues.append(entry)
@@ -895,6 +899,10 @@ class ProjectPanel:
         """删除项目的完整流程（async handler，slot 上下文保留）"""
         confirm_dialog.close()
         await asyncio.sleep(0)
+
+        # 若删除的是当前打开的项目，先关闭其数据库连接，避免文件被占用
+        if self.on_project_close:
+            await self.on_project_close(name)
 
         # 创建进度对话框
         with ui.dialog() as progress_dialog, ui.card().classes('w-96'):

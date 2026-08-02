@@ -64,12 +64,10 @@ class RenpyParser:
 
     # 角色定义模式
     CHARACTER_PATTERNS = [
-        # define e = Character("Eileen")
-        r'^define\s+(\w+)\s*=\s*Character\("([^"]+)"\)',
-        # define e = Character("Eileen", color="#c8ffc8")
-        r'^define\s+(\w+)\s*=\s*Character\("([^"]+)".*\)',
-        # e = Character("Eileen")
-        r'^(\w+)\s*=\s*Character\("([^"]+)"\)',
+        # define e = Character("Eileen") / Character(_("Eileen"))
+        r'^define\s+(\w+)\s*=\s*Character\((?:_\()?"([^"]+)"',
+        # e = Character("Eileen") / e = Character(_("Eileen"))
+        r'^(\w+)\s*=\s*Character\((?:_\()?"([^"]+)"',
     ]
 
     # 界面文字模式（screens.rpy中的字符串）
