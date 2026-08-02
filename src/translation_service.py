@@ -79,6 +79,35 @@ class TranslationService:
             parts.append(glossary)
         return "\n\n".join(parts) if parts else ""
 
+    def _get_style_guide(self) -> str:
+        """获取作品风格指南（同步，在线程池中调用）"""
+        return self.db.get_meta('style_guide')
+
+    # 角色特征注入优先级：语气相关的排前面，其余截断避免稀释
+    _PROFILE_PRIORITY = ['说话风格', '翻译建议', '口癖', '称谓', '语气']
+    _PROFILE_FIELD_MAX = 300  # 非优先字段的最大字符数
+
+    @classmethod
+    def _format_character_profiles(cls, chars: list, get_profile) -> str:
+        """汇总批内角色特征，按语气相关度排序注入"""
+        parts = []
+        for c in chars:
+            profile = get_profile(c)
+            if not profile:
+                continue
+            priority, rest = [], []
+            for k, v in profile.items():
+                if not v:
+                    continue
+                line = f"- {k}：{v}"
+                if any(p in k for p in cls._PROFILE_PRIORITY):
+                    priority.append(line)
+                else:
+                    rest.append(line[:cls._PROFILE_FIELD_MAX])
+            lines = priority + rest
+            parts.append(f"[{c}] 人物特征：\n" + "\n".join(lines))
+        return "\n\n".join(parts)
+
     # ===== 批次翻译 =====
 
     _BATCH_FIXED_CHARS = 3000  # 系统提示词模板 + 用户提示词模板/格式说明 + 前文参考 的估算开销
@@ -143,23 +172,18 @@ class TranslationService:
             return {}
         loop = asyncio.get_event_loop()
 
-        # 术语表 + 人名表（每批一次，不再每句一次）
+        # 术语表 + 人名表 + 风格指南（每批一次，不再每句一次）
         glossary_text = await loop.run_in_executor(None, self._get_glossary_text)
+        style_guide = await loop.run_in_executor(None, self._get_style_guide)
 
         # 批内角色特征汇总（仅对话）
         character_profiles = ""
         if content_type == 'dialogue':
             chars = sorted({it.get('character', '') for it in items if it.get('character')})
             if chars:
-                def _get_profiles():
-                    parts = []
-                    for c in chars:
-                        profile = self.db.get_profile(c)
-                        if profile:
-                            lines = [f"- {k}：{v}" for k, v in profile.items() if v]
-                            parts.append(f"[{c}] 人物特征：\n" + "\n".join(lines))
-                    return "\n\n".join(parts)
-                character_profiles = await loop.run_in_executor(None, _get_profiles)
+                character_profiles = await loop.run_in_executor(
+                    None, lambda: self._format_character_profiles(chars, self.db.get_profile)
+                )
 
         # 前文上下文（取批内首条；批内句子互为上下文，取消后文参考）
         context_count = min(self._calc_context_count(glossary_text, character_profiles), 8)
@@ -180,6 +204,7 @@ class TranslationService:
                         glossary_text=glossary_text,
                         character_profiles=character_profiles,
                         context_before=context_before,
+                        style_guide=style_guide,
                         context_window_tokens=self.max_context_k * 1024,
                     )
                 )
@@ -228,8 +253,9 @@ class TranslationService:
         async with self._semaphore:
             loop = asyncio.get_event_loop()
             try:
-                # 获取术语表 + 人名表
+                # 获取术语表 + 人名表 + 风格指南
                 glossary_text = await loop.run_in_executor(None, self._get_glossary_text)
+                style_guide = await loop.run_in_executor(None, self._get_style_guide)
 
                 # 获取角色特征（对话翻译时）
                 character_profile = ""
@@ -264,6 +290,7 @@ class TranslationService:
                         character_profile=character_profile,
                         context_before=context_before,
                         context_after=context_after,
+                        style_guide=style_guide,
                     )
                 )
 
@@ -317,7 +344,8 @@ class TranslationService:
                             glossary_text: str = "",
                             character_profile: str = "",
                             context_before: list = None,
-                            context_after: list = None):
+                            context_after: list = None,
+                            style_guide: str = ""):
         """在线程池中执行的单条翻译（同步方法）
 
         返回：
@@ -330,7 +358,7 @@ class TranslationService:
             )
         elif content_type == 'ui':
             return self.translator.translate_ui(
-                text, glossary_text=glossary_text, debug=False
+                text, glossary_text=glossary_text, style_guide=style_guide, debug=False
             )
         elif content_type == 'dialogue':
             return self.translator.translate_text(
@@ -340,6 +368,7 @@ class TranslationService:
                 context_after=context_after,
                 glossary_text=glossary_text,
                 character_profile=character_profile,
+                style_guide=style_guide,
                 debug=False
             )
         return ""

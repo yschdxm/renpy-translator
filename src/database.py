@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS ui_texts (
     label TEXT DEFAULT '',
     original_text TEXT NOT NULL,
     translated_text TEXT DEFAULT '',
-    is_translated INTEGER DEFAULT 0
+    is_translated INTEGER DEFAULT 0,
+    context_hint TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ui_label ON ui_texts(label);
 CREATE INDEX IF NOT EXISTS idx_ui_translated ON ui_texts(is_translated);
@@ -111,6 +112,7 @@ class ProjectDatabase:
         for table, col, col_def in [
             ('dialogues', 'label', "TEXT DEFAULT ''"),
             ('ui_texts', 'label', "TEXT DEFAULT ''"),
+            ('ui_texts', 'context_hint', "TEXT DEFAULT ''"),
         ]:
             existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in existing:
@@ -237,8 +239,8 @@ class ProjectDatabase:
 
     @_auto_reconnect
     def get_untranslated_dialogues(self, limit: int = None) -> list[dict]:
-        """获取未翻译的对话"""
-        sql = "SELECT * FROM dialogues WHERE is_translated=0 ORDER BY id"
+        """获取未翻译的对话（按剧情书写顺序：文件 + 行号）"""
+        sql = "SELECT * FROM dialogues WHERE is_translated=0 ORDER BY file_path, line_number"
         if limit:
             sql += f" LIMIT {limit}"
         rows = self._conn.execute(sql).fetchall()
@@ -420,11 +422,25 @@ class ProjectDatabase:
 
     @_auto_reconnect
     def get_untranslated_ui_texts(self, limit: int = None) -> list[dict]:
-        sql = "SELECT * FROM ui_texts WHERE is_translated=0 ORDER BY id"
+        """获取未翻译的 UI 字符串（按文件 + 行号顺序，同文件字符串相邻成批）"""
+        sql = "SELECT * FROM ui_texts WHERE is_translated=0 ORDER BY file_path, line_number"
         if limit:
             sql += f" LIMIT {limit}"
         rows = self._conn.execute(sql).fetchall()
         return [self._row_to_ui_dict(row) for row in rows]
+
+    @_auto_reconnect
+    def update_ui_hints(self, hints: dict) -> int:
+        """批量写回 UI 字符串的出处上下文（按原文匹配），返回命中条数"""
+        matched = 0
+        with self._transaction():
+            for original, hint in hints.items():
+                cur = self._conn.execute(
+                    "UPDATE ui_texts SET context_hint=? WHERE original_text=?",
+                    (hint, original)
+                )
+                matched += cur.rowcount
+        return matched
 
     @_auto_reconnect
     def get_ui_text(self, item_id: int) -> Optional[dict]:
@@ -452,6 +468,7 @@ class ProjectDatabase:
             "original_text": row["original_text"],
             "translated_text": row["translated_text"],
             "is_translated": bool(row["is_translated"]),
+            "context_hint": row["context_hint"] if "context_hint" in row.keys() else "",
         }
 
     # ========== 角色表（合并后） ==========

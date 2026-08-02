@@ -283,6 +283,7 @@ class App:
 
         self.strings_panel.set_db(self.db)
         self.strings_panel.set_translation_service(self.translation_service)
+        self.strings_panel.set_project_dir(str(self.project_manager.projects_dir / name))
         self.strings_panel._on_task_state_change = lambda running: self.set_task_running(running, 'ui')
 
         self.dialogue_panel.set_db(self.db)

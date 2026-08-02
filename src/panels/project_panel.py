@@ -548,6 +548,21 @@ class ProjectPanel:
 
             await loop.run_in_executor(None, _save_tl)
 
+            # 步骤6.5: 回扫源码定位 UI 字符串出处
+            progress_label.text = '正在定位字符串上下文...'
+            await asyncio.sleep(0)
+
+            def _locate_hints():
+                p = RenpyParser()
+                return p.locate_ui_string_contexts(str(game_work_dir))
+
+            try:
+                hints = await loop.run_in_executor(None, _locate_hints)
+                matched = await loop.run_in_executor(None, db.update_ui_hints, hints)
+                self.logger.info(f'UI 上下文定位: {matched} 条命中', panel='projects')
+            except Exception as e:
+                self.logger.warning(f'UI 上下文定位失败（不影响建项）: {e}', panel='projects')
+
         progress_bar.value = 0.95
 
         # 步骤7: 清理冲突文件

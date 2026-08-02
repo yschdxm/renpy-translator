@@ -351,3 +351,104 @@ class RenpyParser:
             'total_files': len(rpy_files),
             'extracted_rpa': extracted_files
         }
+
+    # ---- UI 字符串出处定位 ----
+
+    # 行类型识别（优先级从上到下）
+    _SCOPE_PATTERNS = [
+        (re.compile(r'^screen\s+(\w+)'), 'screen'),
+        (re.compile(r'^label\s+(\w+)\s*:'), 'label'),
+        (re.compile(r'^menu\s*:'), 'menu'),
+        (re.compile(r'^menu\s+"((?:[^"\\]|\\.)*?)"\s*:'), 'menu'),
+    ]
+    _KIND_PATTERNS = [
+        (re.compile(r'\btextbutton\s+_\(\s*"((?:[^"\\]|\\.)*?)"\s*\)'), '按钮'),
+        (re.compile(r'\btextbutton\s+"((?:[^"\\]|\\.)*?)"'), '按钮'),
+        (re.compile(r'\btext\s+_\(\s*"((?:[^"\\]|\\.)*?)"\s*\)'), '界面文本'),
+        (re.compile(r'\btooltip\s+"((?:[^"\\]|\\.)*?)"'), '提示'),
+        (re.compile(r'\blabel\s+_\(\s*"((?:[^"\\]|\\.)*?)"\s*\)'), '标题'),
+        (re.compile(r'^"((?:[^"\\]|\\.)*?)"\s*:'), 'menu选项'),
+        (re.compile(r'_\(\s*"((?:[^"\\]|\\.)*?)"\s*\)'), '文本'),
+    ]
+
+    @staticmethod
+    def _unescape_renpy(s: str) -> str:
+        """Ren'Py 字符串反转义（与 SDK old/new 块中的原文对齐）"""
+        return (s.replace('\\"', '"').replace("\\'", "'")
+                 .replace('\\n', '\n').replace('\\t', '\t')
+                 .replace('\\\\', '\\'))
+
+    def locate_ui_string_contexts(self, game_dir: str) -> dict:
+        """回扫游戏源码，定位 UI 字符串的出处
+
+        逐行跟踪封闭作用域（screen/label/menu）与行类型（按钮/界面文本/menu选项等），
+        提取行内带引号字符串，返回 {反转义后的原文: 出处描述}。
+        出处描述格式："screen名·按钮" / "label名·menu选项" / "label名·文本" 等。
+        """
+        hints = {}
+        game_path = Path(game_dir)
+        search_roots = [p for p in (game_path / 'game', game_path) if p.exists()]
+        exclude_dirs = {'renpy', 'lib', 'saves', 'cache', 'tl', 'audio', 'sound',
+                        'images', 'image', 'fonts', 'font', 'video', 'movies'}
+
+        seen_files = set()
+        for root in search_roots:
+            for rpy_file in root.rglob('*.rpy'):
+                if rpy_file in seen_files:
+                    continue
+                seen_files.add(rpy_file)
+                if any(part in exclude_dirs for part in rpy_file.parts):
+                    continue
+                try:
+                    content = rpy_file.read_text(encoding='utf-8', errors='ignore')
+                except OSError:
+                    continue
+                self._scan_file_for_hints(content, hints)
+        return hints
+
+    def _scan_file_for_hints(self, content: str, hints: dict):
+        """扫描单个文件，把字符串出处写入 hints（已有出处的不覆盖）"""
+        scope_stack = []  # [(indent, kind, name)]
+
+        def current_scope():
+            return scope_stack[-1] if scope_stack else (0, '', '')
+
+        for raw_line in content.split('\n'):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            indent = len(raw_line) - len(raw_line.lstrip())
+
+            # 弹出缩进不小于当前行的作用域
+            while scope_stack and indent <= scope_stack[-1][0]:
+                scope_stack.pop()
+
+            # 作用域定义行（screen/label 行本身无可提取字符串，menu "标题" 已在上面记录）
+            for pattern, kind in self._SCOPE_PATTERNS:
+                m = re.match(pattern, stripped)
+                if m:
+                    name = m.group(1) if kind != 'menu' or m.lastindex else 'menu'
+                    scope_stack.append((indent, kind, name))
+                    # menu "标题" 的标题本身也是可翻译字符串
+                    if kind == 'menu' and m.lastindex:
+                        text = self._unescape_renpy(m.group(1))
+                        hints.setdefault(text, f'场景菜单·菜单标题')
+                    break
+
+            # 字符串行：识别行类型并提取
+            _, scope_kind, scope_name = current_scope()
+            for pattern, kind in self._KIND_PATTERNS:
+                m = pattern.search(stripped)
+                if m:
+                    text = self._unescape_renpy(m.group(1))
+                    if len(text) > 1 and not text.startswith('$'):
+                        if scope_kind == 'screen':
+                            hint = f'{scope_name}界面·{kind}'
+                        elif scope_kind == 'label':
+                            hint = f'{scope_name}场景·{kind}'
+                        elif scope_kind == 'menu':
+                            hint = f'{scope_name}·{kind}' if kind != 'menu选项' else 'menu选项'
+                        else:
+                            hint = kind
+                        hints.setdefault(text, hint)
+                    break

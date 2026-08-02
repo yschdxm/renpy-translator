@@ -130,7 +130,8 @@ class AITranslator:
 
     def _build_system_prompt(self, character: str = "",
                               glossary_text: str = "",
-                              character_profile: str = "") -> str:
+                              character_profile: str = "",
+                              style_guide: str = "") -> str:
         """构建系统提示词"""
         prompt = """你是一位资深的游戏本地化翻译家。请将以下文本翻译成简体中文。
 
@@ -161,6 +162,10 @@ class AITranslator:
 - 不要提取：通用词汇、UI文字、技术术语、许可证名称、框架名称、软件名称
 - 如果术语表中已有该词的翻译，不要重复添加
 - 如果没有新的游戏专有名词，不输出术语部分"""
+
+        # 作品风格指南
+        if style_guide:
+            prompt += f"\n\n【作品风格指南】\n{style_guide}"
 
         # 术语表
         if glossary_text:
@@ -232,6 +237,7 @@ class AITranslator:
                        context_after: List[dict] = None,
                        glossary_text: str = "",
                        character_profile: str = "",
+                       style_guide: str = "",
                        debug: bool = False) -> tuple[str, list[dict]]:
         """翻译单行文本，返回 (译文, 术语列表)
 
@@ -250,7 +256,8 @@ class AITranslator:
         system_prompt = self._build_system_prompt(
             character=character,
             glossary_text=glossary_text,
-            character_profile=character_profile
+            character_profile=character_profile,
+            style_guide=style_guide,
         )
         user_prompt = self._build_user_prompt(
             text, character, context_before, context_after
@@ -375,7 +382,8 @@ class AITranslator:
         return result
 
     @staticmethod
-    def _build_ui_system_prompt(glossary_text: str = "") -> str:
+    def _build_ui_system_prompt(glossary_text: str = "",
+                                style_guide: str = "") -> str:
         """构建 UI 翻译系统提示词"""
         system_prompt = """你是一位游戏本地化翻译家。请将以下文本翻译成简体中文。
 
@@ -401,12 +409,15 @@ class AITranslator:
 - 如果术语表中已有该词的翻译，不要重复添加
 - 如果没有新的游戏专有名词，不输出术语部分"""
 
+        if style_guide:
+            system_prompt += f"\n\n【作品风格指南】\n{style_guide}"
         if glossary_text:
             system_prompt += f"\n\n{glossary_text}"
         return system_prompt
 
     def translate_ui(self, text: str, glossary_text: str = "",
                      character_dict: Dict[str, str] = None,
+                     style_guide: str = "",
                      debug: bool = False) -> tuple[str, list[dict]]:
         """翻译UI文字，返回 (译文, 术语列表)"""
         if not self.client:
@@ -419,7 +430,7 @@ class AITranslator:
         if not any(c.isalnum() for c in text):
             return text
 
-        system_prompt = self._build_ui_system_prompt(glossary_text)
+        system_prompt = self._build_ui_system_prompt(glossary_text, style_guide=style_guide)
 
         user_prompt = f"""请翻译：\n{text}
 
@@ -443,8 +454,13 @@ class AITranslator:
         return translated, terms
 
     def _build_batch_user_prompt(self, items: List[dict],
-                                 context_before: List[dict] = None) -> str:
-        """构建批次翻译用户提示词（编号输入、编号输出）"""
+                                 context_before: List[dict] = None,
+                                 content_type: str = 'dialogue') -> str:
+        """构建批次翻译用户提示词（编号输入、编号输出）
+
+        dialogue：相邻 item 的 label 变化时插入不占编号的【场景: xxx】分隔行。
+        ui：有 context_hint 的条目标注出处（(出处) 原文），帮助模型推断词义。
+        """
         prompt = ""
 
         if context_before:
@@ -461,19 +477,29 @@ class AITranslator:
 
         n = len(items)
         prompt += f"【请翻译以下文本，共 {n} 句，按编号顺序逐句翻译】\n"
+        last_label = None
         for i, item in enumerate(items, 1):
+            # 场景分隔行（不占编号）
+            if content_type == 'dialogue':
+                label = item.get('label', '')
+                if label and label != last_label:
+                    prompt += f"【场景: {label}】\n"
+                last_label = label
+
             char = item.get('character', '')
             text = item.get('original_text', '').replace('\n', ' ')
+            hint = item.get('context_hint', '') if content_type == 'ui' else ''
+            prefix = f"({hint}) " if hint else ''
             if char:
-                prompt += f"{i}. [{char}] {text}\n"
+                prompt += f"{i}. [{char}] {prefix}{text}\n"
             else:
-                prompt += f"{i}. {text}\n"
+                prompt += f"{i}. {prefix}{text}\n"
 
         prompt += f"""
 【输出要求】
 - 调用 submit_translations 函数提交结果
 - translations 数组必须恰好包含 {n} 条译文，顺序与输入编号 1 到 {n} 一一对应，不要合并、拆分或跳过任何一句
-- [角色] 是说话人标记，不要翻译，也不要出现在译文中
+- [角色] 是说话人标记，不要翻译，也不要出现在译文中；【场景:】和(出处)只是上下文提示，同样不要出现在译文中
 - 原文中新出现的游戏专有名词（地名、物品名、技能名等，且术语表中没有的）放入 terms 数组；术语表中已有或没有新名词时传空数组"""
 
         return prompt
@@ -506,6 +532,7 @@ class AITranslator:
     def translate_batch(self, items: List[dict], content_type: str = 'dialogue',
                         glossary_text: str = "", character_profiles: str = "",
                         context_before: List[dict] = None,
+                        style_guide: str = "",
                         context_window_tokens: Optional[int] = None,
                         debug: bool = False) -> tuple[Optional[List[str]], List[dict]]:
         """批次翻译多句文本，返回 (译文列表, 术语列表)
@@ -519,13 +546,14 @@ class AITranslator:
             return [], []
 
         if content_type == 'ui':
-            system_prompt = self._build_ui_system_prompt(glossary_text)
+            system_prompt = self._build_ui_system_prompt(glossary_text, style_guide=style_guide)
         else:
             system_prompt = self._build_system_prompt(
                 glossary_text=glossary_text,
-                character_profile=character_profiles
+                character_profile=character_profiles,
+                style_guide=style_guide,
             )
-        user_prompt = self._build_batch_user_prompt(items, context_before)
+        user_prompt = self._build_batch_user_prompt(items, context_before, content_type)
 
         if debug:
             print(f'\n{"="*50}')
@@ -635,6 +663,26 @@ class AITranslator:
             max_tokens=self.config.max_tokens,
             task_type='analysis',
         )
+
+    # 风格指南分析提示词模板
+    _STYLE_GUIDE_PROMPT = """你是一位资深的游戏本地化专家。以下是某部视觉小说/游戏的台词抽样，请分析这部作品的文字风格，生成一份供翻译人员使用的【作品风格指南】。
+
+台词抽样：
+{sample}
+
+请按以下维度输出（每项 1-3 句，直接给出结论，不要复述台词）：
+
+【题材基调】作品的题材、氛围、世界观调性（如：暗黑奇幻、轻松日常、悬疑惊悚……）
+【叙事人称与视角】旁白的人称、视角特点、与读者的距离感
+【作者文风】句式长短与节奏、用词习惯（文雅/口语/粗俗）、修辞特点、幽默或抒情的方式
+【情感强度】情感表达是克制还是外露，激烈场景的语言烈度
+【翻译基调建议】中译时应保持的整体口吻、应避免的译法、需要特别注意的语言习惯（如口癖、双关、梗）"""
+
+    def generate_style_guide(self, sample_text: str) -> str:
+        """根据台词抽样生成作品风格指南"""
+        if not sample_text.strip():
+            return ""
+        return self.analyze_text(self._STYLE_GUIDE_PROMPT.format(sample=sample_text))
 
     def test_connection(self) -> Dict[str, Any]:
         """测试API连接"""

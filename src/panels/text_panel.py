@@ -36,6 +36,7 @@ class TextTranslationPanel:
 
         self.db: ProjectDatabase = None
         self.translation_service: TranslationService = None
+        self._project_dir: str = ''
 
         self.table: PaginatedTable = None
         self.progress: ProgressPanel = None
@@ -55,11 +56,25 @@ class TextTranslationPanel:
     def set_translation_service(self, service: TranslationService):
         self.translation_service = service
 
+    def set_project_dir(self, project_dir: str):
+        """设置项目工作目录（用于回扫源码定位字符串上下文）"""
+        self._project_dir = project_dir
+
     def create(self, container: ui.column):
         with container:
             with ui.row().classes('w-full items-center gap-2'):
                 self.stats_label = ui.label('请先打开项目').classes('text-subtitle1')
                 ui.space()
+                if self.content_type == 'ui':
+                    ui.button(
+                        '📍 重建上下文', color='accent',
+                        on_click=self._rebuild_ui_hints
+                    )
+                if self.content_type == 'dialogue':
+                    ui.button(
+                        '🎨 风格指南', color='accent',
+                        on_click=self._open_style_guide
+                    )
                 self.translate_page_btn = ui.button(
                     '🚀 翻译本页', color='primary',
                     on_click=self._translate_page
@@ -317,16 +332,25 @@ class TextTranslationPanel:
             _safe(ui.notify, '当前页已全部翻译', type='info')
             return
 
+        # 从 db 取完整条目（含 label/context_hint，供场景分隔与出处提示）
+        def _get_full(row):
+            if self.content_type == 'ui':
+                return self.db.get_ui_text(row['action'])
+            return self.db.get_dialogue(row['action'])
+
         # 表格行映射为翻译条目
         to_translate = []
         for row in to_translate_rows:
             char = row.get('character', '') or ''
             if char == '旁白':
                 char = ''
+            full = _get_full(row) or {}
             to_translate.append({
                 'id': row['action'],
                 'original_text': row.get('original', ''),
                 'character': char,
+                'label': full.get('label', ''),
+                'context_hint': full.get('context_hint', ''),
             })
 
         self._cancel = False
@@ -586,3 +610,143 @@ class TextTranslationPanel:
 
         dialog.props('persistent')
         dialog.open()
+
+    # ========== 字符串上下文重建（UI 模式） ==========
+
+    async def _rebuild_ui_hints(self):
+        """回扫游戏源码，重建 UI 字符串的出处上下文"""
+        if not self.db:
+            _safe(ui.notify, '请先打开项目', type='warning')
+            return
+        if not self._project_dir:
+            _safe(ui.notify, '项目目录未知，无法回扫源码', type='negative')
+            return
+
+        from renpy_parser import RenpyParser
+        loop = asyncio.get_event_loop()
+
+        # ongoing 通知不会自动消失，完成后更新同一个通知对象
+        progress_notice = ui.notification('正在回扫源码定位字符串出处...', spinner=True, timeout=None)
+
+        def _locate():
+            parser = RenpyParser()
+            return parser.locate_ui_string_contexts(self._project_dir)
+
+        try:
+            hints = await loop.run_in_executor(None, _locate)
+            matched = await loop.run_in_executor(None, self.db.update_ui_hints, hints)
+
+            counts = await loop.run_in_executor(None, self.db.get_ui_text_count)
+            total = counts['total']
+            _safe(setattr, progress_notice, 'message',
+                  f'上下文重建完成: {matched}/{total} 条字符串已定位出处')
+            _safe(setattr, progress_notice, 'spinner', False)
+            _safe(setattr, progress_notice, 'type', 'positive' if matched else 'warning')
+            self.logger.info(f'UI 上下文重建: {matched}/{total} 命中', panel='ui')
+            await asyncio.sleep(3)
+            _safe(progress_notice.dismiss)
+        except Exception as e:
+            self.logger.error(f'上下文重建失败: {e}', panel='ui')
+            _safe(setattr, progress_notice, 'message', f'重建失败: {e}')
+            _safe(setattr, progress_notice, 'spinner', False)
+            _safe(setattr, progress_notice, 'type', 'negative')
+            await asyncio.sleep(5)
+            _safe(progress_notice.dismiss)
+
+    # ========== 风格指南（对话模式） ==========
+
+    async def _open_style_guide(self):
+        """打开风格指南对话框（展示/生成/编辑/保存）"""
+        if not self.db:
+            _safe(ui.notify, '请先打开项目', type='warning')
+            return
+
+        loop = asyncio.get_event_loop()
+        existing = await loop.run_in_executor(None, self.db.get_meta, 'style_guide')
+
+        with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl'):
+            ui.label('🎨 作品风格指南').classes('text-h6')
+            ui.label('注入所有翻译的系统提示词，决定全作翻译的文风基调。'
+                     '可点击「生成」由 AI 分析台词抽样自动撰写，也可直接手写或编辑。'
+                     ).classes('text-caption text-grey')
+
+            editor = ui.textarea(value=existing or '').classes('w-full').props('rows=14 outlined')
+
+            with ui.row().classes('gap-2'):
+                gen_btn = ui.button('🤖 生成', color='primary')
+                save_btn = ui.button('💾 保存', color='positive')
+                ui.button('关闭', on_click=dialog.close)
+
+            async def _generate():
+                if not self.translation_service:
+                    _safe(ui.notify, '请先配置翻译器', type='warning')
+                    return
+                gen_btn.disable()
+                _safe(setattr, gen_btn, 'text', '生成中...')
+                try:
+                    sample = await loop.run_in_executor(None, self._sample_dialogue_text)
+                    if not sample:
+                        _safe(ui.notify, '项目中没有可抽样的对话', type='warning')
+                        return
+                    guide = await loop.run_in_executor(
+                        None, self.translation_service.translator.generate_style_guide, sample
+                    )
+                    if guide:
+                        editor.value = guide
+                        _safe(ui.notify, '风格指南已生成，可编辑后保存', type='positive')
+                    else:
+                        _safe(ui.notify, '生成失败（空结果）', type='negative')
+                except Exception as e:
+                    _safe(ui.notify, f'生成失败: {e}', type='negative')
+                finally:
+                    gen_btn.enable()
+                    _safe(setattr, gen_btn, 'text', '🤖 生成')
+
+            async def _save():
+                await loop.run_in_executor(None, self.db.set_meta, 'style_guide', editor.value or '')
+                _safe(ui.notify, '风格指南已保存，后续翻译将按此风格执行', type='positive')
+                dialog.close()
+
+            gen_btn.on_click(_generate)
+            save_btn.on_click(_save)
+
+        dialog.props('persistent')
+        dialog.open()
+
+    def _sample_dialogue_text(self) -> str:
+        """抽样对话文本用于风格分析（同步，在线程池中调用）
+
+        每个 label 取前 3 句 + 随机 50 句，总量限 ~30K 字符。
+        """
+        import random
+        rows = self.db._conn.execute(
+            "SELECT label, character, original_text FROM dialogues "
+            "WHERE length(original_text) > 5 ORDER BY file_path, line_number"
+        ).fetchall()
+        if not rows:
+            return ""
+
+        # 每个 label 前 3 句
+        samples, seen_labels = [], set()
+        for r in rows:
+            label = r['label'] or ''
+            if label not in seen_labels:
+                seen_labels.add(label)
+                label_rows = [x for x in rows if (x['label'] or '') == label][:3]
+                samples.extend(label_rows)
+
+        # 随机补 50 句
+        pool = [r for r in rows if r not in samples]
+        if pool:
+            samples.extend(random.sample(pool, min(50, len(pool))))
+
+        # 拼装，限 30K 字符
+        lines, total = [], 0
+        for r in samples:
+            char = r['character'] or '旁白'
+            line = f"{char}: {r['original_text']}"
+            if total + len(line) > 30000:
+                break
+            lines.append(line)
+            total += len(line)
+        return "\n".join(lines)
