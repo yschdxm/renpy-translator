@@ -15,6 +15,16 @@ def _safe(fn, *args, **kwargs):
     except (RuntimeError, AttributeError):
         return None
 
+
+def _escape_translation(text: str) -> str:
+    """转义译文中的特殊字符，保证写入 .rpy 后是合法的单行字符串
+
+    - 真实换行符 → \\n 转义序列（Ren'Py 字符串不支持跨行，换行会破坏解析）
+    - 双引号 → \\"
+    注意译文里已有的 \\n（反斜杠+n 两字符）不受影响。
+    """
+    return text.replace('\r', '').replace('\n', '\\n').replace('"', '\\"')
+
 from database import ProjectDatabase
 from project_manager import ProjectManager
 from logger import TranslationLogger
@@ -105,60 +115,87 @@ class ExportPanel:
 
         _safe(self.export_btn.disable)
         _safe(setattr, self.export_btn, 'text', '导出中...')
-        await self._do_export()
 
-    async def _do_export(self):
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('📦 导出游戏').classes('text-h6')
+            progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full')
+            progress_label = ui.label('准备中...').classes('text-caption')
+        dialog.props('persistent')
+        dialog.open()
+
+        await self._do_export(dialog, progress_bar, progress_label)
+
+    async def _do_export(self, dialog, progress_bar, progress_label):
         """异步导出"""
         loop = asyncio.get_event_loop()
-        log_queue = Queue()
+        msg_queue = Queue()
 
         try:
             self.logger.info('开始导出游戏...', panel='export')
 
-            async def process_log_queue():
+            async def process_queue():
                 while True:
                     try:
-                        msg = log_queue.get_nowait()
+                        msg = msg_queue.get_nowait()
                         if msg == '__DONE__':
                             break
-                        self.logger.info(msg, panel='export')
+                        if msg[0] == 'progress':
+                            progress_bar.value = msg[1]
+                            progress_label.text = msg[2]
+                        else:
+                            self.logger.info(msg[1], panel='export')
                     except Exception as e:
                         # queue.Empty 是正常的轮询空队列，其他异常需要记录
                         if 'Empty' not in type(e).__name__:
                             self.logger.warning(f'日志队列处理异常: {e}')
                     await asyncio.sleep(0.1)
 
-            log_task = asyncio.create_task(process_log_queue())
+            queue_task = asyncio.create_task(process_queue())
 
             meta = await loop.run_in_executor(None, self.db.get_all_meta)
             project_name = meta.get('name', 'unknown')
 
             result = await loop.run_in_executor(
                 None,
-                lambda: self._export_thread(project_name, log_queue)
+                lambda: self._export_thread(project_name, msg_queue)
             )
 
             try:
-                await asyncio.wait_for(log_task, timeout=10.0)
+                await asyncio.wait_for(queue_task, timeout=10.0)
             except asyncio.TimeoutError:
-                log_task.cancel()
+                queue_task.cancel()
 
             if result['success']:
+                progress_bar.value = 1.0
+                progress_label.text = '✅ 导出完成！'
                 self.logger.info('✅ 导出完成！', panel='export')
+                await asyncio.sleep(2)
             else:
+                progress_label.text = f'❌ 导出失败: {result["message"]}'
                 self.logger.error(f'❌ 导出失败: {result["message"]}', panel='export')
+                await asyncio.sleep(5)
 
         except Exception as e:
+            progress_label.text = f'❌ 导出异常: {str(e)}'
             self.logger.error(f'❌ 导出异常: {str(e)}', panel='export')
+            await asyncio.sleep(5)
 
         finally:
+            dialog.close()
             _safe(self.export_btn.enable)
             _safe(setattr, self.export_btn, 'text', '📦 开始导出')
 
-    def _export_thread(self, project_name: str, log_queue: Queue) -> dict:
-        """在线程中执行导出"""
+    def _export_thread(self, project_name: str, msg_queue: Queue) -> dict:
+        """在线程中执行导出
+
+        通过队列回报两种消息：('log', 文本) 写入日志面板；
+        ('progress', 0~1, 阶段文本) 更新进度条。
+        """
         def log(msg):
-            log_queue.put(msg)
+            msg_queue.put(('log', msg))
+
+        def progress(value, text):
+            msg_queue.put(('progress', value, text))
 
         try:
             project_dir = self.project_manager._get_project_dir(project_name)
@@ -167,15 +204,30 @@ class ExportPanel:
 
             # 清理旧输出
             if export_dir.exists():
+                progress(0.01, '正在清理旧的输出目录...')
                 log('清理旧的输出目录...')
                 shutil.rmtree(export_dir)
 
-            # 复制游戏文件
+            # 复制游戏文件（逐文件复制，带进度）
+            progress(0.02, '正在复制游戏文件...')
             log('复制游戏文件...')
-            shutil.copytree(game_work_dir, export_dir)
+            total = sum(1 for p in game_work_dir.rglob('*') if p.is_file()) or 1
+            copied = 0
+            for root, dirs, files in os.walk(game_work_dir):
+                rel_root = Path(root).relative_to(game_work_dir)
+                dst_root = export_dir / rel_root
+                dst_root.mkdir(parents=True, exist_ok=True)
+                for f in files:
+                    shutil.copy2(Path(root) / f, dst_root / f)
+                    copied += 1
+                    if copied % 20 == 0 or copied == total:
+                        progress(0.02 + (copied / total) * 0.48,
+                                 f'正在复制游戏文件... ({copied}/{total})')
+            progress(0.5, '游戏文件复制完成')
             log('游戏文件复制完成')
 
             # 构建翻译字典
+            progress(0.55, '正在构建翻译字典...')
             translation_dict = {}
 
             # 对话翻译
@@ -208,36 +260,46 @@ class ExportPanel:
             tl_dir = export_dir / 'game' / 'tl' / 'chinese'
             if tl_dir.exists():
                 log('填充对话翻译...')
-                d_count = self._fill_dialogue(tl_dir, translation_dict)
+                d_count = self._fill_dialogue(
+                    tl_dir, translation_dict,
+                    lambda c, t: progress(0.55 + (c / t) * 0.2,
+                                          f'正在填充对话翻译... ({c}/{t})'))
                 log(f'对话翻译: {d_count} 条')
 
                 log('填充字符串翻译...')
-                u_count = self._fill_strings(tl_dir, translation_dict)
+                u_count = self._fill_strings(
+                    tl_dir, translation_dict,
+                    lambda c, t: progress(0.75 + (c / t) * 0.1,
+                                          f'正在填充字符串翻译... ({c}/{t})'))
                 log(f'字符串翻译: {u_count} 条')
 
             # 添加语言选择
+            progress(0.9, '正在添加语言选择界面...')
             log('添加语言选择界面...')
             self._add_language_selector(export_dir, log)
 
             # 添加中文字体
+            progress(0.95, '正在添加中文字体支持...')
             log('添加中文字体支持...')
             self._add_chinese_font(export_dir, log)
 
             log('')
             log(f'导出目录: {export_dir}')
 
-            log_queue.put('__DONE__')
+            msg_queue.put('__DONE__')
             return {'success': True, 'message': f'导出目录: {export_dir}'}
 
         except Exception as e:
             log(f'导出异常: {str(e)}')
-            log_queue.put('__DONE__')
+            msg_queue.put('__DONE__')
             return {'success': False, 'message': str(e)}
 
-    def _fill_dialogue(self, tl_dir: Path, translation_dict: dict) -> int:
-        """填充对话翻译"""
+    def _fill_dialogue(self, tl_dir: Path, translation_dict: dict, progress_cb=None) -> int:
+        """填充对话翻译，progress_cb(已处理文件数, 总文件数) 回报进度"""
         filled = 0
-        for tl_file in tl_dir.rglob('*.rpy'):
+        files = list(tl_dir.rglob('*.rpy'))
+        total = len(files) or 1
+        for file_idx, tl_file in enumerate(files, 1):
             try:
                 with open(tl_file, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -250,7 +312,10 @@ class ExportPanel:
                     comment_match = re.match(r'^\s+#\s+(.*)', line)
                     if comment_match:
                         comment_text = comment_match.group(1).strip()
-                        if not comment_text or comment_text.startswith('game/'):
+                        # 跳过源文件位置注释（# game/xxx.rpy:123、# renpy/common/00sync.rpy:305 等），
+                        # 它们后面跟的是 old/new 行而不是对话，不能按对话处理
+                        if (not comment_text or comment_text.startswith('game/')
+                                or re.match(r'^[\w./-]+\.rpym?:\d+', comment_text)):
                             new_lines.append(line)
                             i += 1
                             continue
@@ -267,10 +332,11 @@ class ExportPanel:
                             content_match = re.match(r'^\s+(\w+)\s+"(.*)"', lines[i + 1])
                             narration_match = re.match(r'^\s+"(.*)"', lines[i + 1])
 
-                            if content_match:
+                            # old/new 是 strings 块的行，绝不能当对话发言处理
+                            if content_match and content_match.group(1) not in ('old', 'new'):
                                 text = content_match.group(2).replace('\\"', '"')
                                 if text in translation_dict:
-                                    translated = translation_dict[text].replace('"', '\\"')
+                                    translated = _escape_translation(translation_dict[text])
                                     new_lines.append(f'    {content_match.group(1)} "{translated}"')
                                     filled += 1
                                 else:
@@ -280,7 +346,7 @@ class ExportPanel:
                             elif narration_match:
                                 text = narration_match.group(1).replace('\\"', '"')
                                 if text in translation_dict:
-                                    translated = translation_dict[text].replace('"', '\\"')
+                                    translated = _escape_translation(translation_dict[text])
                                     new_lines.append(f'    "{translated}"')
                                     filled += 1
                                 else:
@@ -297,12 +363,17 @@ class ExportPanel:
             except Exception as e:
                 self.logger.error(f'填充失败 {tl_file.name}: {e}', panel='export')
 
+            if progress_cb:
+                progress_cb(file_idx, total)
+
         return filled
 
-    def _fill_strings(self, tl_dir: Path, translation_dict: dict) -> int:
-        """填充字符串翻译"""
+    def _fill_strings(self, tl_dir: Path, translation_dict: dict, progress_cb=None) -> int:
+        """填充字符串翻译，progress_cb(已处理文件数, 总文件数) 回报进度"""
         filled = 0
-        for tl_file in tl_dir.rglob('*.rpy'):
+        files = list(tl_dir.rglob('*.rpy'))
+        total = len(files) or 1
+        for file_idx, tl_file in enumerate(files, 1):
             try:
                 with open(tl_file, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -322,7 +393,7 @@ class ExportPanel:
                             new_match = re.match(r'^\s+new\s+"(.*)"\s*$', lines[i + 1])
                             if new_match:
                                 if translated:
-                                    escaped = translated.replace('"', '\\"')
+                                    escaped = _escape_translation(translated)
                                     new_lines.append(f'    new "{escaped}"')
                                     filled += 1
                                 else:
@@ -338,6 +409,9 @@ class ExportPanel:
 
             except Exception as e:
                 self.logger.error(f'填充失败 {tl_file.name}: {e}', panel='export')
+
+            if progress_cb:
+                progress_cb(file_idx, total)
 
         return filled
 
@@ -437,3 +511,27 @@ class ExportPanel:
 
                 log(f'已配置 {gui_file.name}')
                 break
+
+        # 写入字体映射：游戏里写死的字体引用（如 font "DejaVuSans.ttf"）不走
+        # gui.text_font，中文会渲染成方块。font_replacement_map 在字体加载层
+        # 全局替换 Ren'Py 内置 DejaVuSans 系列，覆盖所有写死的引用。
+        tl_chinese_dir = export_dir / 'game' / 'tl' / 'chinese'
+        if tl_chinese_dir.exists():
+            override_file = tl_chinese_dir / 'font_override.rpy'
+            lines = [
+                '# 中文字体映射（导出工具自动生成）',
+                "# 将 Ren'Py 内置 DejaVuSans 系列映射到中文字体，",
+                '# 覆盖游戏中写死 font "DejaVuSans.ttf" 等引用的样式。',
+                'init python:',
+            ]
+            for base in ('DejaVuSans.ttf', 'DejaVuSans-Bold.ttf',
+                         'DejaVuSans-Oblique.ttf', 'DejaVuSans-BoldOblique.ttf'):
+                for bold in (False, True):
+                    for italic in (False, True):
+                        lines.append(
+                            f'    config.font_replacement_map["{base}", {bold}, {italic}] = '
+                            f'("{font_path}", False, False)'
+                        )
+            with open(override_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+            log(f'已写入字体映射: tl/chinese/{override_file.name}')
