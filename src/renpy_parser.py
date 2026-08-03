@@ -242,7 +242,9 @@ class RenpyParser:
     def parse_directory(self, game_dir: str,
                        include_ui: bool = False,
                        extract_rpa: bool = True,
-                       work_dir: str = None) -> dict:
+                       work_dir: str = None,
+                       decompile_rpyc: bool = False,
+                       python_exe: str = None) -> dict:
         """解析整个游戏目录
 
         Args:
@@ -250,6 +252,8 @@ class RenpyParser:
             include_ui: 是否包含UI文字
             extract_rpa: 是否解包rpa文件
             work_dir: 工作目录（用于存放临时文件，不修改原游戏）
+            decompile_rpyc: 是否反编译只有 .rpyc 的脚本（解包后、解析前执行）
+            python_exe: 运行 unrpyc 的 Python 解释器路径（decompile_rpyc=True 时必填）
         """
         from rpa_extractor import RPAExtractor
 
@@ -304,6 +308,12 @@ class RenpyParser:
                     except Exception as e:
                         print(f"解包 {rpa_file.name} 失败: {e}")
 
+        # 反编译只有 .rpyc 的脚本（游戏只发布编译版时）
+        decompiled = {'success': [], 'failed': []}
+        if decompile_rpyc and python_exe:
+            from rpyc_decompiler import decompile_game_rpyc
+            decompiled = decompile_game_rpyc(game_path / 'game', python_exe)
+
         # 查找所有.rpy文件（优先使用工作目录中的文件）
         rpy_files = []
 
@@ -349,7 +359,10 @@ class RenpyParser:
             'dialogues': all_dialogues,
             'ui_texts': all_ui_texts,
             'total_files': len(rpy_files),
-            'extracted_rpa': extracted_files
+            'extracted_rpa': extracted_files,
+            'decompiled_rpyc_ok': len(decompiled['success']),
+            'decompiled_rpyc_fail': len(decompiled['failed']),
+            'decompiled_files': [str(p) for p in decompiled['decompiled']],
         }
 
     # ---- UI 字符串出处定位 ----

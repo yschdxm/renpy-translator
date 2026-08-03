@@ -60,6 +60,19 @@ uv sync
 2. 解压到项目目录（如 `renpy-8.5.3-sdk`）
 3. 在「模型配置」页面设置 SDK 路径
 
+### 安装 unrpyc（反编译，仅 rpyc-only 游戏需要）
+
+部分游戏只发布编译后的 `.rpyc` 脚本（没有 `.rpy` 源码），创建项目时需要
+[unrpyc](https://github.com/CensoredUsername/unrpyc) 反编译后才能解析。
+如果游戏自带 `.rpy` 源码则无需安装。
+
+1. 下载 [unrpyc v2.0.4](https://github.com/CensoredUsername/unrpyc/releases/tag/v2.0.4) 的 Source code (zip)
+2. 解压后将 `unrpyc-2.0.4` 文件夹重命名为 `unrpyc`，放到 `tools/` 目录下
+3. 确认 `tools/unrpyc/unrpyc.py` 存在
+
+未安装时遇到 rpyc-only 游戏，创建项目会中断并提示安装方法。
+要求 Python 3.9+，支持 Ren'Py 8 ~ 6.18 的游戏。
+
 ### 配置 AI 模型
 
 1. 在「模型配置」页面添加 AI 模型

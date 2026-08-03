@@ -39,5 +39,13 @@ renpy-*-sdk/
 # 日志
 *.log
 
+# 测试脚本与临时产物
+test_*.py
+fix_*.py
+rpyc_test/
+
+# 第三方工具（unrpyc release，按需下载到 tools/）
+tools/
+
 # 锁文件
 uv.lock

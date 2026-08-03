@@ -16,14 +16,47 @@ def _safe(fn, *args, **kwargs):
         return None
 
 
-def _escape_translation(text: str) -> str:
-    """转义译文中的特殊字符，保证写入 .rpy 后是合法的单行字符串
+# Ren'Py 对台词和菜单选项做 % 格式化（sayexports/menuexports 中的
+# what % tag_quoting_dict），裸 % 会抛 ValueError，必须写成 %%。
+# 合法 %(name)s 变量和已转义的 %% 需要保留。
+_SAY_PROTECT_RE = re.compile(
+    r'%%|%\(\w+\)[#0\- +]*(?:\d+)?(?:\.\d+)?[diouxXeEfFgGcrs]'
+)
+
+# UI 字符串是混合场景：菜单选项同样被 % 格式化（裸 % 要转义），
+# 但 strftime/代码格式化串（%m月%d日、存档位 %s、%(n)d 等）的 % 必须保留，
+# 否则日期/档位号显示会坏。规则：% 后跟 ASCII 字母或 ( 的保留，其余转义。
+_STRING_PROTECT_RE = re.compile(
+    r'%%|%\(\w+\)[#0\- +]*(?:\d+)?(?:\.\d+)?[diouxXeEfFgGcrs]|%[a-zA-Z]'
+)
+
+
+def _escape_translation(text: str, percent: str = 'say') -> str:
+    """转义译文中的特殊字符，保证写入 .rpy 后是合法且可运行的字符串
 
     - 真实换行符 → \\n 转义序列（Ren'Py 字符串不支持跨行，换行会破坏解析）
+    - 裸 % → %%（Ren'Py 对台词/菜单选项做 % 格式化，裸 % 会 ValueError）
+      percent='say'：台词，仅保留 %% 与 %(name)s 变量
+      percent='string'：UI 字符串，额外保留 strftime/%s 等代码格式符
     - 双引号 → \\"
-    注意译文里已有的 \\n（反斜杠+n 两字符）不受影响。
+    译文里已有的 \\n（反斜杠+n 两字符）、%%、%(name)s 变量不受影响。
     """
-    return text.replace('\r', '').replace('\n', '\\n').replace('"', '\\"')
+    text = text.replace('\r', '').replace('\n', '\\n')
+
+    # % 转义：先保护合法占位，再把剩余裸 % 变 %%，最后还原
+    protect_re = _SAY_PROTECT_RE if percent == 'say' else _STRING_PROTECT_RE
+    protected = []
+
+    def _protect(m):
+        protected.append(m.group(0))
+        return f'\x00{len(protected) - 1}\x00'
+
+    text = protect_re.sub(_protect, text)
+    text = text.replace('%', '%%')
+    for i, p in enumerate(protected):
+        text = text.replace(f'\x00{i}\x00', p)
+
+    return text.replace('"', '\\"')
 
 from database import ProjectDatabase
 from project_manager import ProjectManager
@@ -226,6 +259,23 @@ class ExportPanel:
             progress(0.5, '游戏文件复制完成')
             log('游戏文件复制完成')
 
+            # 移除反编译生成的 .rpy：Ren'Py 会优先加载 .rpy 而非原始 .rpyc，
+            # 反编译代码仅供解析用，导出时删除以保证游戏运行原始编译代码
+            decompiled_meta = self.db.get_meta('decompiled_rpy_files')
+            if decompiled_meta:
+                import json as _json
+                try:
+                    removed = 0
+                    for rel in _json.loads(decompiled_meta):
+                        target = export_dir / rel
+                        if target.exists():
+                            target.unlink()
+                            removed += 1
+                    if removed:
+                        log(f'已移除 {removed} 个反编译产生的 .rpy（游戏将运行原始 .rpyc）')
+                except Exception as e:
+                    log(f'清理反编译文件失败: {e}')
+
             # 构建翻译字典
             progress(0.55, '正在构建翻译字典...')
             translation_dict = {}
@@ -393,7 +443,7 @@ class ExportPanel:
                             new_match = re.match(r'^\s+new\s+"(.*)"\s*$', lines[i + 1])
                             if new_match:
                                 if translated:
-                                    escaped = _escape_translation(translated)
+                                    escaped = _escape_translation(translated, percent='string')
                                     new_lines.append(f'    new "{escaped}"')
                                     filled += 1
                                 else:

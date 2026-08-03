@@ -6,6 +6,7 @@
 
 import asyncio
 import os
+import sys
 import zipfile
 import shutil
 
@@ -24,6 +25,7 @@ from nicegui import ui
 from project_manager import ProjectManager
 from database import ProjectDatabase
 from logger import TranslationLogger
+from rpyc_decompiler import UnrpycMissingError, UNRPYC_RELEASE_URL
 
 
 class ProjectPanel:
@@ -357,6 +359,18 @@ class ProjectPanel:
                         except Exception as clean_err:
                             self.logger.warning(f'清理临时解压目录失败: {clean_err}')
 
+                except UnrpycMissingError as e:
+                    # 游戏只有 .rpyc 但未安装 unrpyc：中断并告知安装方法
+                    self.logger.error(f'创建项目失败: {e}')
+                    try:
+                        await loop.run_in_executor(
+                            None, self.project_manager.delete_project, name
+                        )
+                    except Exception as clean_err:
+                        self.logger.error(f'清理项目目录失败: {clean_err}')
+                    progress_dialog.close()
+                    self._show_unrpyc_install_dialog(str(e))
+
                 except Exception as e:
                     import traceback
                     self.logger.error(f'创建项目失败: {e}\n{traceback.format_exc()}')
@@ -465,11 +479,27 @@ class ProjectPanel:
         def _parse():
             return parser.parse_directory(
                 str(game_work_dir), extract_rpa=True,
-                work_dir=str(game_work_dir)
+                work_dir=str(game_work_dir),
+                decompile_rpyc=True, python_exe=sys.executable
             )
 
         result = await loop.run_in_executor(None, _parse)
         progress_bar.value = 0.50
+
+        # rpyc 反编译结果：记录日志，并把产出清单存 meta 供导出时清理
+        if result.get('decompiled_rpyc_ok') or result.get('decompiled_rpyc_fail'):
+            self.logger.info(
+                f'rpyc 反编译: {result["decompiled_rpyc_ok"]} 成功, '
+                f'{result["decompiled_rpyc_fail"]} 失败', panel='projects')
+        if result.get('decompiled_files'):
+            import json as _json
+            rel_files = [
+                Path(p).relative_to(game_work_dir).as_posix()
+                for p in result['decompiled_files']
+            ]
+            await loop.run_in_executor(
+                None, db.set_meta, 'decompiled_rpy_files', _json.dumps(rel_files)
+            )
 
         # 步骤3.5: 检测官方中文翻译，弹窗确认后删除（否则与 SDK 模板重复入库）
         # 必须在解包后（官中可能在 rpa 里）、SDK 生成前检测
@@ -631,8 +661,8 @@ class ProjectPanel:
         """检测游戏 tl 目录下是否已有中文相关翻译目录（同步，在线程池中调用）
 
         解压后、SDK 生成前调用。tl 下若存在中文相关目录（Chinese/zh/ch/zhs 等）
-        且其中有 .rpy，即判定存在官中/第三方汉化。
-        返回中文目录中的 .rpy 文件数，0 表示无官中。
+        且其中有 .rpy/.rpyc，即判定存在官中/第三方汉化（.rpyc 为编译版汉化）。
+        返回中文目录中的翻译文件数，0 表示无官中。
         """
         tl_root = game_work_dir / 'game' / 'tl'
         if not tl_root.exists():
@@ -643,6 +673,7 @@ class ProjectPanel:
                 continue
             if lang_dir.name.lower() in self._CHINESE_LANG_NAMES:
                 count += sum(1 for _ in lang_dir.rglob('*.rpy'))
+                count += sum(1 for _ in lang_dir.rglob('*.rpyc'))
         return count
 
     async def _confirm_remove_official_chinese(self, file_count: int) -> bool:
@@ -672,6 +703,25 @@ class ProjectPanel:
         dlg.open()
         await result.wait()
         return choice['ok']
+
+    def _show_unrpyc_install_dialog(self, reason: str):
+        """未安装 unrpyc 的中断提示：告知安装方法（常驻弹窗，手动关闭）"""
+        with ui.dialog() as dlg, ui.card().classes('w-96'):
+            ui.label('❌ 需要安装 unrpyc').classes('text-h6')
+            ui.label(reason).classes('text-body2')
+            ui.separator()
+            ui.label('安装方法：').classes('text-body2 text-weight-bold')
+            ui.label(
+                '1. 下载 unrpyc v2.0.4 的 Source code (zip)\n'
+                '2. 解压后将 unrpyc-2.0.4 文件夹重命名为 unrpyc，\n'
+                '    放到本工具的 tools/ 目录下\n'
+                '3. 确认 tools/unrpyc/unrpyc.py 存在后重新创建项目'
+            ).classes('text-body2').style('white-space: pre-line')
+            ui.link('打开下载页面', UNRPYC_RELEASE_URL, new_tab=True).classes('text-body2')
+            with ui.row().classes('gap-2 mt-4'):
+                ui.button('知道了', color='primary', on_click=dlg.close)
+        dlg.props('persistent')
+        dlg.open()
 
     def _remove_official_chinese(self, game_work_dir: Path):
         """删除 tl 下的中文相关翻译目录（同步，在线程池中调用）
