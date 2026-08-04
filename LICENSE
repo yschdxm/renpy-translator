@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 yschdxm
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+本工具的分发包中包含以下第三方组件，其许可声明随包保留：
+
+1. unrpyc（tools/unrpyc/）— MIT License
+   Copyright (c) 2012-2024 Yuri K. Schlesner, CensoredUsername, Jackmcbarn
+   https://github.com/CensoredUsername/unrpyc
+   完整许可文本见分发包内 tools/unrpyc/LICENSE
+
+2. Python embeddable package（tools/python-embed/，仅 Windows 包）— PSF License
+   https://www.python.org/ftp/python/3.12.10/
+   许可文本见分发包内 tools/python-embed/LICENSE.txt
+
+本工具不分发 Ren'Py SDK（应用内从官网下载）。Ren'Py 引擎本身以 MIT 为主、
+含部分 LGPL 组件，版权归 Tom Rothamel 及贡献者所有：
+https://github.com/renpy/renpy

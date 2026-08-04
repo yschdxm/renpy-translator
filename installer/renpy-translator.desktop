@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ren'Py Translator
+Comment=AI translation tool for Ren'Py games
+Exec=/opt/renpy-translator/renpy-translator
+Icon=renpy-translator
+Terminal=false
+Categories=Utility;

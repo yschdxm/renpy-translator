@@ -1,13 +1,16 @@
 ; Ren'Py 翻译工具 — Windows 安装包（Inno Setup 6）
 ; 构建: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\renpy-translator.iss
-;
+; 版本号: CI 用 /DAppVersion=x.y.z 覆盖（取 tag），本地默认 0.2.0
+
+#ifndef AppVersion
+#define AppVersion "0.2.0"
+#endif
+
 ; 布局：
-;   {app}\              应用本体（PyInstaller onedir）
+;   {app}\              应用本体（PyInstaller onedir，单用户目录免管理员）
 ;   {app}\tools\        unrpyc + python-embed（CI staging 下载）
 ;   {app}\.rt_home      数据目录指针（向导页选择，ssPostInstall 写入）
 ;   数据目录默认 {localappdata}\renpy-translator，用户可在向导或应用内修改
-
-#define AppVersion "0.2.0"
 
 [Setup]
 AppName=Ren'Py 翻译工具
@@ -25,6 +28,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 UninstallDisplayName=Ren'Py 翻译工具
+SetupIconFile=icon.ico
+UninstallIconFile=icon.ico
 
 [Files]
 Source: "..\dist\renpy-translator\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion

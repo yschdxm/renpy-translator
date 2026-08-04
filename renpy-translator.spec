@@ -11,7 +11,8 @@ import sys
 
 block_cipher = None
 
-datas = [('src', 'src'), ('web/dist', 'web/dist')]
+datas = [('src', 'src'), ('web/dist', 'web/dist'),
+         ('installer/icon.png', 'assets')]
 binaries = []
 hiddenimports = [
     'anyio._backends._asyncio',
@@ -67,7 +68,8 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,  # 无控制台窗口：默认托盘模式，日志写 logs/
-    icon=None,
+    icon='installer/icon.icns' if sys.platform == 'darwin'
+         else 'installer/icon.ico',
 )
 
 coll = COLLECT(

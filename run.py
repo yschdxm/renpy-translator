@@ -201,17 +201,18 @@ def _webview_missing_msg() -> str:
     return "GUI 窗口模式需要 pywebview（uv add pywebview）"
 
 
-def _make_tray_icon_image():
-    """运行时生成托盘图标（无资源文件依赖）：蓝底圆角方块 + 白字 R"""
-    from PIL import Image, ImageDraw, ImageFont
+def _load_tray_icon_image():
+    """加载应用图标（installer/make_icon.py 生成，打包进 assets/）"""
+    from PIL import Image
+    for p in (BUNDLE / 'assets' / 'icon.png',
+              BUNDLE / 'installer' / 'icon.png'):
+        if p.exists():
+            return Image.open(p)
+    # 兜底：运行时画一个（图标文件丢失时不至于起不来）
     img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(59, 130, 246, 255))
-    try:
-        font = ImageFont.truetype('arialbd.ttf', 36)
-    except OSError:
-        font = ImageFont.load_default()
-    d.text((32, 32), 'R', font=font, fill='white', anchor='mm')
+    from PIL import ImageDraw
+    ImageDraw.Draw(img).rounded_rectangle(
+        (2, 2, 62, 62), radius=14, fill=(59, 130, 246, 255))
     return img
 
 
@@ -243,7 +244,7 @@ def run_tray(port: int):
         icon.stop()
 
     icon = pystray.Icon(
-        'renpy-translator', _make_tray_icon_image(), "Ren'Py 翻译工具",
+        'renpy-translator', _load_tray_icon_image(), "Ren'Py 翻译工具",
         menu=pystray.Menu(
             pystray.MenuItem('打开界面', open_window, default=True),
             pystray.MenuItem('用浏览器打开', open_browser),

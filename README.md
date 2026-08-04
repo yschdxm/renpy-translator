@@ -1,224 +1,163 @@
-# 🎮 Ren'Py 游戏翻译工具
+# Ren'Py 游戏翻译工具
 
-Ren'Py 游戏汉化工具，支持 AI 翻译和手动翻译。FastAPI + Vue3(Naive UI) 前后端分离架构，
-一份前端两种形态：桌面 GUI（pywebview）与 WebUI（浏览器/局域网）。SQLite 存储，任务持久化，断线重连。
+Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、
+内嵌文本提取、一键导出成品游戏。
 
-## ✨ 功能特点
+架构：FastAPI 后端 + Vue 3（Naive UI）前端，一份前端三种形态——系统托盘、
+桌面窗口（pywebview）、浏览器 WebUI。服务独立常驻后台，关窗/关浏览器不中断任务。
 
-### 📂 项目管理
-- 创建翻译项目，绑定游戏目录
-- 自动解包 `.rpa` 文件、反编译 `.rpyc` 文件
-- 使用 Ren'Py SDK 生成标准翻译文件
-- 项目打包导出 / 导入
-- 顶栏快速切换项目（保留在当前面板）
+## 功能特点
 
-### 👤 人名翻译 + 人物分析（融合）
-- 自动提取游戏角色名
-- AI 翻译人名的同时分析角色特征（性格、说话风格、翻译建议等）
-- 台词超长时自动分段处理，根据模型上下文动态调整
-- 支持占位符（如 `[mc_name]`）自动识别，跳过翻译仅分析
-- 人名翻译和人物分析在同一个流程中完成
+### 项目管理
+- 游戏目录或 zip 包一键建项，自动解包 `.rpa`、反编译 `.rpyc`（仅 rpyc 游戏需要 unrpyc）
+- 检测游戏自带中文翻译并提示处理（避免与 SDK 模板重复导入）
+- 使用 Ren'Py SDK 生成标准翻译文件；项目打包导出/导入
 
-### 🔤 字符串翻译
-- 翻译菜单选项、按钮、提示等 UI 文字
-- 支持搜索、筛选、分页
-- 逐条翻译，实时刷新状态
+### 人名翻译 + 人物分析（融合流程）
+- 自动提取角色定义（含 DynamicCharacter、玩家可改名占位符）
+- 一次 AI 调用同时翻译人名 + 分析角色特征（性格/说话风格/翻译建议等）
+- 台词超长自动分段，按模型上下文窗口动态计算批量
 
-### 💬 对话翻译
-- 翻译游戏对话和旁白
-- 支持搜索、筛选、按角色过滤
-- 基于 label 的上下文注入（已翻译 + 未翻译混合）
-- 自动注入角色特征和术语表
+### 字符串 / 对话翻译
+- 搜索、筛选（全部/未翻译/已翻译）、分页、按角色过滤
+- 行内编辑即存；单条/本页/全部三种批量粒度，可随时停止
+- 翻译时自动注入：术语表、人名表、角色特征、label 上下文、风格指南
+- 风格指南可手写或 AI 从台词抽样生成
+- 内嵌文本提取：扫描源码中未包 `_()` 的界面/脚本文本，AI 预筛 + 人工复核
+  （可查看源码上下文、单句精判、全部重判），原位标记后 SDK 重生成模板入库
 
-### 📝 术语表
-- AI 翻译时自动提取游戏专有名词（地名、物品名、技能名等）
-- 翻译时注入已有术语表，保持一致性
-- 内置 UI 标准翻译（Save→保存，Load→读取 等）
-- 大小写不敏感去重
+### 游戏导出
+- 一键导出成品：填充对话/字符串译文、写入角色名 `translate python` 覆盖块、
+  注入中文字体（含 font_replacement_map 覆盖写死字体）、添加语言选择入口
+- 自动处理 Ren'Py 的 `%` 格式化陷阱（裸 % 转义、strftime/%(name)s 保留）
+- 反编译产生的 .rpy 自动移除，游戏运行原始 .rpyc
 
-### 📦 游戏导出
-- 一键导出翻译后的游戏
-- 自动配置中文字体、添加语言选择界面
-- 导出目录：`projects/项目名/output/`
+### 任务与状态
+- 长任务（批量翻译/建项/导出）后台执行，进度条 + 实时日志（SSE）
+- 服务重启/页面刷新自动重连回放；中断任务如实标记，翻译类重发自动跳过已完成部分
+- 交互式任务可挂起等待确认（官中检测、内嵌复核），刷新后对话框自动重开
 
-## 🚀 快速开始
+## 快速开始（用户）
 
-### 安装
+下载对应平台的安装包/压缩包（Release 页）：
+
+| 平台 | 格式 |
+|---|---|
+| Windows | `setup-*.exe` 安装包（免管理员）或 `*-portable.zip` 免安装版 |
+| macOS | `*.dmg` |
+| Linux | `.deb` / `.rpm` / `.AppImage` / `.tar.gz` |
+
+启动后驻系统托盘，托盘菜单：打开界面 / 用浏览器打开 / 退出服务。
+首次使用在「模型配置」里：下载或指定 Ren'Py SDK → 添加 AI 模型（OpenAI 兼容接口）。
+
+### 数据目录
+
+- 便携版：数据存 exe 旁，整目录拷走即迁移
+- 安装版：默认落平台数据目录（`%APPDATA%/renpy-translator` 等），
+  安装向导与应用内「模型配置 → 数据目录」都可自定义，应用内修改自动迁移全部数据
+
+### 反编译依赖（仅 rpyc-only 游戏）
+
+- **安装包**：已内置 unrpyc + python-embed（Windows），开箱即用
+- **便携/开发版**：放 `tools/unrpyc/`（[unrpyc v2.0.4](https://github.com/CensoredUsername/unrpyc/releases/tag/v2.0.4)
+  Source code 解压重命名），冻结环境还需 `tools/python-embed/`
+  （[python-3.12-embed-amd64.zip](https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip) 解压）
+- 未安装时遇到 rpyc-only 游戏，建项会中断并提示安装方法
+
+## 快速开始（开发）
 
 ```bash
 git clone https://github.com/yschdxm/renpy-translator.git
 cd renpy-translator
 uv sync
+cd web && npm ci && npm run build && cd ..
+uv run python run.py
 ```
 
-### 准备字体
-
-将中文字体（如 MiSans）放入 `fonts/` 目录。
-
-### 配置 Ren'Py SDK
-
-1. 下载 [Ren'Py SDK](https://www.renpy.org/latest.html)
-2. 解压到项目目录（如 `renpy-8.5.3-sdk`）
-3. 在「模型配置」页面设置 SDK 路径
-
-### 安装 unrpyc（反编译，仅 rpyc-only 游戏需要）
-
-部分游戏只发布编译后的 `.rpyc` 脚本（没有 `.rpy` 源码），创建项目时需要
-[unrpyc](https://github.com/CensoredUsername/unrpyc) 反编译后才能解析。
-如果游戏自带 `.rpy` 源码则无需安装。
-
-1. 下载 [unrpyc v2.0.4](https://github.com/CensoredUsername/unrpyc/releases/tag/v2.0.4) 的 Source code (zip)
-2. 解压后将 `unrpyc-2.0.4` 文件夹重命名为 `unrpyc`，放到 `tools/` 目录下
-3. 确认 `tools/unrpyc/unrpyc.py` 存在
-
-未安装时遇到 rpyc-only 游戏，创建项目会中断并提示安装方法。
-要求 Python 3.9+，支持 Ren'Py 8 ~ 6.18 的游戏。
-
-### 配置 AI 模型
-
-1. 在「模型配置」页面添加 AI 模型
-2. 支持 OpenAI 兼容接口（DeepSeek、Claude 等）
-3. 设置 API 地址、Key、模型名称、上下文大小
-
-### 启动
+运行模式：
 
 ```bash
-uv run python run.py              # 托盘模式（默认，驻系统托盘，自动开界面）
-uv run python run.py --mode gui   # GUI 窗口（pywebview，关窗即退，服务留后台）
-uv run python run.py --mode web   # WebUI 模式（自动打开浏览器）
+uv run python run.py              # 托盘模式（默认，自动开界面；开发时服务带日志控制台）
+uv run python run.py --mode gui   # 仅桌面窗口（关窗即退，服务留后台）
+uv run python run.py --mode web   # 仅打开浏览器
+uv run python run.py --mode server  # 前台服务（调试用）
 uv run python run.py --mode stop  # 停止后台服务
 ```
 
-GUI/WebUI 访问 http://localhost:7861。
+WebUI 地址 http://localhost:7861（环境变量 `PORT` 可改）。
+前端改动后需在 `web/` 重新 `npm run build`。
 
-**托盘驻守**：默认模式无窗口驻系统托盘，托盘菜单：打开界面 / 用浏览器打开 /
-退出服务。服务、窗口、浏览器都是独立进程——关闭任何界面都不影响进行中的任务；
-只有托盘「退出服务」或 `--mode stop` 会停止服务。
+## 使用流程
 
-首次使用或前端有改动时，先在 `web/` 目录构建前端：`npm install && npm run build`。
+1. **建项**：项目管理 → 新建项目 → 填名称/游戏目录（或上传 zip）→ 选 AI 模型。
+   自动完成解包、反编译、SDK 模板生成、解析入库
+2. **人名翻译**：全部翻译+分析（或逐条），人名译文与角色画像都会用于后续翻译
+3. **字符串翻译**：菜单/按钮等 UI 文字；「提取内嵌文本」处理源码里没包 `_()` 的文本
+4. **对话翻译**：建议先完成人名与风格指南；按角色筛选、看上下文、行内精修
+5. **导出游戏**：导出页一键导出，成品在 `projects/<项目名>/output/`
 
-### 打包（PyInstaller，跨平台）
+## 打包与发布
 
-PyInstaller 不能交叉编译，需在每个 OS 上分别构建（仓库附带 GitHub Actions
-自动产出三平台，见下文）。产物形式：
+PyInstaller 不能交叉编译，每个 OS 分别构建。GitHub Actions
+（`.github/workflows/build.yml`）推 `v*` tag 或手动触发，自动产出：
 
-- **Windows**:Inno Setup 安装包（`installer/renpy-translator.iss`)——
-  免管理员单用户安装（%LOCALAPPDATA%\Programs,VS Code 同款），向导中可选
-  数据目录，unrpyc + python-embed 随包分发，含卸载器
-- **macOS**:`.app` + DMG
-- **Linux**:tar.gz(GUI 窗口需 `python3-gi gir1.2-webkit2-4.1 gir1.2-appindicator3-0.1`)
+```
+renpy-translator-setup-<ver>-windows.exe      Windows 安装包（Inno Setup）
+renpy-translator-<ver>-windows-portable.zip   Windows 免安装版
+renpy-translator-<ver>-macos.dmg              macOS（.app 封装）
+renpy-translator-<ver>-linux-amd64.deb        Debian/Ubuntu
+renpy-translator-<ver>-linux-amd64.rpm        Fedora/RHEL/openSUSE
+renpy-translator-<ver>-linux-x86_64.AppImage  Linux 通用免安装
+renpy-translator-<ver>-linux.tar.gz           Linux 便携
+```
 
-本地构建（Windows 示例，需 Inno Setup 6):
+版本号取 tag（推 `v0.3.0` → `0.3.0`）；手动触发的测试构建用 `dev` 占位。
+
+本地构建（Windows）：
 
 ```bash
 .venv/Scripts/pyinstaller renpy-translator.spec --noconfirm
-# 准备 tools 物料（unrpyc + python-embed）到 staging/tools/
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\renpy-translator.iss
-# 产物: dist/installer/renpy-translator-setup-*-windows.exe
+# staging/tools/ 放入 unrpyc 与 python-embed 后：
+ISCC.exe installer\renpy-translator.iss    # Inno Setup 6
 ```
 
-**数据目录**：便携模式（exe 目录可写）数据存 exe 旁；安装模式自动落到平台数据目录
-(%APPDATA%/renpy-translator 等），安装向导和应用内「模型配置 → 数据目录」都可
-自定义，应用内修改会自动迁移全部数据。
+Linux GUI 窗口需系统 GTK/WebKit：`python3-gi gir1.2-webkit2-4.1 gir1.2-appindicator3-0.1`
+（deb/rpm 已声明依赖自动安装；无则托盘/浏览器模式照常用）。
 
-**Ren'Py SDK**：不打进安装包（~280MB)，应用内「模型配置 → 下载 SDK」一键
-下载解压（官网 zip，带进度条），手动指定路径的老方式保留。
-
-**unrpyc**:MIT 许可，随安装包分发（tools/unrpyc);Windows 包附带
-python-embed(3.12 embed-amd64，冻结环境无解释器时用于反编译子进程）;
-macOS/Linux 使用系统 Python 或自放 `tools/python-embed/`。
-
-仓库附带 GitHub Actions(`.github/workflows/build.yml`)：推 tag 或手动触发，
-自动产出 Windows 安装包 / macOS DMG / Linux tar.gz，并跑健康冒烟测试。
-
-## 📖 使用流程
-
-```
-Header: 🎮 Ren'Py Translator │ [切换项目]          进度: x/x
-├── 左侧导航                    ├── 右侧内容区
-│   ├── 📂 项目管理             │   └── 当前面板内容
-│   ├── 👤 人名翻译（含人物分析）│
-│   ├── 🔤 字符串翻译           │
-│   ├── 💬 对话翻译             │
-│   ├── 📦 导出游戏             │
-│   └── ⚙  模型配置             │
-```
-
-### 1. 创建项目
-- 点击「项目管理」→「新建项目」
-- 填写项目名、游戏目录、选择 AI 模型
-- 自动解包资源、生成翻译文件、预置 UI 术语表
-
-### 2. 人名翻译 + 人物分析
-- 点击「人名翻译」
-- 点击「全部翻译+分析」或逐个「翻译+分析」
-- AI 同时翻译人名和分析角色特征
-- 台词超长时自动分段，根据模型上下文动态调整每段条数
-
-### 3. 字符串翻译
-- 点击「字符串翻译」
-- 翻译菜单、按钮、提示等 UI 文字
-- 翻译时自动注入术语表和上下文
-
-### 4. 对话翻译
-- 点击「对话翻译」
-- 使用搜索和筛选功能
-- 翻译时自动注入角色特征、术语表、label 上下文
-
-### 5. 导出游戏
-- 点击「导出游戏」→「开始导出」
-- 导出目录：`projects/项目名/output/`
-
-### 切换项目
-- **顶栏下拉**：保留在当前面板，只刷新数据
-- **项目管理面板**：打开项目并切换到人名翻译面板
-
-## 🏗️ 技术架构
+## 技术架构
 
 ### 核心设计
 
-- **前后端分离**：FastAPI 无状态 REST + SSE 推送；浏览器持有 UI 状态，刷新/开关页面不丢任务
-- **后台常驻**：服务独立于界面进程运行，关闭窗口/浏览器任务照跑；重开界面自动接管进行中的任务
-- **SQLite 存储**：每个项目独立 `.db` 文件，WAL 模式，单条翻译后立即写入（毫秒级）
-- **任务持久化**：长任务（批量翻译/建项目/导出）与事件流落 `data/app.db`，
-  刷新页面后进度对话框自动重连回放
-- **交互式任务**：任务可挂起等待用户确认（官中检测、内嵌文本复核），刷新页面后对话框自动重开
-- **统一翻译服务**：人名/字符串/对话翻译共用 `TranslationService`，逻辑一致
-- **术语表**：AI 翻译时自动提取游戏专有名词，后续翻译自动注入
+- **前后端分离**：FastAPI REST + SSE 推送；浏览器持有 UI 状态，刷新/关页不丢任务
+- **托盘常驻**：服务、窗口、浏览器均为独立进程，界面全关任务照跑
+- **任务持久化**：任务与事件流落 `data/app.db`，刷新后进度对话框重连回放
+- **SQLite**：每项目独立 `project.db`，WAL 模式，翻译逐条落库
+- **响亮失败**：不做静默降级——错误带完整 traceback 直达界面
+- **数据根解析**：`rt_home`（指针文件 → 便携 exe 旁 → 平台数据目录）
 
 ### 项目结构
 
 ```
 renpy-translator/
-├── run.py                     # 统一入口（gui/web/stop + server-detached）
+├── run.py                     # 统一入口（tray/gui/web/server/stop）
+├── renpy-translator.spec      # PyInstaller 打包配置
+├── installer/                 # Inno 脚本 / RPM spec / desktop / 图标生成
+├── .github/workflows/         # 跨平台 CI 构建
 ├── server/                    # FastAPI 后端
-│   ├── app.py                 # 应用工厂（CORS/SPA 挂载/异常处理/请求分级日志）
-│   ├── state.py               # AppState 单例（当前项目会话）
-│   ├── appdb.py               # 应用级库（settings/jobs/job_events）
+│   ├── app.py / state.py / appdb.py / deps.py / errors.py
 │   ├── jobs/                  # 任务系统（db 持久化 + SSE + ask/answer + 取消）
 │   └── api/                   # REST 路由（session/projects/texts/names/embedded/export/configs/jobs/logs/system）
 ├── web/                       # Vue3 + Vite + TS + Naive UI 前端
 │   └── src/{api,stores,pages,components}/
 ├── src/                       # 纯逻辑核心（与 UI 无关）
-│   ├── database.py            # SQLite 数据库层（WAL + 自动重连）
-│   ├── translation_service.py # 统一翻译调度服务
-│   ├── translator.py          # AI 翻译器（提示词构建 + 术语提取）
-│   ├── renpy_parser.py        # Ren'Py 脚本解析器（label 归属）
+│   ├── database.py / translation_service.py / translator.py
+│   ├── renpy_parser.py / rpa_extractor.py / rpyc_decompiler.py / tl_parser.py
 │   ├── ai_screener.py         # 内嵌文本 AI 预筛（agentic tool 循环）
 │   ├── embedded_strings.py    # 内嵌文本提取/标记
-│   ├── rt_home.py             # 用户数据根解析（开发=仓库根，冻结=exe 目录）
-│   ├── services/              # 业务服务层（无 UI 依赖）
-│   │   ├── project_creation.py    # 建项目管线
-│   │   ├── game_export.py         # 游戏导出
-│   │   ├── name_translation.py    # 人名翻译+人物分析
-│   │   └── embedded_pipeline.py   # 内嵌文本管线
-│   ├── rpa_extractor.py / rpyc_decompiler.py / tl_parser.py / sdk_manager.py
-│   └── project_manager.py / config_manager.py / logger.py
-├── tests/                     # 后端 pytest（任务系统/内嵌复核回环等）
-├── renpy-translator.spec      # PyInstaller 打包配置
-├── data/app.db                # 应用级库（任务/事件/设置）
-├── projects/  config/  fonts/  logs/  exports/  tools/
-└── pyproject.toml
+│   ├── rt_home.py             # 数据根解析
+│   ├── services/              # 业务服务层（建项/导出/人名/内嵌管线）
+│   └── project_manager.py / config_manager.py / logger.py / sdk_manager.py
+└── data/  projects/  config/  fonts/  logs/  exports/  tools/   # 用户数据（不提交）
 ```
 
 ### 数据库表结构
@@ -228,27 +167,42 @@ renpy-translator/
 | `project_meta` | 项目元数据（键值对） |
 | `dialogues` | 对话翻译（含 label 归属） |
 | `ui_texts` | UI 字符串翻译 |
-| `characters` | 角色信息（合并人名+分析档案+台词数） |
-| `glossary` | 术语表（游戏专有名词） |
+| `characters` | 角色信息（人名+画像+台词数，变量名为主键） |
+| `glossary` | 术语表 |
 | `embedded_candidates` | 内嵌文本候选（AI 判定持久化） |
 | `data/app.db: jobs/job_events/settings` | 任务/事件流/全局设置 |
 
-## 🔧 技术栈
+## 技术栈
 
-- **后端**: FastAPI + SSE + SQLite（Python 3.12+）
-- **前端**: Vue 3 + TypeScript + Naive UI + Pinia（Vite 构建）
-- **桌面壳**: pywebview（WebView2）
-- **AI**: OpenAI 兼容接口
-- **SDK**: Ren'Py SDK
+- 后端：FastAPI + SSE + SQLite（Python 3.12+）
+- 前端：Vue 3 + TypeScript + Naive UI + Pinia（Vite）
+- 桌面：pywebview（WebView2 / WKWebView / WebKitGTK）+ pystray
+- AI：OpenAI 兼容接口（DeepSeek、Claude、GPT 等）
+- 打包：PyInstaller + Inno Setup / DMG / deb / rpm / AppImage
 
-## ⚠️ 注意事项
+## 致谢与开源许可
 
-1. **请确保有游戏汉化授权**
+本项目基于 MIT 许可发布（见 [LICENSE](LICENSE)）。感谢以下项目：
+
+- **[Ren'Py](https://github.com/renpy/renpy)**（[官网](https://www.renpy.org/)）——
+  本工具依赖其 SDK 生成翻译模板并作为导出游戏的运行引擎。Ren'Py 以 MIT 为主、
+  含部分 LGPL 组件，版权归 Tom Rothamel 及贡献者所有。本工具不分发 SDK，
+  由应用内引导用户从官网下载。
+- **[unrpyc](https://github.com/CensoredUsername/unrpyc)**——.rpyc 反编译器，
+  MIT 许可，Copyright (c) 2012-2024 Yuri K. Schlesner, CensoredUsername,
+  Jackmcbarn。分发包内含其完整许可文本（tools/unrpyc/LICENSE）。
+
+另：Windows 分发包附带 Python embeddable package（PSF 许可，许可文本见
+tools/python-embed/LICENSE.txt），仅用于冻结环境下的反编译子进程。
+
+## 注意事项
+
+1. 请确保有游戏汉化授权
 2. 翻译前建议备份游戏文件
 
 ---
 
-## ⚖️ 免责声明
+## 免责声明
 
 ### 1. 工具用途
 
@@ -295,11 +249,11 @@ renpy-translator/
 
 严禁将本工具用于：
 
-- ❌ 未经授权翻译受版权保护的作品
-- ❌ 分发未经授权的翻译作品
-- ❌ 侵犯他人知识产权
-- ❌ 传播违法内容
-- ❌ 任何违法行为
+- 未经授权翻译受版权保护的作品
+- 分发未经授权的翻译作品
+- 侵犯他人知识产权
+- 传播违法内容
+- 任何违法行为
 
 ### 7. 免责条款
 
@@ -325,6 +279,6 @@ renpy-translator/
 
 **最后提醒：**
 
-- 🎮 请尊重游戏开发者的劳动成果，支持正版游戏
-- ⚖️ 请遵守当地法律法规，尊重知识产权
-- 💡 本工具仅供学习研究，请勿用于商业用途
+- 请尊重游戏开发者的劳动成果，支持正版游戏
+- 请遵守当地法律法规，尊重知识产权
+- 本工具仅供学习研究，请勿用于商业用途
