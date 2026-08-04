@@ -8,7 +8,8 @@ unrpyc v2.x 要求 Python 3.9+，支持 Ren'Py 8 ~ 6.18。
 import subprocess
 from pathlib import Path
 
-UNRPYC = Path(__file__).parent.parent / 'tools' / 'unrpyc' / 'unrpyc.py'
+from rt_home import find_resource as _find_resource
+UNRPYC = _find_resource('tools/unrpyc/unrpyc.py')
 
 UNRPYC_RELEASE_URL = 'https://github.com/CensoredUsername/unrpyc/releases/tag/v2.0.4'
 
@@ -53,10 +54,10 @@ def decompile_game_rpyc(game_subdir, python_exe: str, log=print, chunk_size: int
 
     log(f'检测到 {len(candidates)} 个只有 .rpyc 的脚本，开始反编译...')
 
-    if not UNRPYC.exists():
+    if UNRPYC is None:
         raise UnrpycMissingError(
             f'检测到 {len(candidates)} 个只有 .rpyc 的脚本，'
-            f'需要 unrpyc 反编译，但未安装（{UNRPYC} 不存在）'
+            '需要 unrpyc 反编译，但未安装（tools/unrpyc/unrpyc.py 不存在）'
         )
 
     for i in range(0, len(candidates), chunk_size):

@@ -43,9 +43,20 @@ renpy-*-sdk/
 test_*.py
 fix_*.py
 rpyc_test/
+tests/
+
+# 应用级数据库
+data/
 
 # 第三方工具（unrpyc release，按需下载到 tools/）
 tools/
 
-# 锁文件
-uv.lock
+# CI 安装包物料
+staging/
+dist/
+
+# 前端依赖（package-lock.json 要提交，CI npm ci 需要）
+node_modules/
+
+# 数据目录指针（应用内迁移生成）
+.rt_home

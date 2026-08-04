@@ -690,7 +690,7 @@ class AITranslator:
 
         return translated_list, terms
 
-    def analyze_text(self, prompt: str) -> str:
+    def analyze_text(self, prompt: str, max_tokens: int = None) -> str:
         """分析文本（不使用翻译系统提示词）"""
         if not self.client:
             raise ValueError("请先配置API Key")
@@ -706,7 +706,7 @@ class AITranslator:
                 {"role": "user", "content": prompt}
             ],
             temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
+            max_tokens=max_tokens or self.config.max_tokens,
             task_type='analysis',
         )
 
@@ -729,6 +729,62 @@ class AITranslator:
         if not sample_text.strip():
             return ""
         return self.analyze_text(self._STYLE_GUIDE_PROMPT.format(sample=sample_text))
+
+    # 内嵌文本 AI 预筛提示词模板
+    _CLASSIFY_STRINGS_PROMPT = """你是游戏本地化专家。以下是从 Ren'Py 游戏源码中扫描出的字符串候选（JSON 数组），请逐条判断它是否是【玩家可见、应当翻译的显示文本】。
+
+判定标准：
+- keep=true：界面文字、按钮、菜单标题、提示、叙事/消息/帖子内容等玩家会直接读到的文本
+- keep=false：内部标识符、字典键名、技术串、格式模板、变量占位、代码用字符串、图片/音频/字体相关名称、纯数字或时间标记（如 "20h"、"1d"）
+
+字段说明：text=候选原文，hint=源码出处，kind=screen(屏幕语言)/python(脚本数据)
+
+候选：
+{items_json}
+
+只输出 JSON 数组，不要输出任何其他文字：[{{"id": 1, "keep": true}}, {{"id": 2, "keep": false}}, ...]"""
+
+    def classify_strings(self, items: list) -> dict:
+        """AI 预筛内嵌文本候选：判断每条是否是玩家可见、应当翻译的文本
+
+        Args:
+            items: [{'id': int, 'text': str, 'hint': str, 'kind': str}]
+
+        Returns:
+            {id: bool}——keep 判定。解析失败时抛异常，由调用方降级为启发式默认值。
+        """
+        import json as _json
+
+        if not items:
+            return {}
+        if not self.client:
+            raise ValueError("请先配置API Key")
+
+        items_json = _json.dumps(
+            [{'id': it['id'], 'text': it['text'], 'hint': it.get('hint', ''),
+              'kind': it.get('kind', '')} for it in items],
+            ensure_ascii=False
+        )
+        result = self.analyze_text(
+            self._CLASSIFY_STRINGS_PROMPT.format(items_json=items_json)
+        )
+
+        # 宽松解析：提取第一个 JSON 数组
+        m = re.search(r'\[.*\]', result, re.S)
+        if not m:
+            raise ValueError(f'AI 预筛返回无法解析: {result[:100]}')
+        try:
+            parsed = _json.loads(m.group(0))
+        except _json.JSONDecodeError as e:
+            raise ValueError(f'AI 预筛 JSON 解析失败: {e}') from e
+
+        verdicts = {}
+        for entry in parsed:
+            if isinstance(entry, dict) and 'id' in entry:
+                verdicts[entry['id']] = bool(entry.get('keep', True))
+        if not verdicts:
+            raise ValueError('AI 预筛返回为空')
+        return verdicts
 
     def test_connection(self) -> Dict[str, Any]:
         """测试API连接"""

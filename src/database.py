@@ -5,6 +5,7 @@
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
@@ -61,6 +62,8 @@ CREATE INDEX IF NOT EXISTS idx_ui_translated ON ui_texts(is_translated);
 CREATE INDEX IF NOT EXISTS idx_ui_file ON ui_texts(file_path);
 
 -- 角色表（合并 characters + char_dict + char_profiles）
+-- 主键身份是 variable（Character() 变量名）；display_name 允许重复
+-- （不同角色可故意同名，如两个 "Unknown"）
 CREATE TABLE IF NOT EXISTS characters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     variable TEXT DEFAULT '',
@@ -69,8 +72,7 @@ CREATE TABLE IF NOT EXISTS characters (
     lines_count INTEGER DEFAULT 0,
     profile_json TEXT DEFAULT '',
     is_placeholder INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT '',
-    UNIQUE(display_name)
+    created_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_characters_display ON characters(display_name);
 CREATE INDEX IF NOT EXISTS idx_characters_cn ON characters(cn_name);
@@ -84,6 +86,24 @@ CREATE TABLE IF NOT EXISTS glossary (
     created_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_glossary_type ON glossary(term_type);
+
+-- 内嵌文本候选（AI 判断持久化：重开不丢，支持重判）
+CREATE TABLE IF NOT EXISTS embedded_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rel_file TEXT DEFAULT '',
+    line INTEGER DEFAULT 0,
+    col_start INTEGER DEFAULT 0,
+    raw TEXT DEFAULT '',
+    text TEXT DEFAULT '',
+    kind TEXT DEFAULT '',
+    hint TEXT DEFAULT '',
+    confidence TEXT DEFAULT '',
+    ai_keep INTEGER DEFAULT -1,
+    ai_reason TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    updated_at TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_embedded_status ON embedded_candidates(status);
 """
 
 
@@ -105,6 +125,8 @@ class ProjectDatabase:
         self._conn.executescript(_SCHEMA_SQL)
         # 迁移：给已有表补上缺失的列
         self._migrate_columns()
+        # 迁移：拆除 characters.display_name 的 UNIQUE 约束
+        self._migrate_characters_unique()
         self._conn.commit()
 
     def _migrate_columns(self):
@@ -117,6 +139,37 @@ class ProjectDatabase:
             existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+
+    def _migrate_characters_unique(self):
+        """拆除旧库 characters.display_name 的 UNIQUE 约束
+
+        同名不同角色（如两个 "Unknown"）需要并存，旧约束会导致
+        按变量名插入同名角色时报错。SQLite 不能直接删约束，重建表。
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='characters'"
+        ).fetchone()
+        if not row or 'UNIQUE' not in (row['sql'] or '').upper():
+            return
+        self._conn.executescript('''
+            CREATE TABLE characters_mig (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                variable TEXT DEFAULT '',
+                display_name TEXT NOT NULL,
+                cn_name TEXT DEFAULT '',
+                lines_count INTEGER DEFAULT 0,
+                profile_json TEXT DEFAULT '',
+                is_placeholder INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT ''
+            );
+            INSERT INTO characters_mig
+                SELECT id, variable, display_name, cn_name, lines_count,
+                       profile_json, is_placeholder, created_at FROM characters;
+            DROP TABLE characters;
+            ALTER TABLE characters_mig RENAME TO characters;
+            CREATE INDEX IF NOT EXISTS idx_characters_display ON characters(display_name);
+            CREATE INDEX IF NOT EXISTS idx_characters_cn ON characters(cn_name);
+        ''')
 
     def close(self):
         if self._conn:
@@ -373,6 +426,142 @@ class ProjectDatabase:
             )
 
     @_auto_reconnect
+    def insert_ui_texts_new_only(self, items: list[dict]) -> int:
+        """只插入库中不存在的 UI 字符串（按 original_text 判重），返回插入条数
+
+        与 insert_ui_texts 的区别：预过滤已有项（避免重复建行），
+        且写入 context_hint 列。用于内嵌文本提取后的合并入库。
+        """
+        if not items:
+            return 0
+        existing = {r[0] for r in self._conn.execute(
+            "SELECT original_text FROM ui_texts").fetchall()}
+        new_items = [d for d in items
+                     if d.get("original_text", "") and d["original_text"] not in existing]
+        if not new_items:
+            return 0
+        with self._transaction():
+            self._conn.executemany(
+                """INSERT INTO ui_texts
+                   (file_path, line_number, label, original_text, translated_text,
+                    is_translated, context_hint)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [(
+                    d.get("file_path", ""),
+                    d.get("line_number", 0),
+                    d.get("label", ""),
+                    d.get("original_text", ""),
+                    d.get("translated_text", ""),
+                    1 if d.get("is_translated") else 0,
+                    d.get("context_hint", ""),
+                ) for d in new_items]
+            )
+        return len(new_items)
+
+    # ========== 内嵌文本候选 ==========
+
+    @staticmethod
+    def _embedded_key(d: dict) -> tuple:
+        return (d.get("rel_file", ""), d.get("line", 0), d.get("raw", ""))
+
+    @_auto_reconnect
+    def merge_embedded_candidates(self, candidates: list) -> list:
+        """把新扫描到的候选合并入库（按 rel_file+line+raw 判重），
+        返回合并后的完整待评审列表（含已有 AI 判定与状态）。
+
+        已存在项保留 ai_keep/ai_reason/status 与 id；新项以 pending 插入。
+        status='marked' 的历史项不再返回（源码已标记，不会重现）。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM embedded_candidates WHERE status != 'marked'"
+        ).fetchall()
+        existing = {(r["rel_file"], r["line"], r["raw"]): r for r in rows}
+
+        now = datetime.now().isoformat()
+        result = []
+        with self._transaction():
+            for c in candidates:
+                key = (c.rel_file, c.line, c.raw)
+                row = existing.get(key)
+                if row:
+                    result.append({
+                        'id': row['id'], 'candidate': c,
+                        'ai_keep': row['ai_keep'], 'ai_reason': row['ai_reason'],
+                        'status': row['status'],
+                    })
+                else:
+                    cur = self._conn.execute(
+                        """INSERT INTO embedded_candidates
+                           (rel_file, line, col_start, raw, text, kind, hint,
+                            confidence, ai_keep, ai_reason, status, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, -1, '', 'pending', ?)""",
+                        (c.rel_file, c.line, c.col_start, c.raw, c.text,
+                         c.kind, c.hint, c.confidence, now)
+                    )
+                    result.append({
+                        'id': cur.lastrowid, 'candidate': c,
+                        'ai_keep': -1, 'ai_reason': '', 'status': 'pending',
+                    })
+        return result
+
+    @_auto_reconnect
+    def update_embedded_ai(self, row_id: int, ai_keep, ai_reason: str):
+        """更新候选的 AI 判定（ai_keep: 1/0/-1）"""
+        keep_val = -1 if ai_keep is None else (1 if ai_keep else 0)
+        self._conn.execute(
+            "UPDATE embedded_candidates SET ai_keep=?, ai_reason=?, updated_at=? WHERE id=?",
+            (keep_val, ai_reason or '', datetime.now().isoformat(), row_id)
+        )
+        self._conn.commit()
+
+    @_auto_reconnect
+    def get_embedded_candidate(self, row_id: int) -> Optional[dict]:
+        """按 id 取单条内嵌候选（refine 单句精判用）"""
+        row = self._conn.execute(
+            "SELECT * FROM embedded_candidates WHERE id=?", (row_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_auto_reconnect
+    def reset_embedded_ai(self, row_ids: list = None):
+        """清空 AI 判定（全部重判前调用；row_ids=None 时清空全部非 marked）"""
+        now = datetime.now().isoformat()
+        if row_ids:
+            self._conn.executemany(
+                "UPDATE embedded_candidates SET ai_keep=-1, ai_reason='', updated_at=? WHERE id=?",
+                [(now, rid) for rid in row_ids]
+            )
+        else:
+            self._conn.execute(
+                "UPDATE embedded_candidates SET ai_keep=-1, ai_reason='', updated_at=? "
+                "WHERE status != 'marked'", (now,)
+            )
+        self._conn.commit()
+
+    @_auto_reconnect
+    def set_embedded_status(self, row_ids: list, status: str):
+        """批量设置候选状态（pending/skipped/marked）"""
+        if not row_ids:
+            return
+        now = datetime.now().isoformat()
+        with self._transaction():
+            self._conn.executemany(
+                "UPDATE embedded_candidates SET status=?, updated_at=? WHERE id=?",
+                [(status, now, rid) for rid in row_ids]
+            )
+
+    @_auto_reconnect
+    def delete_embedded_stale(self, keep_ids: list):
+        """清理已不存在于最新扫描的 pending/skipped 候选（源码已变化）"""
+        if keep_ids:
+            placeholders = ','.join('?' * len(keep_ids))
+            self._conn.execute(
+                f"DELETE FROM embedded_candidates WHERE status != 'marked' "
+                f"AND id NOT IN ({placeholders})", keep_ids
+            )
+        self._conn.commit()
+
+    @_auto_reconnect
     def update_ui_text(self, item_id: int, translated_text: str):
         self._conn.execute(
             "UPDATE ui_texts SET translated_text=?, is_translated=1 WHERE id=?",
@@ -473,24 +662,43 @@ class ProjectDatabase:
 
     # ========== 角色表（合并后） ==========
 
+    def _find_character_id(self, key: str) -> Optional[int]:
+        """按变量名或显示名查找角色 id（变量名优先，精确匹配身份）"""
+        row = self._conn.execute(
+            "SELECT id FROM characters WHERE variable=?", (key,)
+        ).fetchone()
+        if not row:
+            row = self._conn.execute(
+                "SELECT id FROM characters WHERE display_name=?", (key,)
+            ).fetchone()
+        return row["id"] if row else None
+
     @_auto_reconnect
     def insert_characters(self, characters: list[dict]):
-        """批量插入角色（已存在则更新 variable）"""
+        """批量插入角色（按变量名去重——角色身份是 Character() 变量；
+        无变量名时按显示名去重。同名显示名不再互相吞并）"""
         with self._transaction():
             for c in characters:
                 display_name = c.get("display_name", c.get("name", ""))
+                variable = c.get("variable", "")
                 if not display_name:
                     continue
-                existing = self._conn.execute(
-                    "SELECT id FROM characters WHERE display_name=?",
-                    (display_name,)
-                ).fetchone()
+                if variable:
+                    existing = self._conn.execute(
+                        "SELECT id FROM characters WHERE variable=?",
+                        (variable,)
+                    ).fetchone()
+                else:
+                    existing = self._conn.execute(
+                        "SELECT id FROM characters WHERE display_name=? AND (variable='' OR variable IS NULL)",
+                        (display_name,)
+                    ).fetchone()
                 if existing:
-                    if c.get("variable"):
-                        self._conn.execute(
-                            "UPDATE characters SET variable=? WHERE display_name=?",
-                            (c["variable"], display_name)
-                        )
+                    # 更新显示名（源码可能改名），译名/档案保留
+                    self._conn.execute(
+                        "UPDATE characters SET display_name=? WHERE id=?",
+                        (display_name, existing["id"])
+                    )
                 else:
                     self._conn.execute(
                         """INSERT INTO characters
@@ -498,7 +706,7 @@ class ProjectDatabase:
                             profile_json, is_placeholder, created_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?)""",
                         (
-                            c.get("variable", ""),
+                            variable,
                             display_name,
                             c.get("cn_name", ""),
                             c.get("lines_count", 0),
@@ -516,55 +724,70 @@ class ProjectDatabase:
 
     @_auto_reconnect
     def get_character_by_name(self, display_name: str) -> Optional[dict]:
+        char_id = self._find_character_id(display_name)
+        if char_id is None:
+            return None
         row = self._conn.execute(
-            "SELECT * FROM characters WHERE display_name=?", (display_name,)
+            "SELECT * FROM characters WHERE id=?", (char_id,)
         ).fetchone()
         return self._row_to_character_dict(row) if row else None
 
     @_auto_reconnect
-    def update_character_cn_name(self, display_name: str, cn_name: str):
-        """更新角色中文名"""
-        existing = self._conn.execute(
-            "SELECT id FROM characters WHERE display_name=?", (display_name,)
-        ).fetchone()
-        if existing:
+    def update_character_cn_name(self, display_name: str, cn_name: str,
+                                 variable: str = None):
+        """更新角色中文名（优先按变量名定位，避免同名角色互相覆盖）"""
+        if variable:
+            row = self._conn.execute(
+                "SELECT id FROM characters WHERE variable=?", (variable,)
+            ).fetchone()
+            char_id = row["id"] if row else None
+        else:
+            char_id = self._find_character_id(display_name)
+        if char_id is not None:
             self._conn.execute(
-                "UPDATE characters SET cn_name=? WHERE display_name=?",
-                (cn_name, display_name)
+                "UPDATE characters SET cn_name=? WHERE id=?",
+                (cn_name, char_id)
             )
         else:
             self._conn.execute(
-                "INSERT INTO characters (display_name, cn_name) VALUES (?, ?)",
-                (display_name, cn_name)
+                "INSERT INTO characters (variable, display_name, cn_name) VALUES (?, ?, ?)",
+                (variable or "", display_name, cn_name)
             )
         self._conn.commit()
 
     @_auto_reconnect
-    def update_character_profile(self, display_name: str, profile: dict):
-        """更新角色分析档案"""
+    def update_character_profile(self, display_name: str, profile: dict,
+                                 variable: str = None):
+        """更新角色分析档案（优先按变量名定位）"""
         profile_json = json.dumps(profile, ensure_ascii=False)
-        existing = self._conn.execute(
-            "SELECT id FROM characters WHERE display_name=?", (display_name,)
-        ).fetchone()
-        if existing:
+        if variable:
+            row = self._conn.execute(
+                "SELECT id FROM characters WHERE variable=?", (variable,)
+            ).fetchone()
+            char_id = row["id"] if row else None
+        else:
+            char_id = self._find_character_id(display_name)
+        if char_id is not None:
             self._conn.execute(
-                "UPDATE characters SET profile_json=? WHERE display_name=?",
-                (profile_json, display_name)
+                "UPDATE characters SET profile_json=? WHERE id=?",
+                (profile_json, char_id)
             )
         else:
             self._conn.execute(
-                "INSERT INTO characters (display_name, profile_json) VALUES (?, ?)",
-                (display_name, profile_json)
+                "INSERT INTO characters (variable, display_name, profile_json) VALUES (?, ?, ?)",
+                (variable or "", display_name, profile_json)
             )
         self._conn.commit()
 
     @_auto_reconnect
     def update_character_lines_count(self, display_name: str, count: int):
-        """更新角色台词数"""
-        self._conn.execute(
-            "UPDATE characters SET lines_count=? WHERE display_name=?",
-            (count, display_name)
-        )
+        """更新角色台词数（调用方传入的是对话 speaker 变量名，双键查找）"""
+        char_id = self._find_character_id(display_name)
+        if char_id is not None:
+            self._conn.execute(
+                "UPDATE characters SET lines_count=? WHERE id=?",
+                (count, char_id)
+            )
         self._conn.commit()
 
     @_auto_reconnect
@@ -611,19 +834,23 @@ class ProjectDatabase:
 
     @_auto_reconnect
     def get_profile(self, display_name: str) -> Optional[dict]:
-        """获取角色分析档案"""
+        """获取角色分析档案
+
+        人名表/分析面板按显示名（Ria）存取，对话翻译按说话者变量名
+        （ria/mc/neto）查询，两种键都要能命中。
+        """
         row = self._conn.execute(
-            "SELECT profile_json FROM characters WHERE display_name=?",
-            (display_name,)
+            "SELECT profile_json FROM characters WHERE display_name=? OR variable=?",
+            (display_name, display_name)
         ).fetchone()
         if row and row["profile_json"]:
             return json.loads(row["profile_json"])
         return None
 
     @_auto_reconnect
-    def save_profile(self, display_name: str, profile: dict):
+    def save_profile(self, display_name: str, profile: dict, variable: str = None):
         """保存角色分析档案"""
-        self.update_character_profile(display_name, profile)
+        self.update_character_profile(display_name, profile, variable=variable)
 
     @_auto_reconnect
     def get_all_profiles(self) -> dict[str, dict]:

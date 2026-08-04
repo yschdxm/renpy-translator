@@ -30,7 +30,8 @@ class ConfigManager:
     def __init__(self, config_dir: str = None):
         # 默认配置目录
         if config_dir is None:
-            config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config")
+            from rt_home import home
+            config_dir = str(home() / "config")
 
         self.config_dir = Path(config_dir)
         self.config_file = self.config_dir / "models.json"

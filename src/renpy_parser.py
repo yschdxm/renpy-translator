@@ -64,10 +64,12 @@ class RenpyParser:
 
     # 角色定义模式
     CHARACTER_PATTERNS = [
-        # define e = Character("Eileen") / Character(_("Eileen"))
-        r'^define\s+(\w+)\s*=\s*Character\((?:_\()?"([^"]+)"',
-        # e = Character("Eileen") / e = Character(_("Eileen"))
-        r'^(\w+)\s*=\s*Character\((?:_\()?"([^"]+)"',
+        # define e = Character("Eileen") / Character ("Eileen")（允许空格）
+        # Character(_("Eileen"))（_() 包装）/ DynamicCharacter("persistent.x")（动态名）
+        # 引号用反向引用配对，名字里可含另一种引号（如 "Myrielle's thoughts"）
+        r'^define\s+(\w+)\s*=\s*(Dynamic)?Character\s*\(\s*(?:_\(\s*)?(["\'])(.*?)\3',
+        # e = Character("Eileen")（无 define 前缀，同上）
+        r'^(\w+)\s*=\s*(Dynamic)?Character\s*\(\s*(?:_\(\s*)?(["\'])(.*?)\3',
     ]
 
     # 界面文字模式（screens.rpy中的字符串）
@@ -96,7 +98,13 @@ class RenpyParser:
                 match = re.match(pattern, line)
                 if match:
                     var_name = match.group(1)
-                    char_name = match.group(2)
+                    is_dynamic = bool(match.group(2))
+                    char_name = match.group(4)
+                    # DynamicCharacter 的名字是 store 表达式（如 persistent.xxx），
+                    # 归一为 [表达式] 形式，与 Character("[name]", dynamic=True) 一致，
+                    # 人名翻译时会跳过（玩家可改名变量）
+                    if is_dynamic and not char_name.startswith('['):
+                        char_name = f'[{char_name}]'
                     # 检查是否已经存在该角色
                     if var_name not in self.characters:
                         char_info = CharacterInfo(
@@ -309,7 +317,7 @@ class RenpyParser:
                         print(f"解包 {rpa_file.name} 失败: {e}")
 
         # 反编译只有 .rpyc 的脚本（游戏只发布编译版时）
-        decompiled = {'success': [], 'failed': []}
+        decompiled = {'success': [], 'failed': [], 'decompiled': []}
         if decompile_rpyc and python_exe:
             from rpyc_decompiler import decompile_game_rpyc
             decompiled = decompile_game_rpyc(game_path / 'game', python_exe)

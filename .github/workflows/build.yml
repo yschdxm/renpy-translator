@@ -1,0 +1,147 @@
+name: build
+
+# 跨平台打包：PyInstaller 不能交叉编译，在每个 OS 上分别构建。
+# 产物：
+#   Windows: dist/installer/renpy-translator-setup-*-windows.exe（Inno Setup 安装包）
+#   macOS:   dist/renpy-translator-macos.dmg（.app 封装）
+#   Linux:   dist/renpy-translator-linux.tar.gz
+# 用法：推 tag（如 v0.2.0）触发（自动挂 Release），或手动 workflow_dispatch。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # tag 触发时上传 Release 附件需要
+
+env:
+  UNRPYC_VERSION: '2.0.4'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: renpy-translator-windows
+          - os: ubuntu-latest
+            artifact: renpy-translator-linux
+          - os: macos-latest
+            artifact: renpy-translator-macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Install GTK/WebKit (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-webkit2-4.1 \
+            gir1.2-appindicator3-0.1 libgirepository1.0-dev
+
+      - name: Stage unrpyc
+        shell: bash
+        run: |
+          mkdir -p staging/tools
+          curl -sL "https://github.com/CensoredUsername/unrpyc/archive/refs/tags/v${UNRPYC_VERSION}.zip" -o /tmp/unrpyc.zip
+          python -m zipfile -e /tmp/unrpyc.zip staging/tools/
+          mv "staging/tools/unrpyc-${UNRPYC_VERSION}" staging/tools/unrpyc
+
+      - name: Stage python-embed (Windows, unrpyc 冻结运行用)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -sL "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip" -o /tmp/pyembed.zip
+          mkdir -p staging/tools/python-embed
+          python -m zipfile -e /tmp/pyembed.zip staging/tools/python-embed/
+
+      - name: PyInstaller build
+        run: uv run pyinstaller renpy-translator.spec --noconfirm
+
+      - name: Smoke test (health check)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then EXE=dist/renpy-translator/renpy-translator.exe;
+          else EXE=dist/renpy-translator/renpy-translator; fi
+          "$EXE" --mode server-detached &
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:7861/api/health; then ok=1; break; fi
+            sleep 1
+          done
+          [ -n "$ok" ] || { echo "SMOKE FAILED: server did not come up"; exit 1; }
+          "$EXE" --mode stop || true
+
+      - name: Build installer (Windows, Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\renpy-translator.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create -volname "Ren'Py 翻译工具" \
+            -srcfolder dist/RenPyTranslator.app -ov -format UDZO \
+            dist/renpy-translator-macos.dmg
+
+      - name: Package Linux tarball
+        if: runner.os == 'Linux'
+        run: |
+          cd dist && tar -czf renpy-translator-linux.tar.gz renpy-translator
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/installer/*.exe
+
+      - name: Upload macOS DMG
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/renpy-translator-macos.dmg
+
+      - name: Upload Linux tarball
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/renpy-translator-linux.tar.gz
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/installer/*.exe
+            dist/renpy-translator-macos.dmg
+            dist/renpy-translator-linux.tar.gz

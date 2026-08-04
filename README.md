@@ -1,6 +1,7 @@
 # 🎮 Ren'Py 游戏翻译工具
 
-一个基于 NiceGUI 的 Ren'Py 游戏汉化工具，支持 AI 翻译和手动翻译。使用 SQLite 存储，支持断线重连、状态恢复。
+Ren'Py 游戏汉化工具，支持 AI 翻译和手动翻译。FastAPI + Vue3(Naive UI) 前后端分离架构，
+一份前端两种形态：桌面 GUI（pywebview）与 WebUI（浏览器/局域网）。SQLite 存储，任务持久化，断线重连。
 
 ## ✨ 功能特点
 
@@ -82,10 +83,53 @@ uv sync
 ### 启动
 
 ```bash
-uv run python run.py
+uv run python run.py              # 托盘模式（默认，驻系统托盘，自动开界面）
+uv run python run.py --mode gui   # GUI 窗口（pywebview，关窗即退，服务留后台）
+uv run python run.py --mode web   # WebUI 模式（自动打开浏览器）
+uv run python run.py --mode stop  # 停止后台服务
 ```
 
-访问 http://localhost:8080
+GUI/WebUI 访问 http://localhost:7861。
+
+**托盘驻守**：默认模式无窗口驻系统托盘，托盘菜单：打开界面 / 用浏览器打开 /
+退出服务。服务、窗口、浏览器都是独立进程——关闭任何界面都不影响进行中的任务；
+只有托盘「退出服务」或 `--mode stop` 会停止服务。
+
+首次使用或前端有改动时，先在 `web/` 目录构建前端：`npm install && npm run build`。
+
+### 打包（PyInstaller，跨平台）
+
+PyInstaller 不能交叉编译，需在每个 OS 上分别构建（仓库附带 GitHub Actions
+自动产出三平台，见下文）。产物形式：
+
+- **Windows**:Inno Setup 安装包（`installer/renpy-translator.iss`)——
+  免管理员单用户安装（%LOCALAPPDATA%\Programs,VS Code 同款），向导中可选
+  数据目录，unrpyc + python-embed 随包分发，含卸载器
+- **macOS**:`.app` + DMG
+- **Linux**:tar.gz(GUI 窗口需 `python3-gi gir1.2-webkit2-4.1 gir1.2-appindicator3-0.1`)
+
+本地构建（Windows 示例，需 Inno Setup 6):
+
+```bash
+.venv/Scripts/pyinstaller renpy-translator.spec --noconfirm
+# 准备 tools 物料（unrpyc + python-embed）到 staging/tools/
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\renpy-translator.iss
+# 产物: dist/installer/renpy-translator-setup-*-windows.exe
+```
+
+**数据目录**：便携模式（exe 目录可写）数据存 exe 旁；安装模式自动落到平台数据目录
+(%APPDATA%/renpy-translator 等），安装向导和应用内「模型配置 → 数据目录」都可
+自定义，应用内修改会自动迁移全部数据。
+
+**Ren'Py SDK**：不打进安装包（~280MB)，应用内「模型配置 → 下载 SDK」一键
+下载解压（官网 zip，带进度条），手动指定路径的老方式保留。
+
+**unrpyc**:MIT 许可，随安装包分发（tools/unrpyc);Windows 包附带
+python-embed(3.12 embed-amd64，冻结环境无解释器时用于反编译子进程）;
+macOS/Linux 使用系统 Python 或自放 `tools/python-embed/`。
+
+仓库附带 GitHub Actions(`.github/workflows/build.yml`)：推 tag 或手动触发，
+自动产出 Windows 安装包 / macOS DMG / Linux tar.gz，并跑健康冒烟测试。
 
 ## 📖 使用流程
 
@@ -133,9 +177,12 @@ Header: 🎮 Ren'Py Translator │ [切换项目]          进度: x/x
 
 ### 核心设计
 
+- **前后端分离**：FastAPI 无状态 REST + SSE 推送；浏览器持有 UI 状态，刷新/开关页面不丢任务
+- **后台常驻**：服务独立于界面进程运行，关闭窗口/浏览器任务照跑；重开界面自动接管进行中的任务
 - **SQLite 存储**：每个项目独立 `.db` 文件，WAL 模式，单条翻译后立即写入（毫秒级）
-- **非阻塞 UI**：所有 I/O 操作通过 `run_in_executor` 移至线程池，不阻塞前端
-- **断线恢复**：浏览器关闭后后台任务继续运行，重开后自动恢复按钮状态
+- **任务持久化**：长任务（批量翻译/建项目/导出）与事件流落 `data/app.db`，
+  刷新页面后进度对话框自动重连回放
+- **交互式任务**：任务可挂起等待用户确认（官中检测、内嵌文本复核），刷新页面后对话框自动重开
 - **统一翻译服务**：人名/字符串/对话翻译共用 `TranslationService`，逻辑一致
 - **术语表**：AI 翻译时自动提取游戏专有名词，后续翻译自动注入
 
@@ -143,36 +190,34 @@ Header: 🎮 Ren'Py Translator │ [切换项目]          进度: x/x
 
 ```
 renpy-translator/
-├── src/
-│   ├── main.py                # NiceGUI 主入口 + App 单例
-│   ├── logger.py              # 统一日志系统（分级 + UI 面板绑定）
+├── run.py                     # 统一入口（gui/web/stop + server-detached）
+├── server/                    # FastAPI 后端
+│   ├── app.py                 # 应用工厂（CORS/SPA 挂载/异常处理/请求分级日志）
+│   ├── state.py               # AppState 单例（当前项目会话）
+│   ├── appdb.py               # 应用级库（settings/jobs/job_events）
+│   ├── jobs/                  # 任务系统（db 持久化 + SSE + ask/answer + 取消）
+│   └── api/                   # REST 路由（session/projects/texts/names/embedded/export/configs/jobs/logs/system）
+├── web/                       # Vue3 + Vite + TS + Naive UI 前端
+│   └── src/{api,stores,pages,components}/
+├── src/                       # 纯逻辑核心（与 UI 无关）
 │   ├── database.py            # SQLite 数据库层（WAL + 自动重连）
 │   ├── translation_service.py # 统一翻译调度服务
 │   ├── translator.py          # AI 翻译器（提示词构建 + 术语提取）
 │   ├── renpy_parser.py        # Ren'Py 脚本解析器（label 归属）
-│   ├── rpa_extractor.py       # RPA 文件解包器
-│   ├── sdk_manager.py         # Ren'Py SDK 管理器
-│   ├── project_manager.py     # 项目管理器
-│   ├── config_manager.py      # 配置管理器
-│   ├── components/            # 通用 UI 组件
-│   │   ├── paginated_table.py # 分页表格（从 SQLite 分页查询）
-│   │   ├── progress_panel.py  # 进度面板
-│   │   └── log_panel.py       # 日志面板
-│   └── panels/                # 功能面板
-│       ├── project_panel.py   # 项目管理
-│       ├── name_panel.py      # 人名翻译 + 人物分析
-│       ├── text_panel.py      # 字符串/对话翻译（共用逻辑）
-│       ├── export_panel.py    # 游戏导出
-│       └── config_panel.py    # 模型配置
-├── projects/                  # 项目目录
-│   └── 项目名/
-│       ├── project.db         # SQLite 项目数据库
-│       ├── game/              # 解包后的游戏文件
-│       └── output/            # 导出目录
-├── config/                    # 配置目录
-│   └── models.json            # AI 模型配置
-├── fonts/                     # 中文字体目录
-├── run.py                     # 启动脚本
+│   ├── ai_screener.py         # 内嵌文本 AI 预筛（agentic tool 循环）
+│   ├── embedded_strings.py    # 内嵌文本提取/标记
+│   ├── rt_home.py             # 用户数据根解析（开发=仓库根，冻结=exe 目录）
+│   ├── services/              # 业务服务层（无 UI 依赖）
+│   │   ├── project_creation.py    # 建项目管线
+│   │   ├── game_export.py         # 游戏导出
+│   │   ├── name_translation.py    # 人名翻译+人物分析
+│   │   └── embedded_pipeline.py   # 内嵌文本管线
+│   ├── rpa_extractor.py / rpyc_decompiler.py / tl_parser.py / sdk_manager.py
+│   └── project_manager.py / config_manager.py / logger.py
+├── tests/                     # 后端 pytest（任务系统/内嵌复核回环等）
+├── renpy-translator.spec      # PyInstaller 打包配置
+├── data/app.db                # 应用级库（任务/事件/设置）
+├── projects/  config/  fonts/  logs/  exports/  tools/
 └── pyproject.toml
 ```
 
@@ -185,11 +230,14 @@ renpy-translator/
 | `ui_texts` | UI 字符串翻译 |
 | `characters` | 角色信息（合并人名+分析档案+台词数） |
 | `glossary` | 术语表（游戏专有名词） |
+| `embedded_candidates` | 内嵌文本候选（AI 判定持久化） |
+| `data/app.db: jobs/job_events/settings` | 任务/事件流/全局设置 |
 
 ## 🔧 技术栈
 
-- **前端**: [NiceGUI](https://nicegui.io/) (Vue.js + Quasar)
-- **后端**: Python 3.12+ / SQLite
+- **后端**: FastAPI + SSE + SQLite（Python 3.12+）
+- **前端**: Vue 3 + TypeScript + Naive UI + Pinia（Vite 构建）
+- **桌面壳**: pywebview（WebView2）
 - **AI**: OpenAI 兼容接口
 - **SDK**: Ren'Py SDK
 

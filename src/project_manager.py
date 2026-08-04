@@ -50,7 +50,8 @@ class ProjectManager:
 
     def __init__(self, projects_dir: str = None):
         if projects_dir is None:
-            projects_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "projects")
+            from rt_home import home
+            projects_dir = str(home() / "projects")
 
         self.projects_dir = Path(projects_dir)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
