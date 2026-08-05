@@ -45,7 +45,7 @@ Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、
 |---|---|
 | Windows | `setup-*.exe` 安装包（免管理员）或 `*-portable.zip` 免安装版 |
 | macOS | `*.dmg` |
-| Linux | `.deb` / `.rpm` / `.AppImage` / `.tar.gz` |
+| Linux | `.deb` / `.rpm` / `.AppImage` / `.tar.gz`（x86_64 与 ARM64 双架构） |
 
 启动后驻系统托盘，托盘菜单：打开界面 / 用浏览器打开 / 退出服务。
 首次使用在「模型配置」里：下载或指定 Ren'Py SDK → 添加 AI 模型（OpenAI 兼容接口）。
@@ -102,13 +102,17 @@ PyInstaller 不能交叉编译，每个 OS 分别构建。GitHub Actions
 （`.github/workflows/build.yml`）推 `v*` tag 或手动触发，自动产出：
 
 ```
-renpy-translator-setup-<ver>-windows.exe      Windows 安装包（Inno Setup）
-renpy-translator-<ver>-windows-portable.zip   Windows 免安装版
-renpy-translator-<ver>-macos.dmg              macOS（.app 封装）
-renpy-translator-<ver>-linux-amd64.deb        Debian/Ubuntu
-renpy-translator-<ver>-linux-amd64.rpm        Fedora/RHEL/openSUSE
-renpy-translator-<ver>-linux-x86_64.AppImage  Linux 通用免安装
-renpy-translator-<ver>-linux.tar.gz           Linux 便携
+renpy-translator-setup-<ver>-windows.exe          Windows 安装包（Inno Setup）
+renpy-translator-<ver>-windows-portable.zip       Windows 免安装版
+renpy-translator-<ver>-macos.dmg                  macOS（.app 封装，Apple Silicon/Intel）
+renpy-translator-<ver>-linux-amd64.deb            Debian/Ubuntu（x86_64）
+renpy-translator-<ver>-linux-arm64.deb            Debian/Ubuntu（ARM64）
+renpy-translator-<ver>-linux-amd64.rpm            Fedora/RHEL/openSUSE（x86_64）
+renpy-translator-<ver>-linux-arm64.rpm            Fedora/RHEL/openSUSE（ARM64）
+renpy-translator-<ver>-linux-x86_64.AppImage      Linux 通用免安装（x86_64）
+renpy-translator-<ver>-linux-aarch64.AppImage     Linux 通用免安装（ARM64）
+renpy-translator-<ver>-linux-amd64.tar.gz         Linux 便携（x86_64）
+renpy-translator-<ver>-linux-arm64.tar.gz         Linux 便携（ARM64）
 ```
 
 版本号取 tag（推 `v0.3.0` → `0.3.0`）；手动触发的测试构建用 `dev` 占位。

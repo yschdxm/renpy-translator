@@ -27,7 +27,11 @@ jobs:
           - os: windows-latest
             artifact: renpy-translator-windows
           - os: ubuntu-latest
-            artifact: renpy-translator-linux
+            artifact: renpy-translator-linux-amd64
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            artifact: renpy-translator-linux-arm64
+            arch: arm64
           - os: macos-latest
             artifact: renpy-translator-macos
 
@@ -139,13 +143,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           PKG=dist/deb/renpy-translator
+          DEBARCH=amd64; [ "$(uname -m)" = "aarch64" ] && DEBARCH=arm64
           mkdir -p "$PKG/DEBIAN" "$PKG/opt" "$PKG/usr/share/applications" \
                    "$PKG/usr/bin" "$PKG/usr/share/icons/hicolor/256x256/apps"
           cp -r dist/renpy-translator "$PKG/opt/"
           {
             echo 'Package: renpy-translator'
             echo "Version: ${PKG_VERSION}"
-            echo 'Architecture: amd64'
+            echo "Architecture: $DEBARCH"
             echo 'Maintainer: yschdxm'
             echo 'Depends: python3-gi, gir1.2-webkit2-4.1, gir1.2-appindicator3-0.1'
             echo 'Section: utils'
@@ -155,7 +160,7 @@ jobs:
           cp installer/renpy-translator.desktop "$PKG/usr/share/applications/"
           cp installer/icon.png "$PKG/usr/share/icons/hicolor/256x256/apps/renpy-translator.png"
           ln -s /opt/renpy-translator/renpy-translator "$PKG/usr/bin/renpy-translator"
-          dpkg-deb --build "$PKG" "dist/renpy-translator-${VERSION}-linux-amd64.deb"
+          dpkg-deb --build "$PKG" "dist/renpy-translator-${VERSION}-linux-${DEBARCH}.deb"
 
       - name: Build rpm (Linux, Fedora/RHEL/openSUSE)
         if: runner.os == 'Linux'
@@ -166,10 +171,11 @@ jobs:
           cp installer/renpy-translator.desktop rpmbuild/SOURCES/
           cp installer/icon.png rpmbuild/SOURCES/renpy-translator.png
           RPM_VERSION=$(echo "$PKG_VERSION" | tr '-' '.')
+          RPMARCH=amd64; [ "$(uname -m)" = "aarch64" ] && RPMARCH=arm64
           rpmbuild -bb --define "_topdir $PWD/rpmbuild" \
             --define "_version $RPM_VERSION" installer/rpm.spec
           cp rpmbuild/RPMS/*/renpy-translator-*.rpm \
-            "dist/renpy-translator-${VERSION}-linux-amd64.rpm"
+            "dist/renpy-translator-${VERSION}-linux-${RPMARCH}.rpm"
 
       - name: Build AppImage (Linux, 通用免安装)
         if: runner.os == 'Linux'
@@ -188,15 +194,16 @@ jobs:
           } > AppDir/renpy-translator.desktop
           printf '#!/bin/sh\nDIR="$(dirname "$(readlink -f "$0")")"\nexec "$DIR/usr/bin/renpy-translator" "$@"\n' > AppDir/AppRun
           chmod +x AppDir/AppRun
-          curl -sL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -o /tmp/appimagetool
+          TOOL_ARCH=$(uname -m)  # x86_64 或 aarch64
+          curl -sL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${TOOL_ARCH}.AppImage" -o /tmp/appimagetool
           chmod +x /tmp/appimagetool
           /tmp/appimagetool --appimage-extract-and-run AppDir \
-            "dist/renpy-translator-${VERSION}-linux-x86_64.AppImage"
+            "dist/renpy-translator-${VERSION}-linux-${TOOL_ARCH}.AppImage"
 
       - name: Package Linux tarball
         if: runner.os == 'Linux'
         run: |
-          cd dist && tar -czf "renpy-translator-${VERSION}-linux.tar.gz" renpy-translator
+          cd dist && tar -czf "renpy-translator-${VERSION}-linux-${{ matrix.arch }}.tar.gz" renpy-translator
 
       - name: Package Windows portable zip
         if: runner.os == 'Windows'
@@ -227,10 +234,10 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            dist/renpy-translator-*-linux.tar.gz
-            dist/renpy-translator-*-linux-amd64.deb
-            dist/renpy-translator-*-linux-amd64.rpm
-            dist/renpy-translator-*-linux-x86_64.AppImage
+            dist/renpy-translator-*-linux-*.tar.gz
+            dist/renpy-translator-*-linux-*.deb
+            dist/renpy-translator-*-linux-*.rpm
+            dist/renpy-translator-*-linux-*.AppImage
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -240,7 +247,7 @@ jobs:
             dist/installer/*.exe
             dist/renpy-translator-*-windows-portable.zip
             dist/renpy-translator-*-macos.dmg
-            dist/renpy-translator-*-linux.tar.gz
-            dist/renpy-translator-*-linux-amd64.deb
-            dist/renpy-translator-*-linux-amd64.rpm
-            dist/renpy-translator-*-linux-x86_64.AppImage
+            dist/renpy-translator-*-linux-*.tar.gz
+            dist/renpy-translator-*-linux-*.deb
+            dist/renpy-translator-*-linux-*.rpm
+            dist/renpy-translator-*-linux-*.AppImage
