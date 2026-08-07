@@ -73,6 +73,11 @@ watch(isTerminal, (v) => { if (v) emit('finished', props.job) })
         <n-button size="tiny" style="margin-left: 8px" @click="jobsStore.retry(job.id)">重连</n-button>
       </n-alert>
 
+      <n-alert v-if="job.cancelling && !isTerminal" type="warning" title="正在取消">
+        取消请求已收到，任务将在当前条目完成后停止
+        （在飞的 API 调用需等待返回，并非卡住）。
+      </n-alert>
+
       <n-alert v-if="job.error" type="error" title="任务失败">
         <pre style="white-space: pre-wrap; font-size: 12px; max-height: 200px; overflow: auto">{{ job.error }}</pre>
       </n-alert>
@@ -91,8 +96,11 @@ watch(isTerminal, (v) => { if (v) emit('finished', props.job) })
 
     <template #footer>
       <n-space justify="end">
-        <n-button v-if="!isTerminal && job.status !== 'waiting_input'" type="error" quaternary @click="onCancel">
-          取消任务
+        <n-button
+          v-if="!isTerminal && job.status !== 'waiting_input'"
+          type="error" quaternary :disabled="job.cancelling" @click="onCancel"
+        >
+          {{ job.cancelling ? '取消中…' : '取消任务' }}
         </n-button>
         <n-button v-if="isTerminal" @click="onClose">关闭</n-button>
       </n-space>

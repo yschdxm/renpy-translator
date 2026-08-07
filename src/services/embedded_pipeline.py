@@ -87,13 +87,16 @@ class EmbeddedPipeline:
             await asyncio.sleep(0.5)
         await screen_task
 
-        # 保存判定
+        # 保存判定（含静态分析的危险用途标记）
         for r in undecided:
             c = r['candidate']
+            danger = bool(getattr(c, 'static_danger', False))
             await loop.run_in_executor(
-                None, self.db.update_embedded_ai, r['id'], c.ai_keep, c.ai_reason)
+                None, self.db.update_embedded_ai,
+                r['id'], c.ai_keep, c.ai_reason, danger)
             r['ai_keep'] = 1 if c.ai_keep else 0
             r['ai_reason'] = c.ai_reason
+            r['ai_danger'] = 1 if danger else 0
 
     async def rescreen_all(self, rows, on_progress=None):
         """全部重判：清空判定后重新预筛"""
@@ -107,27 +110,83 @@ class EmbeddedPipeline:
             r['candidate'].ai_reason = ''
         await self.screen_undecided(rows, on_progress)
 
+    async def refine_rows(self, rows, on_progress=None):
+        """批量 agentic 精判（跳过粗筛，每行都走带工具的精审），写库
+
+        on_progress(phase, done, total)：与 screen_undecided 相同。
+        """
+        from ai_screener import AIScreener
+        from usage_rules import UsageAnalyzer
+        loop = asyncio.get_event_loop()
+        if not rows:
+            return
+
+        cands = [r['candidate'] for r in rows]
+        for c in cands:
+            c.ai_confident = False
+        # 静态用途分析先行：证据/危险用途注入精审输入
+        await loop.run_in_executor(
+            None, UsageAnalyzer(str(self.base_dir)).classify_all, cands)
+
+        screener = AIScreener(self.translator, str(self.base_dir), self.logger)
+        progress = {'phase': '精审', 'done': 0, 'total': len(cands),
+                    'finished': False}
+
+        def _run():
+            try:
+                screener._refine_screen(cands, progress)
+            finally:
+                progress['finished'] = True
+
+        refine_task = loop.run_in_executor(None, _run)
+        while not progress.get('finished'):
+            if on_progress:
+                on_progress(progress['phase'], progress['done'], progress['total'])
+            await asyncio.sleep(0.5)
+        await refine_task
+
+        for r in rows:
+            c = r['candidate']
+            danger = bool(getattr(c, 'static_danger', False))
+            await loop.run_in_executor(
+                None, self.db.update_embedded_ai,
+                r['id'], c.ai_keep, c.ai_reason, danger)
+            r['ai_keep'] = 1 if c.ai_keep else 0
+            r['ai_reason'] = c.ai_reason
+            r['ai_danger'] = 1 if danger else 0
+
     # ---- 单句精判 ----
 
     async def refine_single(self, row) -> tuple:
-        """单句 AI 精判（agentic，带工具），写库并返回 (keep, reason)"""
+        """单句 AI 精判（agentic，带工具），写库并返回 (keep, reason, danger)
+
+        先跑静态用途分析，把出现点证据/危险用途注入精审输入，
+        AI 不用从头盲查（refine_by_id 重建的候选没有 static_* 字段）。
+        danger 作为独立标记入库/返回，不拼进 reason。
+        """
         from ai_screener import AIScreener
+        from usage_rules import UsageAnalyzer
         loop = asyncio.get_event_loop()
         c = row['candidate']
+        await loop.run_in_executor(
+            None, UsageAnalyzer(str(self.base_dir)).classify_all, [c])
         screener = AIScreener(self.translator, str(self.base_dir), self.logger)
         c.ai_confident = False
         verdicts = await loop.run_in_executor(
             None, screener._refine_batch, [(0, c)])
         keep, reason = verdicts[0]
+        danger = bool(getattr(c, 'static_danger', False))
         c.ai_keep, c.ai_reason = keep, reason
         row['ai_keep'] = 1 if keep else 0
         row['ai_reason'] = reason
+        row['ai_danger'] = 1 if danger else 0
         await loop.run_in_executor(
-            None, self.db.update_embedded_ai, row['id'], keep, reason)
-        return keep, reason
+            None, self.db.update_embedded_ai, row['id'], keep, reason, danger)
+        return keep, reason, danger
 
     async def refine_by_id(self, row_id: int) -> tuple:
-        """按 db 行 id 单句精判（API 用：从 db 重建最小 Candidate）"""
+        """按 db 行 id 单句精判（API 用：从 db 重建最小 Candidate）
+        返回 (keep, reason, danger)"""
         from embedded_strings import Candidate
         loop = asyncio.get_event_loop()
         rec = await loop.run_in_executor(

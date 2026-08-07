@@ -35,4 +35,17 @@ router.beforeEach((to) => {
   return true
 })
 
+// 前端重新构建后，旧页面里未访问过的路由 chunk（旧 hash）已不存在，
+// 动态 import 404 会导致点击菜单无反应。检测到 chunk 加载失败时
+// 整页刷新，拿到与新构建一致的 index.html 和 chunk。
+router.onError((error) => {
+  const msg = String(error?.message || error)
+  if (msg.includes('dynamically imported module')
+      || msg.includes('Importing a module script failed')
+      || msg.includes('error loading dynamically imported module')
+      || msg.includes('Failed to fetch')) {
+    window.location.reload()
+  }
+})
+
 export default router

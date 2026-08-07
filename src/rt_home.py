@@ -117,3 +117,14 @@ def find_resource(rel: str) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def temp_root() -> Path:
+    """临时文件根（数据根/temp）
+
+    所有临时文件统一落这里：避免删除失败时系统 TEMP 目录被撑爆。
+    服务启动时会清空该目录（见 AppState.startup）。
+    """
+    p = home() / 'temp'
+    p.mkdir(parents=True, exist_ok=True)
+    return p

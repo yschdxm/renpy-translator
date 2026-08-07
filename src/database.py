@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS embedded_candidates (
     confidence TEXT DEFAULT '',
     ai_keep INTEGER DEFAULT -1,
     ai_reason TEXT DEFAULT '',
+    ai_danger INTEGER DEFAULT 0,
     status TEXT DEFAULT 'pending',
     updated_at TEXT DEFAULT ''
 );
@@ -135,6 +136,7 @@ class ProjectDatabase:
             ('dialogues', 'label', "TEXT DEFAULT ''"),
             ('ui_texts', 'label', "TEXT DEFAULT ''"),
             ('ui_texts', 'context_hint', "TEXT DEFAULT ''"),
+            ('embedded_candidates', 'ai_danger', "INTEGER DEFAULT 0"),
         ]:
             existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in existing:
@@ -487,7 +489,7 @@ class ProjectDatabase:
                     result.append({
                         'id': row['id'], 'candidate': c,
                         'ai_keep': row['ai_keep'], 'ai_reason': row['ai_reason'],
-                        'status': row['status'],
+                        'ai_danger': row['ai_danger'], 'status': row['status'],
                     })
                 else:
                     cur = self._conn.execute(
@@ -500,17 +502,21 @@ class ProjectDatabase:
                     )
                     result.append({
                         'id': cur.lastrowid, 'candidate': c,
-                        'ai_keep': -1, 'ai_reason': '', 'status': 'pending',
+                        'ai_keep': -1, 'ai_reason': '', 'ai_danger': 0,
+                        'status': 'pending',
                     })
         return result
 
     @_auto_reconnect
-    def update_embedded_ai(self, row_id: int, ai_keep, ai_reason: str):
-        """更新候选的 AI 判定（ai_keep: 1/0/-1）"""
+    def update_embedded_ai(self, row_id: int, ai_keep, ai_reason: str,
+                           ai_danger: bool = False):
+        """更新候选的 AI 判定（ai_keep: 1/0/-1；ai_danger: 静态分析发现非显示用途）"""
         keep_val = -1 if ai_keep is None else (1 if ai_keep else 0)
         self._conn.execute(
-            "UPDATE embedded_candidates SET ai_keep=?, ai_reason=?, updated_at=? WHERE id=?",
-            (keep_val, ai_reason or '', datetime.now().isoformat(), row_id)
+            "UPDATE embedded_candidates SET ai_keep=?, ai_reason=?, ai_danger=?, "
+            "updated_at=? WHERE id=?",
+            (keep_val, ai_reason or '', 1 if ai_danger else 0,
+             datetime.now().isoformat(), row_id)
         )
         self._conn.commit()
 
@@ -528,13 +534,14 @@ class ProjectDatabase:
         now = datetime.now().isoformat()
         if row_ids:
             self._conn.executemany(
-                "UPDATE embedded_candidates SET ai_keep=-1, ai_reason='', updated_at=? WHERE id=?",
+                "UPDATE embedded_candidates SET ai_keep=-1, ai_reason='', ai_danger=0, "
+                "updated_at=? WHERE id=?",
                 [(now, rid) for rid in row_ids]
             )
         else:
             self._conn.execute(
-                "UPDATE embedded_candidates SET ai_keep=-1, ai_reason='', updated_at=? "
-                "WHERE status != 'marked'", (now,)
+                "UPDATE embedded_candidates SET ai_keep=-1, ai_reason='', ai_danger=0, "
+                "updated_at=? WHERE status != 'marked'", (now,)
             )
         self._conn.commit()
 

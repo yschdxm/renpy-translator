@@ -66,7 +66,13 @@ class Job:
             raise JobCancelled()
 
     def cancel(self):
+        already = self.cancel_event.is_set()
         self.cancel_event.set()
+        if not already:
+            # 取消是协作式的：在飞的 API 调用/文件操作要跑完才到检查点，
+            # 明确告知用户任务正在取消而非卡住（事件入库，重连回放可见）
+            self.emit_stage('正在取消（等待当前条目完成）…')
+            self.emit_log('收到取消请求：将在当前条目完成后停止')
         fut = self._answer_future
         if fut is not None and not fut.done():
             self._loop.call_soon_threadsafe(

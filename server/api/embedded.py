@@ -27,12 +27,21 @@ def _pipeline(state: AppState):
 
 
 def _row_payload(r: dict) -> dict:
+    from usage_rules import RULE_REASON_PREFIX
     c = r['candidate']
+    reason = r['ai_reason'] or ''
+    danger = 1 if r.get('ai_danger') else 0
+    # 旧库兼容：危险警示曾以 ⚠ 前缀拼在理由里，拆回独立标记
+    if reason.startswith('⚠'):
+        danger = 1
+        reason = reason.split('；', 1)[1] if '；' in reason else ''
     return {
         'id': r['id'], 'text': c.text, 'kind': c.kind, 'hint': c.hint,
         'file': c.rel_file, 'line': c.line, 'confidence': c.confidence,
         'raw': c.raw,
-        'ai_keep': r['ai_keep'], 'ai_reason': r['ai_reason'],
+        'ai_keep': r['ai_keep'], 'ai_reason': reason, 'ai_danger': danger,
+        # 判定来源：rule=静态规则确定，ai=模型判定（前端显示不同标识）
+        'source': 'rule' if reason.startswith(RULE_REASON_PREFIX) else 'ai',
         'status': r.get('status', 'pending'),
     }
 
@@ -65,13 +74,28 @@ async def scan(state: AppState = Depends(require_project)):
             })
             action = answer.get('action')
 
+            # 重判/精判都基于前端筛出的行（row_ids），未传则作用于全部
+            def _target_rows():
+                ids = set(answer.get('row_ids') or [])
+                return [r for r in rows if r['id'] in ids] if ids else rows
+
             if action == 'rescreen':
-                job.emit_log('全部重判：清空判定，重新 AI 预筛')
+                target = _target_rows()
+                job.emit_log(f'重判 {len(target)} 条：清空判定，重新 AI 预筛')
                 await pipe.rescreen_all(
-                    rows,
+                    target,
                     on_progress=lambda phase, done, total: job.emit_progress(
                         done / max(total, 1) * 0.9,
                         f'AI 重判（{phase}）: {done}/{total}'))
+                continue
+            if action == 'refine_all':
+                target = _target_rows()
+                job.emit_log(f'精判 {len(target)} 条（agentic 精审）')
+                await pipe.refine_rows(
+                    target,
+                    on_progress=lambda phase, done, total: job.emit_progress(
+                        done / max(total, 1) * 0.9,
+                        f'AI 精判（{phase}）: {done}/{total}'))
                 continue
             if action == 'cancel':
                 raise JobCancelled()
@@ -95,10 +119,11 @@ async def refine(row_id: int, state: AppState = Depends(require_project)):
         raise ApiError(409, 'NO_TRANSLATOR', '请先配置翻译器（模型配置）')
     pipe = _pipeline(state)
     try:
-        keep, reason = await pipe.refine_by_id(row_id)
+        keep, reason, danger = await pipe.refine_by_id(row_id)
     except KeyError as e:
         raise ApiError(404, 'NOT_FOUND', str(e))
-    return {'ai_keep': 1 if keep else 0, 'ai_reason': reason}
+    return {'ai_keep': 1 if keep else 0, 'ai_reason': reason,
+            'ai_danger': 1 if danger else 0}
 
 
 @router.get('/snippet')

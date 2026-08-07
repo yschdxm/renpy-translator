@@ -7,6 +7,7 @@ import asyncio
 import logging
 import shutil
 import sys
+import tempfile
 from collections import deque
 from pathlib import Path
 
@@ -67,10 +68,18 @@ class AppState:
         self.db_lock = asyncio.Lock()
         self.interrupted_count = 0    # 启动时标记的中断任务数（前端汇总提示用）
 
+        # 临时文件统一进数据根/temp（系统 TEMP 删除失败会撑爆），
+        # 并通过 tempfile.tempdir 覆盖所有 stdlib 临时文件落点
+        self.temp_dir = Path(self.root) / 'temp'
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        tempfile.tempdir = str(self.temp_dir)
+
     # ---- 生命周期 ----
 
     async def startup(self):
         loop = asyncio.get_event_loop()
+        # 清空上次会话残留的临时文件（崩溃/强杀时删除失败的兜底）
+        await loop.run_in_executor(None, self._clean_temp)
         # 上次退出时未结束的任务 → interrupted（终态，仅作历史记录；
         # 计数透给前端做一次性汇总提示，不逐条弹窗）
         n = await loop.run_in_executor(None, self.app_db.mark_interrupted)
@@ -81,6 +90,17 @@ class AppState:
             None, self.app_db.get_setting, 'current_project', '')
         if last and self.project_manager.project_exists(last):
             await self.open_project(last)
+
+    def _clean_temp(self):
+        """清空临时目录内容（保留目录本身；占用中的文件跳过）"""
+        for item in self.temp_dir.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def shutdown(self):
         loop = asyncio.get_event_loop()
@@ -258,6 +278,10 @@ class AppState:
         self.app_db = AppDatabase(new_home / 'data' / 'app.db')
         self.config_manager = ConfigManager()
         self.project_manager = ProjectManager()
+        # 临时目录随数据根迁移
+        self.temp_dir = new_home / 'temp'
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        tempfile.tempdir = str(self.temp_dir)
 
         if was_open and self.project_manager.project_exists(was_open):
             await self.open_project(was_open)

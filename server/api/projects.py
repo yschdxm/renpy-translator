@@ -17,8 +17,19 @@ from ..state import AppState
 
 router = APIRouter(prefix='/projects', tags=['projects'])
 
-EXPORTS_DIR = Path(__file__).resolve().parent.parent.parent / 'exports'
-UPLOADS_DIR = Path(__file__).resolve().parent.parent.parent / 'projects' / '_uploads'
+
+def _exports_dir(state: AppState) -> Path:
+    """项目包导出目录（随数据根，冻结/迁移后不错位）"""
+    d = Path(state.root) / 'exports'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _uploads_dir(state: AppState) -> Path:
+    """上传暂存目录（应用临时根下，服务启动时自动清空，见 AppState.startup）"""
+    d = state.temp_dir / 'uploads'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _sdk_path_getter(state: AppState):
@@ -144,7 +155,7 @@ async def create_project_zip(file: UploadFile = File(...),
         raise ApiError(409, 'NAME_EXISTS', f'项目已存在: {name}')
 
     import uuid
-    zip_path = UPLOADS_DIR / f'{uuid.uuid4().hex[:8]}.zip'
+    zip_path = _uploads_dir(state) / f'{uuid.uuid4().hex[:8]}.zip'
     await _save_upload(file, zip_path)
 
     job = state.jobs.create(
@@ -160,7 +171,7 @@ async def create_project_zip(file: UploadFile = File(...),
 async def import_project(file: UploadFile = File(...), name: str = Form(''),
                          state: AppState = Depends(get_state)):
     import uuid
-    zip_path = UPLOADS_DIR / f'{uuid.uuid4().hex[:8]}.zip'
+    zip_path = _uploads_dir(state) / f'{uuid.uuid4().hex[:8]}.zip'
     await _save_upload(file, zip_path)
 
     async def body(job):
@@ -174,8 +185,10 @@ async def import_project(file: UploadFile = File(...), name: str = Form(''),
                 return state.project_manager.import_from_zip(
                     temp_dir, name or None)
 
-        result = await loop.run_in_executor(None, _do_import)
-        zip_path.unlink(missing_ok=True)
+        try:
+            result = await loop.run_in_executor(None, _do_import)
+        finally:
+            zip_path.unlink(missing_ok=True)  # 异常也要清掉上传暂存
         if not result['success']:
             raise RuntimeError(result['message'])
         job.emit_progress(1.0, result['message'])
@@ -198,8 +211,7 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
         if not db_file.exists():
             raise RuntimeError('项目数据库不存在')
 
-        EXPORTS_DIR.mkdir(exist_ok=True)
-        export_path = EXPORTS_DIR / f'{name}.zip'
+        export_path = _exports_dir(state) / f'{name}.zip'
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_project = Path(temp_dir) / name
@@ -376,10 +388,10 @@ async def delete_project(name: str, state: AppState = Depends(get_state)):
 
 
 @router.get('/{name}/packages')
-async def list_packages(name: str):
-    EXPORTS_DIR.mkdir(exist_ok=True)
+async def list_packages(name: str, state: AppState = Depends(get_state)):
+    exports_dir = _exports_dir(state)
     packages = []
-    for zf in sorted(EXPORTS_DIR.glob(f'{name}*.zip'),
+    for zf in sorted(exports_dir.glob(f'{name}*.zip'),
                      key=lambda p: p.stat().st_mtime, reverse=True):
         st = zf.stat()
         packages.append({'file': zf.name, 'size': st.st_size,
@@ -388,8 +400,10 @@ async def list_packages(name: str):
 
 
 @router.get('/{name}/packages/{file}')
-async def download_package(name: str, file: str):
-    target = (EXPORTS_DIR / file).resolve()
-    if not str(target).startswith(str(EXPORTS_DIR.resolve())) or not target.is_file():
+async def download_package(name: str, file: str,
+                           state: AppState = Depends(get_state)):
+    exports_dir = _exports_dir(state)
+    target = (exports_dir / file).resolve()
+    if not str(target).startswith(str(exports_dir.resolve())) or not target.is_file():
         raise ApiError(404, 'NOT_FOUND', '项目包不存在')
     return FileResponse(target, filename=file)

@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NLayout, NLayoutHeader, NLayoutSider, NLayoutContent, NMenu, NModal, NSelect,
-  NTag, NButton, NSpace, useMessage,
+  NTag, NButton, NDropdown, NSpace, useMessage,
 } from 'naive-ui'
 import type { MenuOption } from 'naive-ui'
 import { useSessionStore } from './stores/session'
@@ -39,6 +39,22 @@ const projectOptions = computed(() =>
 const dialogJobs = computed(() =>
   [...jobsStore.jobs.values()].filter((j) => j.dialogOpen))
 
+/** 后台活跃任务：关掉进度对话框后从顶栏任务列表找回 */
+const backgroundJobs = computed(() =>
+  jobsStore.activeJobs.filter((j) => !j.dialogOpen))
+
+const taskMenuOptions = computed(() =>
+  backgroundJobs.value.map((j) => ({
+    key: j.id,
+    label: j.status === 'waiting_input'
+      ? `${j.label || '任务'} — 等待确认`
+      : `${j.label || '任务'} ${Math.round(j.progress * 100)}%`,
+  })))
+
+function openFromList(jobId: string) {
+  jobsStore.openDialog(jobId)
+}
+
 async function onProjectChange(name: string | null) {
   if (!name) return
   await session.open(name)
@@ -69,7 +85,7 @@ let appEvents: EventSource | undefined
 async function heartbeat() {
   try {
     const resp = await fetch('/api/health', {
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(5000),
     })
     if (!resp.ok) throw new Error(String(resp.status))
     heartbeatFails = 0
@@ -137,6 +153,18 @@ onUnmounted(() => {
       <n-tag v-if="session.currentProject && !session.hasTranslator" size="small" type="warning">
         未配置模型
       </n-tag>
+      <!-- 后台任务列表：进度对话框被关闭后任务仍在跑，点列表项重开对应对话框 -->
+      <span style="flex: 1" />
+      <n-dropdown
+        v-if="backgroundJobs.length"
+        trigger="click" placement="bottom-end"
+        :options="taskMenuOptions"
+        @select="openFromList"
+      >
+        <n-button size="tiny" quaternary type="info">
+          ⏳ 后台任务 {{ backgroundJobs.length }}
+        </n-button>
+      </n-dropdown>
     </n-layout-header>
     <n-layout has-sider position="absolute" style="top: 52px">
       <n-layout-sider bordered :width="180">
@@ -147,7 +175,9 @@ onUnmounted(() => {
         />
       </n-layout-sider>
       <n-layout-content content-style="padding: 16px">
-        <router-view />
+        <!-- key=path：/strings 与 /dialogue 共用 TextsPage 组件，
+             不加 key 切换路由时组件实例被复用，表格不会重新加载 -->
+        <router-view :key="$route.path" />
       </n-layout-content>
     </n-layout>
   </n-layout>

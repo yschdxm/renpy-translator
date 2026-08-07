@@ -17,6 +17,8 @@ export interface JobView {
   /** 前端本地状态 */
   dialogOpen: boolean
   sseFailed: boolean
+  /** 已发取消请求、等待任务到检查点（协作式取消，非卡住） */
+  cancelling: boolean
 }
 
 interface JobRecord {
@@ -46,20 +48,23 @@ export const useJobsStore = defineStore('jobs', {
   },
   actions: {
     /** 应用启动时：拉取活跃任务并接管（刷新恢复入口）。
-     *  只接管真正在跑/等输入的——interrupted 是历史终态，不弹窗。 */
+     *  只接管真正在跑/等输入的——interrupted 是历史终态，不弹窗。
+     *  刷新后不自动打开对话框，由顶栏任务列表手动找回。 */
     async restore() {
       const records = await api.get<JobRecord[]>('/api/jobs?active=1')
       for (const rec of records) {
         if (rec.status === 'running' || rec.status === 'waiting_input') {
-          this.track(rec.id, rec)
+          this.track(rec.id, rec, false)
         }
       }
     },
 
-    /** 跟踪任务：建立 SSE 通道并打开进度对话框。
+    /** 跟踪任务：建立 SSE 通道。
+     *  open=true 时打开进度对话框（并关闭其他对话框，避免多个叠加）；
+     *  open=false 仅后台跟踪（页面刷新恢复用）。
      *  未传 initial 时先拉任务记录（补全 kind/label/payload——
      *  页面的按类刷新依赖 kind） */
-    track(jobId: string, initial?: Partial<JobRecord>) {
+    track(jobId: string, initial?: Partial<JobRecord>, open = true) {
       if (!this.jobs.has(jobId)) {
         this.jobs.set(jobId, {
           id: jobId,
@@ -73,12 +78,13 @@ export const useJobsStore = defineStore('jobs', {
           result: initial?.result ?? null,
           error: initial?.error ?? null,
           logs: [],
-          dialogOpen: true,
+          dialogOpen: false,
           sseFailed: false,
+          cancelling: false,
         })
       }
       const view = this.jobs.get(jobId)!
-      view.dialogOpen = true
+      if (open) this.openDialog(jobId)
       if (initial) {
         Object.assign(view, {
           kind: initial.kind ?? view.kind,
@@ -169,7 +175,21 @@ export const useJobsStore = defineStore('jobs', {
     },
 
     async cancel(jobId: string) {
-      await api.post(`/api/jobs/${jobId}/cancel`)
+      const view = this.jobs.get(jobId)
+      if (view) view.cancelling = true
+      try {
+        await api.post(`/api/jobs/${jobId}/cancel`)
+      } catch (e) {
+        if (view) view.cancelling = false
+        throw e
+      }
+    },
+
+    /** 打开指定任务的对话框，同时关闭其他（同一时刻只开一个） */
+    openDialog(jobId: string) {
+      for (const j of this.jobs.values()) {
+        j.dialogOpen = j.id === jobId
+      }
     },
 
     closeDialog(jobId: string) {

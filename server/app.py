@@ -80,6 +80,10 @@ def create_app(root: Path = None) -> FastAPI:
             target = _WEB_DIST / full_path
             if full_path and target.is_file():
                 return FileResponse(target)
-            return FileResponse(_WEB_DIST / 'index.html')
+            # index.html 必须每次重校验：重新构建后 chunk hash 全变，
+            # 缓存的旧入口会让未访问页面的动态 import 404（菜单点击无反应）。
+            # /assets 下的文件按内容 hash 命名，可安全使用默认缓存。
+            return FileResponse(_WEB_DIST / 'index.html',
+                                headers={'Cache-Control': 'no-cache'})
 
     return app

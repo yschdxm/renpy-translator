@@ -32,6 +32,7 @@ projects/
 exports/
 config/
 fonts/
+temp/
 
 # Ren'Py SDK
 renpy-*-sdk/

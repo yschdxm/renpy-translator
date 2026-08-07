@@ -69,7 +69,7 @@ def _port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _wait_port(port: int, timeout: float = 30) -> bool:
+def _wait_port(port: int, timeout: float = 60) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _port_open(port):
@@ -150,7 +150,7 @@ def ensure_server(port: int):
 
     if not _wait_port(port):
         raise SystemExit(
-            f"后台服务启动超时（30 秒），请查看日志: logs/server.log")
+            f"后台服务启动超时（60 秒），请查看日志: logs/server.log")
     print(f"后台服务已启动: http://127.0.0.1:{port}"
           f"（{'日志: logs/server.log' if frozen else '日志见新开的控制台窗口'}）")
 
