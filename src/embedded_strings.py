@@ -344,3 +344,49 @@ def apply_wrapping(candidates: list) -> tuple:
             path.write_text('\n'.join(lines), encoding='utf-8')
 
     return wrapped, skipped
+
+
+def unwrap_candidates(candidates: list) -> tuple:
+    """拆除候选位置的 _(...) 包裹（apply_wrapping 的逆操作）
+
+    导出校验发现标记破坏语法时用于定点取消该处翻译。
+    记录的 col_start 指向带引号字面量起点；包裹后为 _(raw)，
+    从文件末尾向开头处理保持偏移有效，目标位置不匹配时跳过。
+
+    Returns:
+        (拆除数, 跳过数)
+    """
+    by_file = {}
+    for c in candidates:
+        by_file.setdefault(c.file, []).append(c)
+
+    unwrapped = skipped = 0
+    for file_path, cands in by_file.items():
+        path = Path(file_path)
+        try:
+            lines = path.read_text(encoding='utf-8').split('\n')
+        except OSError:
+            skipped += len(cands)
+            continue
+
+        changed = False
+        for c in sorted(cands, key=lambda x: (x.line, x.col_start), reverse=True):
+            idx = c.line - 1
+            if idx >= len(lines):
+                skipped += 1
+                continue
+            line = lines[idx]
+            end = c.col_start + 2 + len(c.raw)  # _( + raw
+            if (line[c.col_start:c.col_start + 2] != '_('
+                    or line[c.col_start + 2:end] != c.raw
+                    or line[end:end + 1] != ')'):
+                skipped += 1
+                continue
+            lines[idx] = line[:c.col_start] + c.raw + line[end + 1:]
+            unwrapped += 1
+            changed = True
+
+        if changed:
+            path.write_text('\n'.join(lines), encoding='utf-8')
+
+    return unwrapped, skipped

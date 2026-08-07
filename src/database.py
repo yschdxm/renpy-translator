@@ -569,6 +569,33 @@ class ProjectDatabase:
         self._conn.commit()
 
     @_auto_reconnect
+    def get_marked_embedded(self) -> list:
+        """全部已标记的内嵌候选（导出校验失败时定位需拆除的包裹）"""
+        rows = self._conn.execute(
+            "SELECT id, rel_file, line, col_start, raw, text, kind, hint "
+            "FROM embedded_candidates WHERE status = 'marked'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @_auto_reconnect
+    def find_dialogue_by_original(self, original_text: str) -> Optional[dict]:
+        """按原文查对话行（导出校验定位报错条目）"""
+        row = self._conn.execute(
+            "SELECT id, original_text, translated_text FROM dialogues "
+            "WHERE original_text = ? LIMIT 1", (original_text,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_auto_reconnect
+    def find_ui_text_by_original(self, original_text: str) -> Optional[dict]:
+        """按原文查 UI 字符串行（导出校验定位报错条目）"""
+        row = self._conn.execute(
+            "SELECT id, original_text, translated_text FROM ui_texts "
+            "WHERE original_text = ? LIMIT 1", (original_text,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_auto_reconnect
     def update_ui_text(self, item_id: int, translated_text: str):
         self._conn.execute(
             "UPDATE ui_texts SET translated_text=?, is_translated=1 WHERE id=?",

@@ -66,6 +66,24 @@ class GameExporter:
         self.db = db
         self.logger = logger
 
+    def build_translation_dict(self) -> dict:
+        """从库构建 原文 -> 译文 字典（导出与导出后自愈重填共用）"""
+        translation_dict = {}
+        for d in self.db.get_dialogues_page(0, 999999, filter_mode='translated')[0]:
+            if d.get('translated_text'):
+                translation_dict[d['original_text']] = d['translated_text']
+        for u in self.db.get_ui_texts_page(0, 999999, filter_mode='translated')[0]:
+            if u.get('translated_text'):
+                translation_dict[u['original_text']] = u['translated_text']
+        for c in self.db.get_characters():
+            if c['cn_name'] and c['cn_name'].strip():
+                translation_dict[c['display_name']] = c['cn_name']
+        glossary = self.db.get_glossary()
+        for en, cn in glossary.items():
+            if cn and cn.strip():
+                translation_dict[en] = cn
+        return translation_dict
+
     def export(self, project_name: str, log, progress) -> dict:
         """执行导出。log(str) 写日志；progress(0~1, 阶段文本) 报进度。
 
@@ -118,31 +136,7 @@ class GameExporter:
 
             # 构建翻译字典
             progress(0.55, '正在构建翻译字典...')
-            translation_dict = {}
-
-            # 对话翻译
-            dialogues = self.db.get_dialogues_page(0, 999999, filter_mode='translated')[0]
-            for d in dialogues:
-                if d.get('translated_text'):
-                    translation_dict[d['original_text']] = d['translated_text']
-
-            # UI 字符串翻译
-            ui_texts = self.db.get_ui_texts_page(0, 999999, filter_mode='translated')[0]
-            for u in ui_texts:
-                if u.get('translated_text'):
-                    translation_dict[u['original_text']] = u['translated_text']
-
-            # 人名翻译
-            characters = self.db.get_characters()
-            for c in characters:
-                if c['cn_name'] and c['cn_name'].strip():
-                    translation_dict[c['display_name']] = c['cn_name']
-
-            # 术语表
-            glossary = self.db.get_glossary()
-            for en, cn in glossary.items():
-                if cn and cn.strip():
-                    translation_dict[en] = cn
+            translation_dict = self.build_translation_dict()
 
             log(f'翻译字典: {len(translation_dict)} 条')
 
