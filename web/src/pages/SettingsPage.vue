@@ -2,7 +2,7 @@
 import { onMounted, reactive, ref, watch } from 'vue'
 import {
   NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputGroup, NInputNumber,
-  NModal, NPopconfirm, NSlider, NSpace, NSpin, NTag, NText, useMessage,
+  NModal, NPopconfirm, NSpace, NSpin, NTag, NText, useMessage,
 } from 'naive-ui'
 import { AddOutline, CloudDownloadOutline, FolderOpenOutline } from '@vicons/ionicons5'
 import { api, errorText } from '../api/client'
@@ -275,23 +275,23 @@ onMounted(async () => {
         <n-form-item label="模型">
           <n-input v-model:value="form.model" placeholder="如 gpt-4o / deepseek-chat" />
         </n-form-item>
-        <n-form-item :label="`温度 ${form.temperature}`">
-          <n-slider v-model:value="form.temperature" :min="0" :max="1" :step="0.05" />
+        <n-form-item label="温度">
+          <n-input-number v-model:value="form.temperature" :step="0.05" />
         </n-form-item>
         <n-form-item label="max_tokens">
-          <n-input-number v-model:value="form.max_tokens" :min="100" :max="32000" />
+          <n-input-number v-model:value="form.max_tokens" />
         </n-form-item>
         <n-form-item label="上下文行数">
-          <n-input-number v-model:value="form.context_lines" :min="0" :max="20" />
+          <n-input-number v-model:value="form.context_lines" />
         </n-form-item>
         <n-form-item label="上下文窗口(K)">
-          <n-input-number v-model:value="form.max_context" :min="1" :max="1024" />
+          <n-input-number v-model:value="form.max_context" />
         </n-form-item>
         <n-form-item label="每批句数">
-          <n-input-number v-model:value="form.batch_lines" :min="10" :max="500" />
+          <n-input-number v-model:value="form.batch_lines" />
         </n-form-item>
         <n-form-item label="超时(秒)">
-          <n-input-number v-model:value="form.timeout" :min="5" :max="600" />
+          <n-input-number v-model:value="form.timeout" />
         </n-form-item>
       </n-form>
       <template #footer>

@@ -16,6 +16,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import webbrowser
@@ -182,12 +183,37 @@ def run_gui(port: int):
             else:
                 subprocess.Popen(['xdg-open', path])
 
+        def close_window(self):
+            """后端广播 shutdown 后，前端调用此方法关闭窗口"""
+            window.destroy()
+
     url = f"http://127.0.0.1:{port}"
     window = webview.create_window(
         "Ren'Py 翻译工具", url,
         width=1440, height=900, min_size=(1100, 700),
         js_api=JsApi(),
     )
+
+    # 看门狗：服务异常死掉（崩溃/被杀）时向前端发提示事件——只提示，不关窗
+    # （正常退出服务由后端广播 shutdown，前端自行关窗，见 JsApi.close_window）
+    def _watchdog():
+        time.sleep(5)  # 启动宽限
+        fails = 0
+        while True:
+            time.sleep(2)
+            if _server_alive(port):
+                fails = 0
+            else:
+                fails += 1
+                if fails >= 3:
+                    try:
+                        window.evaluate_js(
+                            "window.dispatchEvent(new Event('rt-server-lost'))")
+                    except Exception:
+                        pass
+                    return
+
+    threading.Thread(target=_watchdog, daemon=True).start()
     webview.start()
     # 窗口关闭：服务留在后台，任务不受影响
     print("窗口已关闭。服务仍在后台运行（可用托盘或 run.py 重新打开界面）")

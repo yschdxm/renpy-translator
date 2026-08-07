@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /** 应用主体（在 message/dialog provider 内，可用 useMessage） */
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NLayout, NLayoutHeader, NLayoutSider, NLayoutContent, NMenu, NSelect,
+  NLayout, NLayoutHeader, NLayoutSider, NLayoutContent, NMenu, NModal, NSelect,
   NTag, NButton, NSpace, useMessage,
 } from 'naive-ui'
 import type { MenuOption } from 'naive-ui'
@@ -60,7 +60,47 @@ async function answerConfirm(job: JobView, ok: boolean) {
   }
 }
 
+// ---- 服务心跳：连续失败显示「服务已停止」遮罩（浏览器无法自动关页） ----
+const serverDown = ref(false)
+let heartbeatTimer: number | undefined
+let heartbeatFails = 0
+let appEvents: EventSource | undefined
+
+async function heartbeat() {
+  try {
+    const resp = await fetch('/api/health', {
+      signal: AbortSignal.timeout(3000),
+    })
+    if (!resp.ok) throw new Error(String(resp.status))
+    heartbeatFails = 0
+    serverDown.value = false
+  } catch {
+    heartbeatFails++
+    if (heartbeatFails >= 2) serverDown.value = true
+  }
+}
+
+/** 后端优雅退出时广播 shutdown：GUI 自行关窗；浏览器显示遮罩 */
+function onAppEvent(ev: MessageEvent) {
+  const data = JSON.parse(ev.data)
+  if (data.type === 'shutdown') {
+    const pvw = (window as { pywebview?: { api: { close_window(): void } } }).pywebview
+    if (pvw) {
+      pvw.api.close_window()
+    } else {
+      serverDown.value = true
+    }
+  }
+}
+
 onMounted(async () => {
+  // 应用级事件流（服务关停广播）
+  appEvents = new EventSource('/api/events')
+  appEvents.addEventListener('app', onAppEvent)
+  // 看门狗提示（服务异常死亡）：仅提示，不关窗
+  window.addEventListener('rt-server-lost', () => { serverDown.value = true })
+
+  heartbeatTimer = setInterval(heartbeat, 5000)
   await session.refresh()
   await projectsStore.refresh()
   await jobsStore.restore()
@@ -71,6 +111,11 @@ onMounted(async () => {
       '重新发起即可（已翻译的部分会自动跳过）',
       { duration: 8000 })
   }
+})
+
+onUnmounted(() => {
+  clearInterval(heartbeatTimer)
+  appEvents?.close()
 })
 </script>
 
@@ -106,6 +151,18 @@ onMounted(async () => {
       </n-layout-content>
     </n-layout>
   </n-layout>
+
+  <!-- 服务停止遮罩（浏览器模式；GUI 窗口由看门狗自动关闭） -->
+  <n-modal :show="serverDown" preset="card" title="服务已停止" style="width: 400px"
+           :mask-closable="false" :closable="false">
+    <n-space vertical>
+      <span style="font-size: 13px; color: #ccc">
+        后台服务已退出（托盘「退出服务」或 --mode stop）。<br>
+        重新启动服务后点击下方按钮重连。
+      </span>
+      <n-button type="primary" @click="heartbeat">重新连接</n-button>
+    </n-space>
+  </n-modal>
 
   <!-- 全局任务进度对话框（刷新/切路由后自动重开） -->
   <job-progress-dialog v-for="j in dialogJobs" :key="j.id" :job="j">

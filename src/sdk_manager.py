@@ -58,14 +58,22 @@ class SDKManager:
         return renpy_exe.exists()
 
     def get_renpy_exe(self, sdk_path: Path = None) -> Path:
-        """获取 renpy 可执行文件路径"""
+        """获取 renpy 可执行文件路径（多候选：Linux SDK 根的 renpy.sh、
+        macOS .app 内脚本/二进制等）"""
         if sdk_path is None:
             sdk_path = self.sdk_path
 
         if sys.platform == 'win32':
             return sdk_path / 'renpy.exe'
-        else:
-            return sdk_path / 'renpy.sh'
+
+        for rel in ('renpy.sh',
+                    'renpy.app/Contents/MacOS/renpy.sh',
+                    'renpy.app/Contents/MacOS/renpy'):
+            p = sdk_path / rel
+            if p.exists():
+                return p
+        # 都不存在时返回默认路径（_is_valid_sdk 判定失败，错误信息含路径）
+        return sdk_path / 'renpy.sh'
 
     def generate_translations(self, game_dir: str, language: str = "chinese") -> dict:
         """调用 Ren'Py 生成翻译文件

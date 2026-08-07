@@ -1,4 +1,5 @@
 """FastAPI 应用工厂：CORS、API 路由、SPA 静态挂载（fallback 到 index.html）"""
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     app.state.app_state = AppState(app.state.root)
     await app.state.app_state.startup()
     yield
+    # 关停广播在 /api/shutdown 端点里做（lifespan 退出时连接已被 uvicorn 断开）
     await app.state.app_state.shutdown()
 
 
