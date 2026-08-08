@@ -6,17 +6,17 @@
 #   dist/renpy-translator/_internal/            解释器 + 依赖 + src/ + web/dist
 #   <exe 目录>/projects|config|logs|data|exports|fonts|tools   用户数据（RT_HOME，运行时生成/自带）
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 import sys
 
 block_cipher = None
 
 datas = [('src', 'src'), ('web/dist', 'web/dist'),
          ('installer/icon.png', 'assets')]
-# tiktoken 的编码表（cl100k_base 等）由独立包 tiktoken_ext 通过
-# entry-points 插件机制注册；冻结环境缺 dist-info 元数据会导致
-# "Unknown encoding cl100k_base. Plugins found: []"
-datas += copy_metadata('tiktoken_ext')
+# tiktoken 的编码表（cl100k_base 等）在命名空间包 tiktoken_ext 里，
+# 由 pkgutil.iter_modules 动态发现 importlib 导入，静态分析追踪不到，
+# 冻结后 "Plugins found: []"。整体收集 tiktoken_ext 即可（它随 tiktoken
+# wheel 分发，没有独立的 dist 元数据，不要 copy_metadata）。
 binaries = []
 hiddenimports = [
     'anyio._backends._asyncio',
