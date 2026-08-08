@@ -10,17 +10,18 @@ router = APIRouter(prefix='/current/export', tags=['export'])
 
 @router.get('/info')
 async def export_info(state: AppState = Depends(require_project)):
+    from .projects import _exports_dir
     d = await state.db_call(state.db.get_dialogue_count)
     u = await state.db_call(state.db.get_ui_text_count)
     n = await state.db_call(state.db.get_char_dict_count)
     total = d['total'] + u['total'] + n['total']
     translated = d['translated'] + u['translated'] + n['translated']
-    project_dir = state.project_manager._get_project_dir(state.current_project)
     return {
         'dialogue': d, 'ui': u, 'names': n,
         'total': total, 'translated': translated,
         'percent': round(translated / total * 100, 1) if total else 0,
-        'output_dir': str(project_dir / 'output'),
+        # 导出产物只有 exports/{项目名}/{项目名}-translated.zip
+        'exports_dir': str(_exports_dir(state, state.current_project)),
     }
 
 
@@ -44,40 +45,62 @@ async def export_game(state: AppState = Depends(require_project)):
 
     async def body(job):
         import asyncio
-        from services.game_export import GameExporter
+        import tempfile
+        from pathlib import Path
+        from services.game_export import GameExporter, zip_directory
+        from .projects import _exports_dir
         loop = asyncio.get_event_loop()
         exporter = GameExporter(state.project_manager, state.db, state.logger)
 
-        def _export():
-            return exporter.export(
-                state.current_project,
-                log=lambda msg: job.emit_log(msg),
-                progress=lambda v, t: job.emit_progress(v, t),
-            )
+        # 导出组装在临时目录完成（与导入/导出项目包一致），
+        # 不再在项目下留 output/ 目录；最终产物只有 zip 包
+        with tempfile.TemporaryDirectory(prefix='export-') as tmp:
+            work_dir = Path(tmp) / 'out'
 
-        result = await loop.run_in_executor(None, _export)
-        if not result['success']:
-            raise RuntimeError(result['message'])
+            def _export():
+                return exporter.export(
+                    state.current_project,
+                    log=lambda msg: job.emit_log(msg),
+                    progress=lambda v, t: job.emit_progress(v, t),
+                    export_dir=work_dir,
+                )
 
-        # 编译校验 + 自愈（译文修复需模型；内嵌拆除不需要）
-        from services.export_healer import ExportHealer
-        healer = ExportHealer(state.db, state.translator, str(project_dir),
-                              sdk_path, state.logger, exporter)
-        for attempt in range(1, 3):
-            status = await healer.validate_and_heal(
-                project_dir / 'output', log=job.emit_log)
-            if status == 'ok':
-                job.emit_progress(1.0, '导出完成（编译校验通过）')
-                return result
-            if status == 'reexport' and attempt < 2:
-                job.emit_log('内嵌标记已拆除，重新导出...')
-                result = await loop.run_in_executor(None, _export)
-                if not result['success']:
-                    raise RuntimeError(result['message'])
-                continue
-            raise RuntimeError(
-                '导出后编译校验未通过，自动修复未能解决（详见日志）')
-        raise RuntimeError('导出后编译校验未通过')
+            result = await loop.run_in_executor(None, _export)
+            if not result['success']:
+                raise RuntimeError(result['message'])
+
+            # 编译校验 + 自愈（译文修复需模型；内嵌拆除不需要）
+            from services.export_healer import ExportHealer
+            healer = ExportHealer(state.db, state.translator, str(project_dir),
+                                  sdk_path, state.logger, exporter)
+            for attempt in range(1, 3):
+                status = await healer.validate_and_heal(work_dir, log=job.emit_log)
+                if status == 'ok':
+                    break
+                if status == 'reexport' and attempt < 2:
+                    job.emit_log('内嵌标记已拆除，重新导出...')
+                    result = await loop.run_in_executor(None, _export)
+                    if not result['success']:
+                        raise RuntimeError(result['message'])
+                    continue
+                raise RuntimeError(
+                    '导出后编译校验未通过，自动修复未能解决（详见日志）')
+
+            # 打包为 {项目名}-translated.zip（exports/{项目名}/ 下，与项目包同目录）
+            exports_dir = _exports_dir(state, state.current_project)
+            zip_path = exports_dir / f'{state.current_project}-translated.zip'
+            job.emit_log(f'打包导出结果: {zip_path.name}')
+            await loop.run_in_executor(
+                None,
+                lambda: zip_directory(
+                    work_dir, zip_path,
+                    progress=lambda v, t: job.emit_progress(0.95 + v * 0.05, t)))
+            job.emit_log(f'导出包: {zip_path}')
+            result['package'] = str(zip_path)
+            result['package_name'] = zip_path.name
+            result['message'] = f'导出包: {zip_path}'
+            job.emit_progress(1.0, '导出完成（编译校验通过）')
+            return result
 
     job = state.jobs.create('export.game', f'导出游戏（{state.current_project}）',
                             {}, body)

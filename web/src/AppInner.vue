@@ -175,9 +175,10 @@ onUnmounted(() => {
         />
       </n-layout-sider>
       <n-layout-content content-style="padding: 16px">
-        <!-- key=path：/strings 与 /dialogue 共用 TextsPage 组件，
-             不加 key 切换路由时组件实例被复用，表格不会重新加载 -->
-        <router-view :key="$route.path" />
+        <!-- key=path+项目：/strings 与 /dialogue 共用 TextsPage 组件，
+             不加 key 切换路由时组件实例被复用，表格不会重新加载；
+             同理，切换当前项目后页面也必须重挂载以加载新项目数据 -->
+        <router-view :key="$route.path + '|' + session.currentProject" />
       </n-layout-content>
     </n-layout>
   </n-layout>

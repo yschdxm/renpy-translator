@@ -18,11 +18,25 @@ from ..state import AppState
 router = APIRouter(prefix='/projects', tags=['projects'])
 
 
-def _exports_dir(state: AppState) -> Path:
-    """项目包导出目录（随数据根，冻结/迁移后不错位）"""
+def _exports_dir(state: AppState, name: str = '') -> Path:
+    """导出目录（随数据根）。传 name 时按项目分目录：exports/{name}/"""
     d = Path(state.root) / 'exports'
+    if name:
+        d = d / name
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _migrate_flat_packages(state: AppState, name: str):
+    """旧版平铺在 exports/ 下的包迁移到 exports/{name}/（项目包补 -project 后缀）"""
+    base = Path(state.root) / 'exports'
+    target_dir = _exports_dir(state, name)
+    for zf in list(base.glob(f'{name}.zip')) + list(base.glob(f'{name}-*.zip')):
+        new_name = zf.name if zf.name != f'{name}.zip' else f'{name}-project.zip'
+        try:
+            zf.rename(target_dir / new_name)
+        except OSError:
+            pass  # 占用/冲突时跳过，下次再迁
 
 
 def _uploads_dir(state: AppState) -> Path:
@@ -170,7 +184,10 @@ async def create_project_zip(file: UploadFile = File(...),
 @router.post('/import')
 async def import_project(file: UploadFile = File(...), name: str = Form(''),
                          state: AppState = Depends(get_state)):
+    import re
     import uuid
+    # 自动命名去掉导出后缀：Foo-project.zip / Foo-translated.zip → Foo
+    name = re.sub(r'-(project|translated)$', '', name.strip())
     zip_path = _uploads_dir(state) / f'{uuid.uuid4().hex[:8]}.zip'
     await _save_upload(file, zip_path)
 
@@ -211,7 +228,7 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
         if not db_file.exists():
             raise RuntimeError('项目数据库不存在')
 
-        export_path = _exports_dir(state) / f'{name}.zip'
+        export_path = _exports_dir(state, name) / f'{name}-project.zip'
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_project = Path(temp_dir) / name
@@ -256,9 +273,14 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
                     for f in files:
                         all_files.append(
                             (Path(root) / f, Path(root).relative_to(temp_dir)))
+                total = len(all_files) or 1
                 with zipfile.ZipFile(export_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for file_path, arc_dir in all_files:
+                    for i, (file_path, arc_dir) in enumerate(all_files, 1):
                         zf.write(file_path, arc_dir / file_path.name)
+                        if i % 10 == 0 or i == total:
+                            job.emit_progress(
+                                0.6 + (i / total) * 0.38,
+                                f'正在打包... ({i}/{total})')
 
             await loop.run_in_executor(None, _create_zip)
 
@@ -389,9 +411,10 @@ async def delete_project(name: str, state: AppState = Depends(get_state)):
 
 @router.get('/{name}/packages')
 async def list_packages(name: str, state: AppState = Depends(get_state)):
-    exports_dir = _exports_dir(state)
+    _migrate_flat_packages(state, name)
+    exports_dir = _exports_dir(state, name)
     packages = []
-    for zf in sorted(exports_dir.glob(f'{name}*.zip'),
+    for zf in sorted(exports_dir.glob('*.zip'),
                      key=lambda p: p.stat().st_mtime, reverse=True):
         st = zf.stat()
         packages.append({'file': zf.name, 'size': st.st_size,
@@ -402,8 +425,36 @@ async def list_packages(name: str, state: AppState = Depends(get_state)):
 @router.get('/{name}/packages/{file}')
 async def download_package(name: str, file: str,
                            state: AppState = Depends(get_state)):
-    exports_dir = _exports_dir(state)
+    exports_dir = _exports_dir(state, name)
     target = (exports_dir / file).resolve()
     if not str(target).startswith(str(exports_dir.resolve())) or not target.is_file():
         raise ApiError(404, 'NOT_FOUND', '项目包不存在')
     return FileResponse(target, filename=file)
+
+
+@router.post('/{name}/packages/reveal')
+async def reveal_package(name: str, file: str = '',
+                         state: AppState = Depends(get_state)):
+    """在系统文件管理器中打开该项目的导出目录（传 file 时选中该文件）"""
+    import subprocess
+    import sys
+    exports_dir = _exports_dir(state, name)
+    target = exports_dir
+    if file:
+        target = (exports_dir / file).resolve()
+        if not str(target).startswith(str(exports_dir.resolve())) \
+                or not target.is_file():
+            raise ApiError(404, 'NOT_FOUND', '项目包不存在')
+
+    if sys.platform.startswith('win'):
+        # /select 选中文件；目录则直接打开
+        if file:
+            subprocess.Popen(['explorer', '/select,', str(target)])
+        else:
+            subprocess.Popen(['explorer', str(target)])
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', '-R', str(target)] if file
+                         else ['open', str(target)])
+    else:
+        subprocess.Popen(['xdg-open', str(exports_dir)])
+    return {'ok': True}

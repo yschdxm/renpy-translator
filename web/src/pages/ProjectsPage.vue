@@ -132,10 +132,11 @@ async function submitImport() {
 }
 
 // 项目类任务终结 → 刷新列表/会话/项目包；建项目成功 → 自动打开（对齐旧版）
+// export.game 也会产生项目包（{项目名}-translated.zip），一并触发刷新
 const handledJobs = new Set<string>()
 watch(
   () => [...jobsStore.jobs.values()]
-    .filter((j) => j.kind.startsWith('project.'))
+    .filter((j) => j.kind.startsWith('project.') || j.kind === 'export.game')
     .map((j) => `${j.id}:${j.status}`).join(','),
   async () => {
     await store.refresh()
@@ -229,14 +230,12 @@ async function loadPackages(name: string) {
     `/api/projects/${encodeURIComponent(name)}/packages`)
 }
 
-function packageUrl(name: string, file: string): string {
-  return `/api/projects/${encodeURIComponent(name)}/packages/${encodeURIComponent(file)}`
-}
-
-function formatSize(bytes: number): string {
-  if (bytes >= 1 << 30) return (bytes / (1 << 30)).toFixed(2) + ' GB'
-  if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + ' MB'
-  return (bytes / 1024).toFixed(0) + ' KB'
+async function revealPackages(name: string) {
+  try {
+    await api.post(`/api/projects/${encodeURIComponent(name)}/packages/reveal`)
+  } catch (e) {
+    message.error(errorText(e), { duration: 8000 })
+  }
 }
 
 onMounted(async () => {
@@ -293,15 +292,9 @@ onMounted(async () => {
       </n-space>
 
       <div v-if="packages[p.name]?.length" style="margin-top: 8px">
-        <n-text depth="3" style="font-size: 12px">已导出的项目包：</n-text>
-        <n-space size="small" style="margin-top: 4px">
-          <a
-            v-for="pkg in packages[p.name]"
-            :key="pkg.file"
-            :href="packageUrl(p.name, pkg.file)"
-            style="font-size: 12px"
-          >{{ pkg.file }}（{{ formatSize(pkg.size) }}）</a>
-        </n-space>
+        <n-button size="tiny" quaternary @click="revealPackages(p.name)">
+          打开导出目录（{{ packages[p.name].length }} 个包）
+        </n-button>
       </div>
     </n-card>
 

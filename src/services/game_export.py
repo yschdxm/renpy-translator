@@ -57,6 +57,18 @@ def escape_translation(text: str, percent: str = 'say') -> str:
     return text.replace('"', '\\"')
 
 
+def zip_directory(src_dir: Path, zip_path: Path, progress=None):
+    """把目录打成 zip（内容含目录结构），progress(0~1, 文本) 逐文件回报"""
+    import zipfile
+    files = [p for p in src_dir.rglob('*') if p.is_file()]
+    total = len(files) or 1
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for i, p in enumerate(files, 1):
+            zf.write(p, p.relative_to(src_dir))
+            if progress and (i % 10 == 0 or i == total):
+                progress(i / total, f'正在打包... ({i}/{total})')
+
+
 class GameExporter:
     """导出翻译后的游戏为独立目录（阻塞式，调用方放 executor/线程）"""
 
@@ -84,15 +96,18 @@ class GameExporter:
                 translation_dict[en] = cn
         return translation_dict
 
-    def export(self, project_name: str, log, progress) -> dict:
+    def export(self, project_name: str, log, progress,
+               export_dir: Path = None) -> dict:
         """执行导出。log(str) 写日志；progress(0~1, 阶段文本) 报进度。
 
+        export_dir: 导出目标目录（调用方给临时目录，打包后清理）；
+        缺省为项目 output/（兼容旧调用）。
         Returns: {'success': bool, 'message': str}
         """
         try:
             project_dir = self.project_manager._get_project_dir(project_name)
             game_work_dir = project_dir / 'game'
-            export_dir = project_dir / 'output'
+            export_dir = Path(export_dir) if export_dir else project_dir / 'output'
 
             # 清理旧输出
             if export_dir.exists():

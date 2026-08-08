@@ -24,9 +24,15 @@ export const useSessionStore = defineStore('session', {
   }),
   getters: {
     progressText(state): string {
+      // 只显示有内容的类别；都没有则空
+      const parts: string[] = []
       const d = state.stats.dialogue
-      if (!d) return ''
-      return `进度: ${d.translated}/${d.total}`
+      const u = state.stats.ui
+      const n = state.stats.names
+      if (d?.total) parts.push(`对话 ${d.translated}/${d.total}`)
+      if (u?.total) parts.push(`字符串 ${u.translated}/${u.total}`)
+      if (n?.total) parts.push(`人物 ${n.translated}/${n.total}`)
+      return parts.length ? parts.join(' · ') : ''
     },
   },
   actions: {

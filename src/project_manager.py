@@ -25,12 +25,15 @@ class ProjectInfo:
     translated_dialogues: int = 0
     total_strings: int = 0
     translated_strings: int = 0
+    total_names: int = 0
+    translated_names: int = 0
     updated_at: str = ""
 
     @property
     def progress_percent(self) -> float:
-        total = self.total_dialogues + self.total_strings
-        translated = self.translated_dialogues + self.translated_strings
+        total = self.total_dialogues + self.total_strings + self.total_names
+        translated = (self.translated_dialogues + self.translated_strings
+                      + self.translated_names)
         if total == 0:
             return 0
         return round(translated / total * 100, 1)
@@ -38,7 +41,8 @@ class ProjectInfo:
     @property
     def progress_text(self) -> str:
         return (f"{self.translated_dialogues}/{self.total_dialogues} 对话, "
-                f"{self.translated_strings}/{self.total_strings} 字符串 "
+                f"{self.translated_strings}/{self.total_strings} 字符串, "
+                f"{self.translated_names}/{self.total_names} 人物 "
                 f"({self.progress_percent}%)")
 
 
@@ -85,6 +89,7 @@ class ProjectManager:
                 meta = db.get_all_meta()
                 dialogue_stats = db.get_dialogue_count()
                 ui_stats = db.get_ui_text_count()
+                name_stats = db.get_char_dict_count()
                 db.close()
 
                 projects.append(ProjectInfo(
@@ -95,6 +100,8 @@ class ProjectManager:
                     translated_dialogues=dialogue_stats["translated"],
                     total_strings=ui_stats["total"],
                     translated_strings=ui_stats["translated"],
+                    total_names=name_stats["total"],
+                    translated_names=name_stats["translated"],
                     updated_at=meta.get("updated_at", "")
                 ))
             except Exception as e:
