@@ -78,11 +78,14 @@ async function answerConfirm(job: JobView, ok: boolean) {
 
 // ---- 服务心跳：连续失败显示「服务已停止」遮罩（浏览器无法自动关页） ----
 const serverDown = ref(false)
+// 迁移后自动重启中：显示「正在重启」遮罩，服务恢复后整页刷新
+const restarting = ref(false)
 let heartbeatTimer: number | undefined
 let heartbeatFails = 0
 let appEvents: EventSource | undefined
 
 async function heartbeat() {
+  if (restarting.value) return  // 重启期间由 pollRestart 负责探测
   try {
     const resp = await fetch('/api/health', {
       signal: AbortSignal.timeout(5000),
@@ -96,6 +99,25 @@ async function heartbeat() {
   }
 }
 
+/** 自动重启期间轮询健康检查，恢复后整页刷新（数据根已换，前端状态全重来） */
+async function pollRestart() {
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 2000))
+    try {
+      const resp = await fetch('/api/health', {
+        signal: AbortSignal.timeout(3000),
+      })
+      if (resp.ok) {
+        location.reload()
+        return
+      }
+    } catch { /* 服务还没起来 */ }
+  }
+  // 超时：按服务停止处理，让用户手动重连
+  restarting.value = false
+  serverDown.value = true
+}
+
 /** 后端优雅退出时广播 shutdown：GUI 自行关窗；浏览器显示遮罩 */
 function onAppEvent(ev: MessageEvent) {
   const data = JSON.parse(ev.data)
@@ -106,6 +128,9 @@ function onAppEvent(ev: MessageEvent) {
     } else {
       serverDown.value = true
     }
+  } else if (data.type === 'restarting') {
+    restarting.value = true
+    pollRestart()
   }
 }
 
@@ -183,8 +208,19 @@ onUnmounted(() => {
     </n-layout>
   </n-layout>
 
+  <!-- 自动重启遮罩（迁移后清理占用文件）：服务恢复后自动刷新页面 -->
+  <n-modal :show="restarting" preset="card" title="正在重启服务" style="width: 400px"
+           :mask-closable="false" :closable="false">
+    <n-space vertical>
+      <span style="font-size: 13px; color: #ccc">
+        为释放被占用的文件并完成迁移清理，服务正在自动重启。<br>
+        恢复后页面会自动刷新，请稍候...
+      </span>
+    </n-space>
+  </n-modal>
+
   <!-- 服务停止遮罩（浏览器模式；GUI 窗口由看门狗自动关闭） -->
-  <n-modal :show="serverDown" preset="card" title="服务已停止" style="width: 400px"
+  <n-modal :show="serverDown && !restarting" preset="card" title="服务已停止" style="width: 400px"
            :mask-closable="false" :closable="false">
     <n-space vertical>
       <span style="font-size: 13px; color: #ccc">

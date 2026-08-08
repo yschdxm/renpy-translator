@@ -141,10 +141,17 @@ class DataDirIn(BaseModel):
 
 @router.put('/settings/data-dir')
 async def migrate_data_dir(req: DataDirIn, state: AppState = Depends(get_state)):
-    """迁移数据目录并切换（应用内自定义；长时间操作，前端显示迁移中模态）"""
+    """迁移数据目录并切换（应用内自定义；长时间操作，前端显示迁移中模态）
+
+    有被占用文件残留时自动重启服务：重启后旧句柄释放，启动流程完成清理。
+    """
     if not req.path.strip():
         raise ApiError(400, 'EMPTY_PATH', '数据目录不能为空')
     result = await state.relocate_home(Path(req.path.strip()))
+    if result.get('leftover'):
+        from .system import schedule_restart
+        result['restarting'] = True
+        schedule_restart(state)
     return result
 
 

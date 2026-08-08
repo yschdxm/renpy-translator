@@ -89,15 +89,18 @@ def _server_alive(port: int) -> bool:
 
 
 def _spawn_detached(args: list, log_name: str = None,
-                    visible_console: bool = False):
+                    visible_console: bool = False, home: Path = None):
     """以分离进程启动（父进程退出后存活）
 
     visible_console=True（开发模式）：开一个独立的可见控制台窗口，
     实时显示该进程日志；窗口随新进程组独立，关启动终端不影响它。
+    home：数据根（缺省用进程启动时解析的 HOME；迁移后重启时需传入
+    重新解析的新数据根，旧 HOME 已过期）。
     """
+    base = home or HOME
     out = None
     if log_name:
-        log_file = HOME / 'logs' / log_name
+        log_file = base / 'logs' / log_name
         log_file.parent.mkdir(exist_ok=True)
         out = open(log_file, 'a', encoding='utf-8')
     if sys.platform == 'win32':
@@ -112,12 +115,12 @@ def _spawn_detached(args: list, log_name: str = None,
             args,
             stdout=out if out else None,
             stderr=subprocess.STDOUT if out else None,
-            creationflags=flags, cwd=str(HOME), close_fds=True)
+            creationflags=flags, cwd=str(base), close_fds=True)
     return subprocess.Popen(
         args,
         stdout=out if out else None,
         stderr=subprocess.STDOUT if out else None,
-        start_new_session=True, cwd=str(HOME), close_fds=True)
+        start_new_session=True, cwd=str(base), close_fds=True)
 
 
 def _self_cmd(mode: str) -> list:
@@ -313,6 +316,16 @@ def run_server(port: int, detached: bool = False):
                 sys.stdout.flush()
             except Exception:
                 pass
+            # 迁移后自动重启：server.api.system.schedule_restart 写好标记后
+            # 触发优雅退出走到这里。数据根已切换（指针已改），必须重新解析
+            # rt_home，不能用进程启动时缓存的 HOME。
+            from rt_home import home as _cur_home
+            cur = _cur_home()
+            flag = cur / 'data' / 'restart.flag'
+            if flag.exists():
+                flag.unlink(missing_ok=True)
+                _spawn_detached(_self_cmd('server-detached'), 'server.log',
+                                home=cur)
             os._exit(0)
 
 

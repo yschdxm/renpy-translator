@@ -222,6 +222,7 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
 
     async def body(job):
+        from ..jobs import JobCancelled
         loop = asyncio.get_event_loop()
         project_dir = state.project_manager._get_project_dir(name)
         db_file = project_dir / 'project.db'
@@ -230,59 +231,69 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
 
         export_path = _exports_dir(state, name) / f'{name}-project.zip'
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_project = Path(temp_dir) / name
-            temp_project.mkdir()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_project = Path(temp_dir) / name
+                temp_project.mkdir()
 
-            job.emit_progress(0.1, '正在复制数据库...')
-            await loop.run_in_executor(
-                None, shutil.copy2, db_file, temp_project / 'project.db')
+                job.check_cancelled()
+                job.emit_progress(0.1, '正在复制数据库...')
+                await loop.run_in_executor(
+                    None, shutil.copy2, db_file, temp_project / 'project.db')
 
-            game_dir = project_dir / 'game'
-            if game_dir.exists():
-                copy_progress = {'current': 0, 'total': 0, 'done': False}
+                game_dir = project_dir / 'game'
+                if game_dir.exists():
+                    copy_progress = {'current': 0, 'total': 0, 'done': False}
 
-                def _copy_game():
-                    try:
-                        total = sum(1 for _ in game_dir.rglob('*') if _.is_file())
-                        copy_progress['total'] = total if total > 0 else 1
-                        for root, dirs, files in __import__('os').walk(game_dir):
-                            rel = Path(root).relative_to(game_dir)
-                            dst = temp_project / 'game' / rel
-                            dst.mkdir(parents=True, exist_ok=True)
-                            for f in files:
-                                shutil.copy2(Path(root) / f, dst / f)
-                                copy_progress['current'] += 1
-                    finally:
-                        copy_progress['done'] = True
+                    def _copy_game():
+                        try:
+                            total = sum(1 for _ in game_dir.rglob('*') if _.is_file())
+                            copy_progress['total'] = total if total > 0 else 1
+                            for root, dirs, files in __import__('os').walk(game_dir):
+                                rel = Path(root).relative_to(game_dir)
+                                dst = temp_project / 'game' / rel
+                                dst.mkdir(parents=True, exist_ok=True)
+                                for f in files:
+                                    job.check_cancelled()
+                                    shutil.copy2(Path(root) / f, dst / f)
+                                    copy_progress['current'] += 1
+                        finally:
+                            copy_progress['done'] = True
 
-                copy_task = loop.run_in_executor(None, _copy_game)
-                while not copy_progress['done']:
-                    total, current = copy_progress['total'], copy_progress['current']
-                    if total > 0:
-                        job.emit_progress(0.1 + (current / total) * 0.4,
-                                          f'正在复制游戏文件... ({current}/{total})')
-                    await asyncio.sleep(0.3)
-                await copy_task
+                    copy_task = loop.run_in_executor(None, _copy_game)
+                    while not copy_progress['done']:
+                        job.check_cancelled()
+                        total, current = copy_progress['total'], copy_progress['current']
+                        if total > 0:
+                            job.emit_progress(0.1 + (current / total) * 0.4,
+                                              f'正在复制游戏文件... ({current}/{total})')
+                        await asyncio.sleep(0.3)
+                    await copy_task
 
-            job.emit_progress(0.6, '正在打包...')
+                job.check_cancelled()
+                job.emit_progress(0.6, '正在打包...')
 
-            def _create_zip():
-                all_files = []
-                for root, dirs, files in __import__('os').walk(temp_project):
-                    for f in files:
-                        all_files.append(
-                            (Path(root) / f, Path(root).relative_to(temp_dir)))
-                total = len(all_files) or 1
-                with zipfile.ZipFile(export_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for i, (file_path, arc_dir) in enumerate(all_files, 1):
-                        zf.write(file_path, arc_dir / file_path.name)
-                        if i % 10 == 0 or i == total:
-                            job.emit_progress(
-                                0.6 + (i / total) * 0.38,
-                                f'正在打包... ({i}/{total})')
+                def _create_zip():
+                    all_files = []
+                    for root, dirs, files in __import__('os').walk(temp_project):
+                        for f in files:
+                            all_files.append(
+                                (Path(root) / f, Path(root).relative_to(temp_dir)))
+                    total = len(all_files) or 1
+                    with zipfile.ZipFile(export_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for i, (file_path, arc_dir) in enumerate(all_files, 1):
+                            job.check_cancelled()
+                            zf.write(file_path, arc_dir / file_path.name)
+                            if i % 10 == 0 or i == total:
+                                job.emit_progress(
+                                    0.6 + (i / total) * 0.38,
+                                    f'正在打包... ({i}/{total})')
 
-            await loop.run_in_executor(None, _create_zip)
+                await loop.run_in_executor(None, _create_zip)
+        except JobCancelled:
+            # 删除半成品 zip，避免被当成完整项目包下载
+            export_path.unlink(missing_ok=True)
+            raise
 
         job.emit_progress(1.0, f'导出成功: {export_path.name}')
         return {'file': export_path.name, 'path': str(export_path)}

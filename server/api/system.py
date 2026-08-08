@@ -17,6 +17,31 @@ router = APIRouter(tags=['system'])
 APP_CHANNEL = '_app'
 
 
+def schedule_restart(state: AppState):
+    """延迟自动重启服务（迁移后清理占用文件用）。
+
+    广播 restarting（前端显示「正在重启」而非「服务已停止」并在恢复后
+    自动刷新）→ 等当前响应送达 → 写重启标记 → 触发优雅退出。
+    run.py 退出前发现标记即以分离进程拉起新服务。
+    """
+    async def _restart():
+        state.bus.publish(APP_CHANNEL,
+                          {'seq': 0, 'kind': 'app',
+                           'data': {'type': 'restarting'}})
+        await asyncio.sleep(1.0)  # 让迁移响应与事件先送达
+        flag = state.root / 'data' / 'restart.flag'
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text('1', encoding='utf-8')
+
+        def _raise():
+            time.sleep(0.3)
+            signal.raise_signal(signal.SIGINT)
+
+        threading.Thread(target=_raise, daemon=True).start()
+
+    asyncio.get_event_loop().create_task(_restart())
+
+
 @router.post('/shutdown')
 async def shutdown(state: AppState = Depends(get_state)):
     """优雅关停服务：先广播 shutdown（此时 SSE 连接还开着），再触发信号。

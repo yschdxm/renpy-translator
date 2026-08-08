@@ -51,12 +51,20 @@ async function migrateDataDir() {
   }
   migrating.value = true
   try {
-    const result = await api.put<{ home: string; moved: string[] }>(
-      '/api/settings/data-dir', { path: newDataDir.value.trim() })
+    const result = await api.put<{
+      home: string; moved: string[]
+      leftover?: string[]; leftover_dir?: string; restarting?: boolean
+    }>('/api/settings/data-dir', { path: newDataDir.value.trim() })
     dataDir.value = result.home
     newDataDir.value = result.home
     await session.refresh()
     message.success(`数据目录已迁移（${result.moved.length} 项）`)
+    if (result.leftover?.length) {
+      message.info(
+        `${result.leftover.length} 个被占用的日志文件已复制到新目录，`
+        + '服务将自动重启完成清理，恢复后页面会自动刷新',
+        { duration: 12000, closable: true })
+    }
   } catch (e) {
     message.error(errorText(e), { duration: 12000, closable: true })
   } finally {

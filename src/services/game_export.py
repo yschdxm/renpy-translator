@@ -57,13 +57,20 @@ def escape_translation(text: str, percent: str = 'say') -> str:
     return text.replace('"', '\\"')
 
 
-def zip_directory(src_dir: Path, zip_path: Path, progress=None):
+class ExportCancelled(Exception):
+    """导出被取消（协作式：循环内检查 cancel_event 触发）"""
+
+
+def zip_directory(src_dir: Path, zip_path: Path, progress=None,
+                  cancel_event=None):
     """把目录打成 zip（内容含目录结构），progress(0~1, 文本) 逐文件回报"""
     import zipfile
     files = [p for p in src_dir.rglob('*') if p.is_file()]
     total = len(files) or 1
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for i, p in enumerate(files, 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ExportCancelled()
             zf.write(p, p.relative_to(src_dir))
             if progress and (i % 10 == 0 or i == total):
                 progress(i / total, f'正在打包... ({i}/{total})')
@@ -77,6 +84,11 @@ class GameExporter:
         self.project_manager = project_manager
         self.db = db
         self.logger = logger
+        self._cancel_event = None  # threading.Event，由 export() 注入
+
+    def _check_cancel(self):
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise ExportCancelled()
 
     def build_translation_dict(self) -> dict:
         """从库构建 原文 -> 译文 字典（导出与导出后自愈重填共用）"""
@@ -97,14 +109,17 @@ class GameExporter:
         return translation_dict
 
     def export(self, project_name: str, log, progress,
-               export_dir: Path = None) -> dict:
+               export_dir: Path = None, cancel_event=None) -> dict:
         """执行导出。log(str) 写日志；progress(0~1, 阶段文本) 报进度。
 
         export_dir: 导出目标目录（调用方给临时目录，打包后清理）；
         缺省为项目 output/（兼容旧调用）。
+        cancel_event: threading.Event，置位时长循环抛 ExportCancelled。
         Returns: {'success': bool, 'message': str}
         """
+        self._cancel_event = cancel_event
         try:
+            self._check_cancel()
             project_dir = self.project_manager._get_project_dir(project_name)
             game_work_dir = project_dir / 'game'
             export_dir = Path(export_dir) if export_dir else project_dir / 'output'
@@ -125,6 +140,7 @@ class GameExporter:
                 dst_root = export_dir / rel_root
                 dst_root.mkdir(parents=True, exist_ok=True)
                 for f in files:
+                    self._check_cancel()
                     shutil.copy2(Path(root) / f, dst_root / f)
                     copied += 1
                     if copied % 20 == 0 or copied == total:
@@ -193,6 +209,9 @@ class GameExporter:
 
             return {'success': True, 'message': f'导出目录: {export_dir}'}
 
+        except ExportCancelled:
+            # 取消优先于兜底：不能吞成导出失败
+            raise
         except Exception as e:
             log(f'导出异常: {str(e)}')
             return {'success': False, 'message': str(e)}
@@ -203,6 +222,7 @@ class GameExporter:
         files = list(tl_dir.rglob('*.rpy'))
         total = len(files) or 1
         for file_idx, tl_file in enumerate(files, 1):
+            self._check_cancel()
             try:
                 with open(tl_file, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -277,6 +297,7 @@ class GameExporter:
         files = list(tl_dir.rglob('*.rpy'))
         total = len(files) or 1
         for file_idx, tl_file in enumerate(files, 1):
+            self._check_cancel()
             try:
                 with open(tl_file, 'r', encoding='utf-8') as f:
                     content = f.read()

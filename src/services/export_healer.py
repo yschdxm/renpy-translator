@@ -64,13 +64,24 @@ class ExportHealer:
         self.sdk_path = sdk_path
         self.logger = logger
         self.exporter = exporter  # GameExporter（重填 tl 用）
+        self._cancel_check = None
+
+    def _check_cancel(self):
+        if self._cancel_check is not None:
+            self._cancel_check()
 
     # ========== 总入口 ==========
 
-    async def validate_and_heal(self, export_dir: Path, log) -> str:
-        """校验导出目录并按需自愈，返回 'ok' | 'reexport' | 'fail'"""
+    async def validate_and_heal(self, export_dir: Path, log,
+                                cancel_check=None) -> str:
+        """校验导出目录并按需自愈，返回 'ok' | 'reexport' | 'fail'
+
+        cancel_check: 可调用对象，抛异常即中止（任务取消用）。
+        """
+        self._cancel_check = cancel_check
         loop = asyncio.get_event_loop()
         for round_no in range(1, self.MAX_ROUNDS + 1):
+            self._check_cancel()
             log(f'编译校验（第 {round_no}/{self.MAX_ROUNDS} 轮）...')
             errors = await loop.run_in_executor(
                 None, self._validate, export_dir)
@@ -183,6 +194,7 @@ class ExportHealer:
         loop = asyncio.get_event_loop()
         fixed_any = False
         for e in errors:
+            self._check_cancel()
             tl_file = export_dir / e['file']
             entry = self._locate_entry(tl_file, e['line'])
             if not entry:

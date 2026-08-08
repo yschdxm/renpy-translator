@@ -9,13 +9,23 @@ from openai import OpenAI
 from dataclasses import dataclass
 import tiktoken
 
-# 模块级 BPE 编码器（cl100k_base，对 GPT 系列精确，对国产模型是误差 <15% 的近似，
-# 远好于 len//3 对中文的 3 倍失真）。加载一次复用。
-_ENC = tiktoken.get_encoding("cl100k_base")
+# BPE 编码器（cl100k_base，对 GPT 系列精确，对国产模型是误差 <15% 的近似，
+# 远好于 len//3 对中文的 3 倍失真）。惰性加载：打包环境若缺 tiktoken_ext
+# 插件元数据，get_encoding 会在导入期炸掉整个项目打开流程，降级为粗估即可。
+_ENC = None
+_ENC_FAILED = False
 
 
 def _count_tokens(text: str) -> int:
-    """估算文本 token 数"""
+    """估算文本 token 数（编码器不可用时退化为 len//3 粗估）"""
+    global _ENC, _ENC_FAILED
+    if _ENC is None and not _ENC_FAILED:
+        try:
+            _ENC = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _ENC_FAILED = True
+    if _ENC is None:
+        return len(text or "") // 3
     return len(_ENC.encode(text or ""))
 
 

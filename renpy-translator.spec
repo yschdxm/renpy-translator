@@ -6,17 +6,22 @@
 #   dist/renpy-translator/_internal/            解释器 + 依赖 + src/ + web/dist
 #   <exe 目录>/projects|config|logs|data|exports|fonts|tools   用户数据（RT_HOME，运行时生成/自带）
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
 import sys
 
 block_cipher = None
 
 datas = [('src', 'src'), ('web/dist', 'web/dist'),
          ('installer/icon.png', 'assets')]
+# tiktoken 的编码表（cl100k_base 等）由独立包 tiktoken_ext 通过
+# entry-points 插件机制注册；冻结环境缺 dist-info 元数据会导致
+# "Unknown encoding cl100k_base. Plugins found: []"
+datas += copy_metadata('tiktoken_ext')
 binaries = []
 hiddenimports = [
     'anyio._backends._asyncio',
     'uvicorn.lifespan.on',
+    'tiktoken_ext.openai_public',
     'webview.platforms.gtk' if sys.platform.startswith('linux') else
     'webview.platforms.cocoa' if sys.platform == 'darwin' else
     'webview.platforms.winforms',
@@ -27,7 +32,7 @@ if sys.platform == 'win32':
 # pythonnet/clr_loader 仅 Windows（pywebview winforms 后端）；
 # tiktoken/pystray/pillow 的动态部分整体收集
 for pkg in (['pythonnet', 'clr_loader'] if sys.platform == 'win32' else []) \
-        + ['tiktoken', 'pystray', 'PIL']:
+        + ['tiktoken', 'tiktoken_ext', 'pystray', 'PIL']:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

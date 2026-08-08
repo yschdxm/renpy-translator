@@ -33,6 +33,46 @@ class _RingBufferHandler(logging.Handler):
             pass
 
 
+def _move_tree(src: Path, dst: Path) -> list:
+    """移动目录树；返回未能从源删除的文件相对路径列表（被占用等）。
+
+    先尝试整体 shutil.move；失败（跨盘回退复制时撞到占用文件、
+    目录内有打开句柄等）则逐文件复制——读别的进程打开的文件没问题，
+    删不掉的（如本进程/GUI 持有的 logs/*.log）留在源目录。
+    """
+    try:
+        shutil.move(str(src), str(dst))
+        return []
+    except OSError:
+        pass
+    leftover = []
+    dst.mkdir(parents=True, exist_ok=True)
+    for p in src.rglob('*'):
+        rel = p.relative_to(src)
+        target = dst / rel
+        if p.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(p, target)
+            p.unlink()
+        except OSError:
+            leftover.append(str(rel))
+    # 能删的空目录清掉；含占用文件的骨架留在源目录
+    for d in sorted((d for d in src.rglob('*') if d.is_dir()),
+                    key=lambda x: len(x.parts), reverse=True):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+    return leftover
+
+
 class AppState:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -80,6 +120,8 @@ class AppState:
         loop = asyncio.get_event_loop()
         # 清空上次会话残留的临时文件（崩溃/强杀时删除失败的兜底）
         await loop.run_in_executor(None, self._clean_temp)
+        # 上次迁移时被占用而留下的旧目录文件（迁移后自动重启时走到这里）
+        await loop.run_in_executor(None, self._run_pending_cleanup)
         # 上次退出时未结束的任务 → interrupted（终态，仅作历史记录；
         # 计数透给前端做一次性汇总提示，不逐条弹窗）
         n = await loop.run_in_executor(None, self.app_db.mark_interrupted)
@@ -255,7 +297,7 @@ class AppState:
 
         def _migrate():
             new_home.mkdir(parents=True, exist_ok=True)
-            moved = []
+            moved, leftover = [], []
             for name in self.MIGRATABLE_DIRS:
                 src = old_home / name
                 if not src.exists():
@@ -263,11 +305,12 @@ class AppState:
                 dst = new_home / name
                 if dst.exists():  # 空目录直接替换
                     dst.rmdir()
-                shutil.move(str(src), str(dst))
+                for rel in _move_tree(src, dst):
+                    leftover.append((f'{name}/{rel}', str(src / rel)))
                 moved.append(name)
-            return moved
+            return moved, leftover
 
-        moved = await loop.run_in_executor(None, _migrate)
+        moved, leftover = await loop.run_in_executor(None, _migrate)
         set_home(new_home)
 
         # 重建管理器与状态
@@ -287,7 +330,66 @@ class AppState:
             await self.open_project(was_open)
 
         self.logger.info(f'数据目录已迁移: {old_home} -> {new_home}（{len(moved)} 项）')
-        return {'home': str(new_home), 'moved': moved}
+        result = {'home': str(new_home), 'moved': moved}
+        if leftover:
+            # 被自身/GUI 进程占用的文件（logs/*.log 等）：内容已复制到新目录，
+            # 记录待清理清单，由「自动重启 → 启动时清理」流程收尾
+            names = [n for n, _ in leftover]
+            self.logger.warning(
+                f'{len(names)} 个文件被占用未能从旧目录移除（已复制到新目录）: '
+                + '、'.join(names[:5]))
+            result['leftover'] = names
+            result['leftover_dir'] = str(old_home)
+            import json
+            self.app_db.set_setting('pending_cleanup', json.dumps(
+                {'old_home': str(old_home),
+                 'files': [a for _, a in leftover]}))
+        return result
+
+    # ---- 迁移残留清理（重启后启动时执行） ----
+
+    def _run_pending_cleanup(self):
+        """清理上次迁移时被占用而留在旧目录的文件。
+
+        仍有文件被占用（如 GUI 进程持有的旧 gui.log）则保留记录，
+        下次启动再试；清完即删除记录。
+        """
+        import json
+        raw = self.app_db.get_setting('pending_cleanup', '')
+        if not raw:
+            return
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            self.app_db.set_setting('pending_cleanup', '')
+            return
+        old_home = Path(rec.get('old_home', ''))
+        remaining = []
+        for f in rec.get('files', []):
+            try:
+                Path(f).unlink(missing_ok=True)
+            except OSError:
+                remaining.append(f)
+        # 空目录自下而上修剪；含占用文件的骨架留下次
+        if old_home.is_dir():
+            for d in sorted((d for d in old_home.rglob('*') if d.is_dir()),
+                            key=lambda x: len(x.parts), reverse=True):
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+            try:
+                old_home.rmdir()
+            except OSError:
+                pass
+        if remaining:
+            self.app_db.set_setting('pending_cleanup', json.dumps(
+                {'old_home': str(old_home), 'files': remaining}))
+            self.logger.warning(
+                f'迁移残留清理：仍有 {len(remaining)} 个文件被占用，下次启动重试')
+        else:
+            self.app_db.set_setting('pending_cleanup', '')
+            self.logger.info(f'迁移残留已清理: {old_home}')
 
     # ---- API 日志（移植自旧 main.py::_on_api_log）----
 
