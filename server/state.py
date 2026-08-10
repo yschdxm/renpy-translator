@@ -132,6 +132,29 @@ class AppState:
             None, self.app_db.get_setting, 'current_project', '')
         if last and self.project_manager.project_exists(last):
             await self.open_project(last)
+        # 常备 8.x + 7.x 两个 SDK：缺哪个大版本自动后台下载补齐
+        await self._ensure_sdks()
+
+    async def _ensure_sdks(self):
+        """检测默认目录下的 SDK，缺的大版本以任务形式自动后台下载。
+
+        Ren'Py 7 与 8 的 .rpyc 互不兼容，创建项目/导出校验按游戏引擎
+        选 SDK，两个大版本都得有。
+        """
+        from sdk_manager import (DEFAULT_SDK_7, DEFAULT_SDK_8)
+        loop = asyncio.get_event_loop()
+        majors = set(await loop.run_in_executor(None, self.sdk_paths))
+        from .sdk_download import make_download_body
+        for major, version in ((8, DEFAULT_SDK_8), (7, DEFAULT_SDK_7)):
+            if major in majors:
+                continue
+            self.logger.info(
+                f"未检测到 Ren'Py {major}.x SDK，自动后台下载 {version}")
+            self.jobs.create(
+                'settings.sdk-download',
+                f"自动下载 Ren'Py SDK {version}",
+                {'version': version, 'auto': True},
+                make_download_body(self, version))
 
     def _clean_temp(self):
         """清空临时目录内容（保留目录本身；占用中的文件跳过）"""
@@ -160,6 +183,30 @@ class AppState:
             self.db = None
             await loop.run_in_executor(None, db.close)
         await loop.run_in_executor(None, self.app_db.close)
+
+    # ---- SDK 路径（固定默认目录 tools/，不支持自定义） ----
+
+    def sdk_paths(self) -> dict:
+        """{8: path, 7: path}：默认目录下已安装的 SDK，每个大版本取最新"""
+        from sdk_manager import find_installed_sdks
+        best = {}
+        for v, p in find_installed_sdks():
+            if v[0] not in best or v > best[v[0]][0]:
+                best[v[0]] = (v, str(p))
+        return {m: p for m, (v, p) in best.items()}
+
+    def resolve_sdk_path(self, game_dir=None) -> str:
+        """按游戏目录的引擎大版本选 SDK；无游戏目录时返回主 SDK（8.x 优先）。
+
+        游戏版本可探测但对应大版本未安装时返回 ''（调用方给出指引）。
+        """
+        from sdk_manager import detect_engine_version
+        paths = self.sdk_paths()
+        if game_dir is not None:
+            gv = detect_engine_version(Path(game_dir))
+            if gv:
+                return paths.get(gv[0], '')
+        return paths.get(8) or next(iter(paths.values()), '')
 
     # ---- 项目会话 ----
 

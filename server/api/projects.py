@@ -47,13 +47,9 @@ def _uploads_dir(state: AppState) -> Path:
 
 
 def _sdk_path_getter(state: AppState):
-    def _get():
-        sdk_path = state.app_db.get_setting('sdk_path', '')
-        if not sdk_path:
-            for c in state.config_manager.load_all_configs():
-                if c.sdk_path:
-                    return c.sdk_path
-        return sdk_path
+    """按游戏目录解析匹配引擎大版本的 SDK（7/8 双槽位，含旧配置回退）"""
+    def _get(game_dir=None):
+        return state.resolve_sdk_path(game_dir)
     return _get
 
 

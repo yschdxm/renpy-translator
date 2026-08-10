@@ -49,12 +49,15 @@ export const useJobsStore = defineStore('jobs', {
   actions: {
     /** 应用启动时：拉取活跃任务并接管（刷新恢复入口）。
      *  只接管真正在跑/等输入的——interrupted 是历史终态，不弹窗。
-     *  刷新后不自动打开对话框，由顶栏任务列表手动找回。 */
+     *  一般任务刷新后不自动打开对话框，由顶栏任务列表手动找回；
+     *  例外：SDK 自动补装属于用户应知情的安装流程，与手动下载一样弹进度框。 */
     async restore() {
       const records = await api.get<JobRecord[]>('/api/jobs?active=1')
       for (const rec of records) {
         if (rec.status === 'running' || rec.status === 'waiting_input') {
-          this.track(rec.id, rec, false)
+          const autoSdk = rec.kind === 'settings.sdk-download'
+            && rec.payload?.auto === true
+          this.track(rec.id, rec, autoSdk)
         }
       }
     },

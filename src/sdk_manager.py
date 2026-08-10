@@ -1,10 +1,73 @@
 """Ren'Py SDK 管理器 - 负责调用 Ren'Py SDK 功能"""
 
 import os
+import re
 import sys
 import subprocess
 from pathlib import Path
-from typing import Optional
+
+# 7.x 及更早：__init__.py 里字面量 version_tuple = (7, 4, 9, vc_version)
+_VER_TUPLE_RE = re.compile(r'version_tuple\s*=\s*\((\d+),\s*(\d+),\s*(\d+)')
+# 8.x 的 __init__.py 版本是动态计算的，改从 SDK 目录名解析
+_DIR_NAME_RE = re.compile(r'renpy-(\d+)\.(\d+)\.(\d+)-sdk')
+
+
+def detect_engine_version(base) -> tuple | None:
+    """探测 Ren'Py 引擎版本 (major, minor, patch)。
+
+    base: 游戏目录（读取其内置 renpy/__init__.py；7.x 可直接解析，
+    8.x 游戏读不到则返回 None）或 SDK 目录（从目录名解析）。
+    """
+    base = Path(base)
+    text = ''
+    try:
+        text = (base / 'renpy' / '__init__.py').read_text(
+            encoding='utf-8', errors='ignore')
+    except OSError:
+        pass
+    m = _VER_TUPLE_RE.search(text)
+    if m:
+        return tuple(int(g) for g in m.groups())
+    m = _DIR_NAME_RE.search(base.name)
+    if m:
+        return tuple(int(g) for g in m.groups())
+    return None
+
+
+# 常备 SDK 默认版本：8.x 跟随当前稳定版；7.x 为 7.4 系列最终维护版
+# （Ren'Py 7 已停更，读 7.x 游戏的 .rpyc 必须用它）
+DEFAULT_SDK_8 = '8.5.3'
+DEFAULT_SDK_7 = '7.4.11'
+
+
+def find_installed_sdks() -> list:
+    """扫描默认目录下已安装的 SDK，返回 [(version_tuple, path)]。
+
+    覆盖：数据根与 exe 目录下的 tools/renpy-*-sdk、exe 目录下的
+    renpy-*-sdk（开发态仓库根）。不支持自定义目录。
+    """
+    from rt_home import resources
+    mgr = SDKManager()
+    found, seen = [], set()
+
+    def _add(path):
+        path = Path(path)
+        key = str(path.resolve())
+        if key in seen or not mgr._is_valid_sdk(path):
+            return
+        v = detect_engine_version(path)
+        if v:
+            seen.add(key)
+            found.append((v, path))
+
+    for base in resources():
+        tools = base / 'tools'
+        if tools.is_dir():
+            for cand in sorted(tools.glob('renpy-*-sdk')):
+                _add(cand)
+        for cand in sorted(base.glob('renpy-*-sdk')):
+            _add(cand)
+    return found
 
 
 class SDKManager:
@@ -12,44 +75,6 @@ class SDKManager:
 
     def __init__(self, sdk_path: str = ""):
         self.sdk_path = Path(sdk_path) if sdk_path else None
-
-    def find_sdk(self, search_dir: str = None) -> Optional[Path]:
-        """自动查找 Ren'Py SDK
-
-        Args:
-            search_dir: 搜索目录，默认为项目目录
-
-        Returns:
-            SDK 路径或 None
-        """
-        # 1. 检查配置的路径
-        if self.sdk_path and self.sdk_path.exists():
-            if self._is_valid_sdk(self.sdk_path):
-                return self.sdk_path
-
-        # 2. 在指定目录或项目目录中查找
-        search_paths = []
-        if search_dir:
-            search_paths.append(Path(search_dir))
-
-        # 添加常见位置
-        search_paths.extend([
-            Path.cwd(),
-            Path(__file__).parent.parent,  # 项目根目录
-            Path.home() / "Downloads",
-        ])
-
-        for search_path in search_paths:
-            if not search_path.exists():
-                continue
-
-            # 查找 renpy-*-sdk 目录
-            for item in search_path.iterdir():
-                if item.is_dir() and 'renpy' in item.name.lower() and 'sdk' in item.name.lower():
-                    if self._is_valid_sdk(item):
-                        return item
-
-        return None
 
     def _is_valid_sdk(self, path: Path) -> bool:
         """检查是否是有效的 Ren'Py SDK"""
@@ -99,12 +124,17 @@ class SDKManager:
             print(f'[SDK] 执行命令: {" ".join(cmd)}')
 
             # 执行命令
+            # cwd 必须用 SDK 目录而非游戏目录：游戏发行目录自带 renpy/
+            # 引擎包，cwd 在游戏目录时它会抢占 sys.path——Python 代码用
+            # 游戏的、原生模块（librenpython.dll 里的 render）用 SDK 的，
+            # 大版本不一致即崩溃（如 'Cache' object has no attribute
+            # 'get_renders'）。cwd 在 SDK 目录时两处都来自同一 SDK，自洽。
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=3600,
-                cwd=str(game_dir)  # 在游戏目录中运行
+                cwd=str(self.sdk_path)
             )
 
             output = result.stdout + result.stderr
@@ -140,10 +170,3 @@ class SDKManager:
                 languages.append(item.name)
 
         return languages
-
-
-def find_renpy_sdk(search_dir: str = None) -> Optional[str]:
-    """便捷函数：查找 Ren'Py SDK"""
-    manager = SDKManager()
-    sdk_path = manager.find_sdk(search_dir)
-    return str(sdk_path) if sdk_path else None

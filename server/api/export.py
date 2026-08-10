@@ -31,17 +31,17 @@ async def export_game(state: AppState = Depends(require_project)):
     if d['translated'] == 0:
         raise ApiError(409, 'NOTHING_TO_EXPORT', '没有已翻译的内容可导出')
 
-    sdk_path = state.app_db.get_setting('sdk_path', '')
+    project_dir = state.project_manager._get_project_dir(state.current_project)
+    sdk_path = state.resolve_sdk_path(project_dir)
     if not sdk_path:
-        for c in state.config_manager.load_all_configs():
-            if c.sdk_path:
-                sdk_path = c.sdk_path
-                break
-    if not sdk_path:
+        from sdk_manager import detect_engine_version
+        gv = detect_engine_version(project_dir)
+        hint = (f"（游戏引擎为 Ren'Py {'.'.join(map(str, gv))}，"
+                f'需要 {gv[0]}.x 的 SDK）' if gv else '')
         # 不降级：tl 模板生成本就依赖 SDK，无 SDK 的导出没有意义
         raise ApiError(409, 'NO_SDK',
-                       "导出需要 Ren'Py SDK（模板生成与编译校验），请先在模型配置中设置 SDK 路径")
-    project_dir = state.project_manager._get_project_dir(state.current_project)
+                       "导出需要 Ren'Py SDK（模板生成与编译校验）" + hint +
+                       '，请在模型配置页下载对应版本的 SDK')
 
     async def body(job):
         import asyncio

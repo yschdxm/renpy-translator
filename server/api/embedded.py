@@ -14,14 +14,8 @@ router = APIRouter(prefix='/current/embedded', tags=['embedded'])
 
 def _pipeline(state: AppState):
     from services.embedded_pipeline import EmbeddedPipeline
-    sdk_path = state.app_db.get_setting('sdk_path', '')
-    if not sdk_path:
-        # 回退：旧版存在模型配置里
-        for c in state.config_manager.load_all_configs():
-            if c.sdk_path:
-                sdk_path = c.sdk_path
-                break
     project_dir = state.project_manager._get_project_dir(state.current_project)
+    sdk_path = state.resolve_sdk_path(project_dir)
     return EmbeddedPipeline(state.db, state.translator, str(project_dir),
                             sdk_path, state.logger)
 

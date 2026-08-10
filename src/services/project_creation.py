@@ -17,6 +17,7 @@ UnrpycMissingError 原样上抛（调用方负责提示安装方法并清理项�
 import asyncio
 import json as _json
 import os
+import re
 import shutil
 import sys
 import zipfile
@@ -139,6 +140,7 @@ class ProjectCreator:
                  logger: TranslationLogger, get_sdk_path=None):
         self.project_manager = project_manager
         self.logger = logger
+        # get_sdk_path(game_dir)：按游戏引擎大版本解析匹配的 SDK 路径
         self.get_sdk_path = get_sdk_path
 
     async def create(self, name: str, game_dir: str, model: str,
@@ -195,6 +197,9 @@ class ProjectCreator:
             progress(0.30, '游戏文件复制完成')
 
             # 步骤3: 解包 rpa & 反编译 rpyc
+            # 反编译必须在 SDK 生成前：translate 只能从 .rpy 源生成模板
+            # （实测：同一脚本编译成 .rpyc 删掉 .rpy 后就不再产出模板），
+            # 纯 .rpyc 游戏的反编译产物是模板生成的唯一来源
             progress(0.30, '正在解包游戏资源...')
 
             from renpy_parser import RenpyParser
@@ -215,11 +220,11 @@ class ProjectCreator:
                 self.logger.info(
                     f'rpyc 反编译: {result["decompiled_rpyc_ok"]} 成功, '
                     f'{result["decompiled_rpyc_fail"]} 失败', panel='projects')
-            if result.get('decompiled_files'):
-                rel_files = [
-                    Path(p).relative_to(game_work_dir).as_posix()
-                    for p in result['decompiled_files']
-                ]
+            rel_files = [
+                Path(p).relative_to(game_work_dir).as_posix()
+                for p in result.get('decompiled_files', [])
+            ]
+            if rel_files:
                 await loop.run_in_executor(
                     None, db.set_meta, 'decompiled_rpy_files', _json.dumps(rel_files)
                 )
@@ -250,8 +255,22 @@ class ProjectCreator:
                 )
                 self.logger.info(f'已删除官方中文翻译（{official_tl} 个文件）', panel='projects')
 
-            # 步骤4: SDK 生成翻译文件
-            sdk_path = self.get_sdk_path() if self.get_sdk_path else ''
+            # 步骤4: SDK 生成翻译文件（自愈重试）
+            sdk_path = (self.get_sdk_path(str(game_work_dir))
+                        if self.get_sdk_path else '')
+            if not sdk_path:
+                # 游戏版本可探测但没有匹配大版本的 SDK（Ren'Py 7 与 8 的
+                # .rpyc 互不兼容），继续走只会得到没有对话的空项目
+                from sdk_manager import detect_engine_version
+                gv = detect_engine_version(game_work_dir)
+                if gv:
+                    hint = '（7.x 建议 7.4.11）' if gv[0] == 7 else ''
+                    raise Exception(
+                        f"游戏引擎为 Ren'Py {'.'.join(map(str, gv))}，"
+                        f'但未安装 {gv[0]}.x 的 SDK。\n'
+                        '启动时的自动补装可能仍在下载（见任务列表），'
+                        '请稍候重新创建；若下载失败，请在模型配置页'
+                        f'手动下载对应版本的 SDK{hint}')
             if sdk_path:
                 progress(0.55, '正在使用 SDK 生成翻译文件...')
 
@@ -262,11 +281,63 @@ class ProjectCreator:
                 def _sdk():
                     return sdk.generate_translations(str(game_work_dir), 'chinese')
 
-                sdk_result = await loop.run_in_executor(None, _sdk)
-                if not sdk_result['success']:
-                    raise Exception(f'SDK 生成翻译文件失败: {sdk_result["message"]}')
+                # 反编译产物可能有语法瑕疵（unrpyc 对部分语句还原不完美，
+                # 如空 scene 块），translate 解析到就整体失败。把报错的
+                # 反编译文件隔离（改名 .rpy.broken）后重试：损失该文件的
+                # 模板，但保住整项目创建。游戏自带源文件报错则不降级，原样抛。
+                err_re = re.compile(r'File "([^"]+\.rpy)", line \d+')
+                decompiled_set = set(rel_files)
+                quarantined = []
+                for attempt in range(5):
+                    sdk_result = await loop.run_in_executor(None, _sdk)
+                    if sdk_result['success']:
+                        break
+                    bad = None
+                    for m in err_re.finditer(sdk_result.get('output') or ''):
+                        rel = m.group(1).replace('\\', '/')
+                        if rel in decompiled_set:
+                            bad = rel
+                            break
+                    if bad is None:
+                        # 必须带上 SDK 输出：返回码本身无法区分是游戏脚本
+                        # 解析失败还是 SDK 版本不匹配
+                        tail = (sdk_result.get('output') or '')[-2000:].strip()
+                        detail = f'\nSDK 输出:\n{tail}' if tail else ''
+                        raise Exception(
+                            f'SDK 生成翻译文件失败: {sdk_result["message"]}{detail}')
+                    src = game_work_dir / bad
+                    src.rename(src.with_name(src.name + '.broken'))
+                    quarantined.append(bad + '.broken')
+                    self.logger.warning(
+                        f'反编译文件语法错误，已隔离（该文件的对话将缺失）: {bad}',
+                        panel='projects')
+                    progress(0.55, f'已隔离损坏的反编译文件，重试生成...')
+                else:
+                    raise Exception(
+                        'SDK 生成翻译文件失败：损坏的反编译文件过多'
+                        f'（已隔离 {len(quarantined)} 个仍有报错）')
+                if quarantined:
+                    # 隔离文件加入导出清理清单，并给用户一条汇总
+                    await loop.run_in_executor(
+                        None, db.set_meta, 'decompiled_rpy_files',
+                        _json.dumps(rel_files + quarantined))
+                    self.logger.warning(
+                        f'共隔离 {len(quarantined)} 个损坏的反编译文件，'
+                        '对应对话不会出现在翻译列表中', panel='projects')
 
-            progress(0.70, 'SDK 模板就绪')
+                # 只有 common.rpy = 游戏脚本一条都没进模板（典型原因：
+                # 游戏引擎与 SDK 大版本不匹配，SDK 读不了游戏的 .rpyc），
+                # 继续走只会得到一个没有任何对话的空项目
+                tl_out = game_work_dir / 'game' / 'tl' / 'chinese'
+                has_templates = tl_out.exists() and any(
+                    p.name != 'common.rpy' for p in tl_out.glob('*.rpy'))
+                if not has_templates:
+                    raise Exception(
+                        "SDK 未为游戏脚本生成任何翻译模板（只有 common.rpy）。\n"
+                        "通常是游戏引擎版本与 SDK 不匹配——请检查游戏的 Ren'Py "
+                        "版本，在模型配置页下载对应大版本的 SDK 后重新创建项目")
+
+            progress(0.60, 'SDK 模板就绪')
 
             # 步骤5: 解析角色信息
             progress(0.70, '正在解析角色信息...')

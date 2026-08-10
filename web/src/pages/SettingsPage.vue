@@ -29,9 +29,9 @@ interface ModelConfig {
 }
 
 const configs = ref<ModelConfig[]>([])
-const sdkPath = ref('')
-const sdkVersion = ref('8.5.3')
-const sdkTesting = ref(false)
+const sdkPath8 = ref('')
+const sdkPath7 = ref('')
+const sdkVersion = ref('')
 const guiMode = ref(false)
 
 // ---- 数据目录 ----
@@ -85,8 +85,11 @@ const testing = ref(false)
 
 async function refresh() {
   configs.value = await api.get<ModelConfig[]>('/api/configs')
-  const settings = await api.get<{ sdk_path: string; data_dir: string }>('/api/settings')
-  sdkPath.value = settings.sdk_path
+  const settings = await api.get<{
+    sdk_path_8: string; sdk_path_7: string; data_dir: string
+  }>('/api/settings')
+  sdkPath8.value = settings.sdk_path_8
+  sdkPath7.value = settings.sdk_path_7
   dataDir.value = settings.data_dir
   if (!newDataDir.value) newDataDir.value = settings.data_dir
 }
@@ -141,42 +144,13 @@ async function testConnection() {
   }
 }
 
-async function saveSdkPath() {
-  await api.put('/api/settings', { sdk_path: sdkPath.value })
-  message.success('SDK 路径已保存')
-}
-
-async function autoFindSdk() {
-  try {
-    const result = await api.post<{ sdk_path: string }>('/api/settings/sdk/find')
-    sdkPath.value = result.sdk_path
-    message.success(`找到 SDK: ${result.sdk_path}`)
-    await saveSdkPath()
-  } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
-  }
-}
-
-async function testSdk() {
-  sdkTesting.value = true
-  try {
-    await api.post('/api/settings/sdk/test', { path: sdkPath.value })
-    message.success('SDK 路径有效')
-    await saveSdkPath()
-  } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
-  } finally {
-    sdkTesting.value = false
-  }
-}
-
 // ---- SDK 下载（任务） ----
 const sdkJobId = ref('')
 
-async function downloadSdk() {
+async function downloadSdk(version: string) {
   try {
     const data = await api.post<{ job_id: string }>(
-      '/api/settings/sdk/download', { version: sdkVersion.value })
+      '/api/settings/sdk/download', { version })
     sdkJobId.value = data.job_id
     jobsStore.track(data.job_id)
   } catch (e) {
@@ -205,16 +179,31 @@ onMounted(async () => {
 
     <n-card size="small" title="Ren'Py SDK" style="margin-bottom: 16px">
       <n-space vertical>
+        <n-text depth="3" style="font-size: 12px">
+          需要 7.x 与 8.x 两个版本：创建项目与导出校验会按游戏引擎自动选择；
+          缺失的大版本会在启动时自动下载补齐。SDK 固定安装在数据目录的 tools/ 下。
+        </n-text>
         <n-space align="center">
-          <n-input v-model:value="sdkPath" placeholder="SDK 路径（如 D:\renpy-8.5.3-sdk）" style="width: 420px" />
-          <n-button size="small" @click="autoFindSdk">自动查找</n-button>
-          <n-button size="small" :loading="sdkTesting" @click="testSdk">测试并保存</n-button>
+          <n-tag size="small" :type="sdkPath8 ? 'success' : 'default'"
+                 style="width: 66px; justify-content: center">Ren'Py 8</n-tag>
+          <n-text style="font-size: 13px">{{ sdkPath8 || '未安装' }}</n-text>
+          <n-button size="small" :render-icon="renderIcon(CloudDownloadOutline)" @click="downloadSdk('8.5.3')">
+            {{ sdkPath8 ? '重新下载 8.5.3' : '下载 8.5.3' }}
+          </n-button>
         </n-space>
         <n-space align="center">
-          <n-text depth="3" style="font-size: 12px">没有 SDK？输入版本号一键下载：</n-text>
-          <n-input v-model:value="sdkVersion" size="small" style="width: 90px" placeholder="8.5.3" />
-          <n-button size="small" type="primary" :render-icon="renderIcon(CloudDownloadOutline)" @click="downloadSdk">
-            下载 SDK
+          <n-tag size="small" :type="sdkPath7 ? 'success' : 'default'"
+                 style="width: 66px; justify-content: center">Ren'Py 7</n-tag>
+          <n-text style="font-size: 13px">{{ sdkPath7 || '未安装' }}</n-text>
+          <n-button size="small" :render-icon="renderIcon(CloudDownloadOutline)" @click="downloadSdk('7.4.11')">
+            {{ sdkPath7 ? '重新下载 7.4.11' : '下载 7.4.11' }}
+          </n-button>
+        </n-space>
+        <n-space align="center">
+          <n-text depth="3" style="font-size: 12px">其他版本：</n-text>
+          <n-input v-model:value="sdkVersion" size="small" style="width: 90px" placeholder="如 8.4.1" />
+          <n-button size="small" :disabled="!sdkVersion.trim()" @click="downloadSdk(sdkVersion.trim())">
+            下载
           </n-button>
         </n-space>
       </n-space>
