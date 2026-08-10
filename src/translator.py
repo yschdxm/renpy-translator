@@ -587,7 +587,7 @@ class AITranslator:
         """批次翻译多句文本，返回 (译文列表, 术语列表)
 
         items: [{'original_text': ..., 'character': ...}]，译文列表与之按顺序一一对应。
-        解析失败（句数不匹配）时返回 (None, [])，调用方应回退逐句翻译。
+        解析失败（句数不匹配）会自动重试，重试耗尽仍失败时返回 (None, [])。
         """
         if not self.client:
             raise ValueError("请先配置API Key")
@@ -661,21 +661,28 @@ class AITranslator:
             },
         }]
 
-        message = self._call_api(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=self.config.temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            # 注意：不能强制指定函数（{"type": "function", ...}），
-            # deepseek 思考模式会拒绝该 tool_choice（400），auto 下模型也会可靠调用
-            tool_choice="auto",
-            return_message=True,
-            task_type=content_type,
-        )
-        translated_list, terms = self._parse_tool_response(message, n)
+        # 解析失败（句数不匹配）也重试：模型偶发漏译/多译，重新请求通常能恢复
+        translated_list, terms = None, []
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            message = self._call_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=self.config.temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                # 注意：不能强制指定函数（{"type": "function", ...}），
+                # deepseek 思考模式会拒绝该 tool_choice（400），auto 下模型也会可靠调用
+                tool_choice="auto",
+                return_message=True,
+                task_type=content_type,
+            )
+            translated_list, terms = self._parse_tool_response(message, n)
+            if translated_list is not None:
+                break
+            if attempt < self.MAX_RETRIES:
+                print(f'[批次翻译] 解析失败（句数不匹配），进行第 {attempt + 1}/{self.MAX_RETRIES} 次尝试...')
 
         if translated_list is not None:
             # 兜底：剥掉模型误抄进译文开头的说话人标记（[角色]/【角色】/角色:）
@@ -692,7 +699,7 @@ class AITranslator:
 
         if debug:
             if translated_list is None:
-                print(f'[批次翻译] 解析失败（句数不匹配），需回退逐句翻译')
+                print(f'[批次翻译] 解析失败（句数不匹配），已重试 {self.MAX_RETRIES} 次仍失败')
             else:
                 print(f'[批次翻译] 成功解析 {len(translated_list)} 句')
             if terms:

@@ -212,6 +212,205 @@ async def import_project(file: UploadFile = File(...), name: str = Form(''),
     return {'job_id': job.id}
 
 
+class UpdateRequest(BaseModel):
+    game_dir: str
+
+
+def _check_update_allowed(state: AppState, name: str):
+    """更新前置校验：项目存在 + 无活动任务占用（翻译/导出中更新会丢数据）"""
+    if not state.project_manager.project_exists(name):
+        raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
+    for rec in state.app_db.list_jobs(active_only=True):
+        payload = rec.get('payload') or {}
+        if payload.get('name') == name or payload.get('project') == name:
+            raise ApiError(
+                409, 'PROJECT_BUSY',
+                f'项目有正在进行的任务（{rec.get("label") or rec["kind"]}），'
+                '请等待完成或取消后再更新')
+
+
+def _make_update_body(state: AppState, name: str,
+                      game_dir_holder: dict, cleanup_paths: list):
+    """版本更新任务体：game_dir_holder['dir'] 在任务内解析（可能先解压 zip）
+
+    失败/取消由 ProjectUpdater 内部回滚——这里绝不 delete_project。
+    """
+    async def body(job):
+        from services.project_creation import extract_game_zip
+        from services.project_update import ProjectUpdater
+        from ..jobs import JobCancelled
+        loop = asyncio.get_event_loop()
+
+        was_current = name == state.current_project
+        try:
+            # zip 来源：先解压（逐项计数进度）
+            if 'zip_path' in game_dir_holder:
+                job.emit_progress(0.005, '正在解压游戏文件...')
+                extract_dir = Path(game_dir_holder['zip_path']).parent / 'extracted'
+                if extract_dir.exists():
+                    shutil.rmtree(extract_dir)
+
+                def _extract():
+                    return extract_game_zip(
+                        game_dir_holder['zip_path'], extract_dir,
+                        lambda c, t: job.emit_progress(
+                            0.005 + (c / max(t, 1)) * 0.035,
+                            f'正在解压游戏文件... ({c}/{t})'))
+                game_dir_holder['dir'] = await loop.run_in_executor(None, _extract)
+                job.emit_progress(0.04, '解压完成')
+
+            game_dir = game_dir_holder['dir']
+            if not Path(game_dir).exists():
+                raise RuntimeError(f'游戏目录不存在: {game_dir}')
+
+            # 更新会替换 game/ 与重建 db——当前打开的项目先关库（Windows 文件锁）
+            if was_current:
+                await state.close_project()
+
+            async def _confirm(count: int) -> bool:
+                ans = await job.ask('confirm', {
+                    'title': '新版本自带中文翻译',
+                    'body': f'新版本的 tl 目录下已存在中文翻译（{count} 个文件），'
+                            '可能是官方中文或第三方汉化。\n\n'
+                            '如果保留，其中的译文会与继承的译文及 SDK 模板重复，'
+                            '导致对话条目翻倍、翻译混乱。\n\n'
+                            '建议删除该中文目录，继续使用现有翻译。',
+                })
+                return bool(ans.get('ok'))
+
+            updater = ProjectUpdater(state.project_manager, state.logger,
+                                     _sdk_path_getter(state))
+
+            def _progress(p, t):
+                job.check_cancelled()
+                job.emit_progress(0.04 + p * 0.96, t)
+
+            result = await updater.update(
+                name, game_dir,
+                progress=_progress,
+                confirm_official_chinese=_confirm,
+            )
+            if result.get('cancelled'):
+                raise JobCancelled()
+            return result
+        finally:
+            # 更新前是当前项目的，无论成败都重新打开（失败时回滚已恢复原状）
+            if was_current and state.project_manager.project_exists(name):
+                try:
+                    await state.open_project(name)
+                except Exception:
+                    pass
+            for p in cleanup_paths:
+                try:
+                    if p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    return body
+
+
+@router.post('/{name}/update')
+async def update_project(name: str, req: UpdateRequest,
+                         state: AppState = Depends(get_state)):
+    _check_update_allowed(state, name)
+    if not req.game_dir:
+        raise ApiError(400, 'BAD_DIR', '请填写新版本游戏目录')
+
+    job = state.jobs.create(
+        'project.update', f'更新项目 {name}',
+        {'name': name, 'game_dir': req.game_dir},
+        _make_update_body(state, name, {'dir': req.game_dir}, []))
+    return {'job_id': job.id}
+
+
+@router.post('/{name}/update-zip')
+async def update_project_zip(name: str, file: UploadFile = File(...),
+                             state: AppState = Depends(get_state)):
+    _check_update_allowed(state, name)
+
+    import uuid
+    zip_path = _uploads_dir(state) / f'{uuid.uuid4().hex[:8]}.zip'
+    await _save_upload(file, zip_path)
+
+    job = state.jobs.create(
+        'project.update', f'更新项目 {name}',
+        {'name': name, 'zip': file.filename},
+        _make_update_body(state, name,
+                          {'zip_path': str(zip_path)},
+                          [zip_path, zip_path.parent / 'extracted']))
+    return {'job_id': job.id}
+
+
+@router.get('/{name}/update-report')
+async def update_report(name: str, state: AppState = Depends(get_state)):
+    """最近一次版本更新的报告 + 失效译文 + 复核列表"""
+    if not state.project_manager.project_exists(name):
+        raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
+    loop = asyncio.get_event_loop()
+
+    def _load():
+        import json as _json
+        db = state.project_manager.open_project(name)
+        if not db:
+            return None
+        raw = db.get_meta('last_update_report', '')
+        report = _json.loads(raw) if raw else None
+        obsolete = db.get_obsolete()
+        review = db.get_update_review()
+        db.close()
+        return report, obsolete, review
+
+    loaded = await loop.run_in_executor(None, _load)
+    if loaded is None:
+        raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
+    report, obsolete, review = loaded
+    return {'report': report, 'obsolete': obsolete, 'review': review}
+
+
+class ReviewActionRequest(BaseModel):
+    action: str  # 'apply' | 'dismiss'
+
+
+@router.post('/{name}/update-review/{row_id}')
+async def update_review_action(name: str, row_id: int, req: ReviewActionRequest,
+                               state: AppState = Depends(get_state)):
+    """复核行操作：apply 把旧译文写入目标条目并标记已译；dismiss 忽略"""
+    if not state.project_manager.project_exists(name):
+        raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
+    if req.action not in ('apply', 'dismiss'):
+        raise ApiError(400, 'BAD_ACTION', 'action 必须是 apply 或 dismiss')
+    loop = asyncio.get_event_loop()
+
+    def _apply():
+        db = state.project_manager.open_project(name)
+        if not db:
+            return None
+        rows = [r for r in db.get_update_review() if r['id'] == row_id]
+        if not rows:
+            db.close()
+            return 'not_found'
+        row = rows[0]
+        if req.action == 'apply':
+            if row['target_kind'] == 'dialogue':
+                db.update_dialogue(row['target_id'], row['old_translation'])
+            else:
+                db.update_ui_text(row['target_id'], row['old_translation'])
+            db.set_review_status(row_id, 'applied')
+        else:
+            db.set_review_status(row_id, 'dismissed')
+        db.close()
+        return 'ok'
+
+    result = await loop.run_in_executor(None, _apply)
+    if result is None:
+        raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
+    if result == 'not_found':
+        raise ApiError(404, 'REVIEW_NOT_FOUND', f'复核条目不存在: {row_id}')
+    return {'ok': True}
+
+
 @router.post('/{name}/export-zip')
 async def export_zip(name: str, state: AppState = Depends(get_state)):
     if not state.project_manager.project_exists(name):

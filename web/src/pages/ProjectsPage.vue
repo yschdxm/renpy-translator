@@ -13,6 +13,7 @@ import { AddOutline, DownloadOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, errorText } from '../api/client'
 import { renderIcon } from '../components/icons'
 import { nativeReady, pickDirectory } from '../api/native'
+import UpdateReportDialog from '../components/UpdateReportDialog.vue'
 
 
 const message = useMessage()
@@ -109,6 +110,72 @@ const importZip = ref<File | null>(null)
 const importing = ref(false)
 const importPct = ref(-1)
 
+// ---- 更新版本 ----
+const updateVisible = ref(false)
+const updateName = ref('')
+const updateMethod = ref<'path' | 'zip'>('path')
+const updateDir = ref('')
+const updateZip = ref<File | null>(null)
+const updating = ref(false)
+const updatePct = ref(-1)
+const reportVisible = ref(false)
+const reportName = ref('')
+
+function openUpdate(p: ProjectItem) {
+  updateName.value = p.name
+  updateDir.value = ''
+  updateZip.value = null
+  updateMethod.value = 'path'
+  updating.value = false
+  updatePct.value = -1
+  updateVisible.value = true
+}
+
+function openReport(name: string) {
+  reportName.value = name
+  reportVisible.value = true
+}
+
+async function browseUpdateDir() {
+  const dir = await pickDirectory()
+  if (dir) updateDir.value = dir
+}
+
+async function submitUpdate() {
+  try {
+    let jobId: string
+    const encName = encodeURIComponent(updateName.value)
+    if (updateMethod.value === 'path') {
+      if (!updateDir.value.trim()) {
+        message.warning('请填写新版本游戏目录')
+        return
+      }
+      const data = await api.post<{ job_id: string }>(
+        `/api/projects/${encName}/update`, { game_dir: updateDir.value })
+      jobId = data.job_id
+    } else {
+      if (!updateZip.value) {
+        message.warning('请先选择 zip 文件')
+        return
+      }
+      updating.value = true
+      updatePct.value = 0
+      const form = new FormData()
+      form.append('file', updateZip.value)
+      const data = await api.postFormProgress<{ job_id: string }>(
+        `/api/projects/${encName}/update-zip`, form,
+        (pct) => { updatePct.value = pct })
+      jobId = data.job_id
+    }
+    updateVisible.value = false
+    jobsStore.track(jobId)
+  } catch (e) {
+    message.error(errorText(e), { duration: 10000, closable: true })
+  } finally {
+    updating.value = false
+  }
+}
+
 async function submitImport() {
   if (!importZip.value) {
     message.warning('请先选择 zip 文件')
@@ -156,6 +223,13 @@ watch(
             message.error(errorText(e), { duration: 8000 })
           }
         }
+      }
+      // 版本更新成功 → 弹出更新报告（继承/新增/复核/失效统计）
+      if (j.kind === 'project.update' && j.status === 'succeeded'
+          && !handledJobs.has(j.id)) {
+        handledJobs.add(j.id)
+        const name = (j.payload?.name as string) || ''
+        if (name) openReport(name)
       }
     }
   })
@@ -271,6 +345,7 @@ onMounted(async () => {
             打开
           </n-button>
           <n-button size="small" @click="openEdit(p)">编辑</n-button>
+          <n-button size="small" @click="openUpdate(p)">更新版本</n-button>
           <n-button size="small" @click="exportZip(p)">导出</n-button>
           <n-popconfirm @positive-click="deleteProject(p)">
             <template #trigger>
@@ -291,10 +366,11 @@ onMounted(async () => {
         <n-text depth="3" style="font-size: 12px">{{ p.progress_text }}</n-text>
       </n-space>
 
-      <div v-if="packages[p.name]?.length" style="margin-top: 8px">
-        <n-button size="tiny" quaternary @click="revealPackages(p.name)">
+      <div style="margin-top: 8px">
+        <n-button v-if="packages[p.name]?.length" size="tiny" quaternary @click="revealPackages(p.name)">
           打开导出目录（{{ packages[p.name].length }} 个包）
         </n-button>
+        <n-button size="tiny" quaternary @click="openReport(p.name)">更新报告</n-button>
       </div>
     </n-card>
 
@@ -348,6 +424,48 @@ onMounted(async () => {
         </n-space>
       </template>
     </n-modal>
+
+    <!-- 更新版本 -->
+    <n-modal v-model:show="updateVisible" preset="card" :title="`更新版本 — ${updateName}`" style="width: 520px">
+      <n-space vertical>
+        <n-text depth="3" style="font-size: 12px">
+          选择新版本游戏（目录或 zip）。现有译文、人名、术语、风格指南都会保留，
+          已翻译文本按原文自动继承，只有新增/改动的文本需要翻译。更新前会自动备份，可回滚。
+        </n-text>
+        <n-radio-group v-model:value="updateMethod" size="small">
+          <n-radio-button value="path">路径输入</n-radio-button>
+          <n-radio-button value="zip">上传 zip</n-radio-button>
+        </n-radio-group>
+        <n-input-group v-if="updateMethod === 'path'">
+          <n-input
+            v-model:value="updateDir"
+            placeholder="新版本游戏目录（含 game/ 的上一级或游戏根目录）"
+          />
+          <n-button v-if="guiMode" size="small" @click="browseUpdateDir">浏览…</n-button>
+        </n-input-group>
+        <n-upload
+          v-else
+          :max="1" accept=".zip"
+          :default-upload="false"
+          @change="(o: { fileList: UploadFileInfo[] }) => updateZip = o.fileList[0]?.file ?? null"
+        >
+          <n-button size="small">选择新版本 zip</n-button>
+          <span v-if="updateZip" style="margin-left: 8px; font-size: 12px">{{ updateZip.name }}</span>
+        </n-upload>
+        <div v-if="updating && updatePct >= 0">
+          <n-text depth="3" style="font-size: 12px">正在上传 zip（本地传输，大文件需等待）...</n-text>
+          <n-progress type="line" :percentage="Math.round(updatePct * 100)" :height="8" processing />
+        </div>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button :disabled="updating" @click="updateVisible = false">取消</n-button>
+          <n-button type="primary" :loading="updating" @click="submitUpdate">开始更新</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <update-report-dialog v-model:show="reportVisible" :project-name="reportName" />
 
     <!-- 导入项目 -->
     <n-modal v-model:show="importVisible" preset="card" title="导入项目" style="width: 480px">

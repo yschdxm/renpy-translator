@@ -133,6 +133,112 @@ def extract_game_zip(zip_path, extract_dir: Path, progress_cb=None) -> str:
     return str(extract_dir)
 
 
+def copy_game_files(src: Path, dst: Path, progress_state: dict):
+    """逐文件复制游戏目录（同步，调用方放 executor 并轮询 progress_state）。
+
+    progress_state: {'current': int, 'total': int, 'done': bool}
+    """
+    try:
+        if dst.exists():
+            shutil.rmtree(dst)
+        src = Path(src)
+        total = sum(1 for _ in src.rglob('*') if _.is_file())
+        progress_state['total'] = total if total > 0 else 1
+        dst.mkdir(parents=True, exist_ok=True)
+        for root, dirs, files in os.walk(src):
+            rel_root = Path(root).relative_to(src)
+            dst_root = dst / rel_root
+            dst_root.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                shutil.copy2(Path(root) / f, dst_root / f)
+                progress_state['current'] += 1
+    finally:
+        progress_state['done'] = True
+
+
+async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
+                                decompiled_rel: list, db,
+                                logger: TranslationLogger,
+                                progress, run_in_executor) -> list:
+    """SDK 生成翻译模板（自愈重试：隔离损坏的反编译文件后重试）。
+
+    阻塞调用通过 run_in_executor(fn, *args) 调度（调用方传入绑定 loop 与
+    None executor 的偏函数）。db 用于回写 decompiled_rpy_files meta；
+    progress(pct, text)。返回隔离的 .broken 相对路径列表。
+    失败抛异常（含 SDK 输出尾部）。
+    """
+    from sdk_manager import SDKManager
+    sdk = SDKManager()
+    sdk.sdk_path = Path(sdk_path)
+
+    def _sdk():
+        return sdk.generate_translations(str(game_work_dir), 'chinese')
+
+    # 反编译产物可能有语法瑕疵（unrpyc 对部分语句还原不完美，
+    # 如空 scene 块），translate 解析到就整体失败。把报错的
+    # 反编译文件隔离（改名 .rpy.broken）后重试：损失该文件的
+    # 模板，但保住整项目创建。游戏自带源文件报错则不降级，原样抛。
+    err_re = re.compile(r'File "([^"]+\.rpy)", line \d+')
+    decompiled_set = set(decompiled_rel)
+    quarantined = []
+    for attempt in range(5):
+        sdk_result = await run_in_executor(_sdk)
+        if sdk_result['success']:
+            break
+        bad = None
+        for m in err_re.finditer(sdk_result.get('output') or ''):
+            rel = m.group(1).replace('\\', '/')
+            if rel in decompiled_set:
+                bad = rel
+                break
+        if bad is None:
+            # 必须带上 SDK 输出：返回码本身无法区分是游戏脚本
+            # 解析失败还是 SDK 版本不匹配
+            tail = (sdk_result.get('output') or '')[-2000:].strip()
+            detail = f'\nSDK 输出:\n{tail}' if tail else ''
+            raise Exception(
+                f'SDK 生成翻译文件失败: {sdk_result["message"]}{detail}')
+        src = game_work_dir / bad
+        src.rename(src.with_name(src.name + '.broken'))
+        quarantined.append(bad + '.broken')
+        logger.warning(
+            f'反编译文件语法错误，已隔离（该文件的对话将缺失）: {bad}',
+            panel='projects')
+        progress(0.55, '已隔离损坏的反编译文件，重试生成...')
+    else:
+        raise Exception(
+            'SDK 生成翻译文件失败：损坏的反编译文件过多'
+            f'（已隔离 {len(quarantined)} 个仍有报错）')
+    if quarantined:
+        # 隔离文件加入导出清理清单，并给用户一条汇总
+        await run_in_executor(
+            db.set_meta, 'decompiled_rpy_files',
+            _json.dumps(decompiled_rel + quarantined))
+        logger.warning(
+            f'共隔离 {len(quarantined)} 个损坏的反编译文件，'
+            '对应对话不会出现在翻译列表中', panel='projects')
+
+    # 只有 common.rpy = 游戏脚本一条都没进模板（典型原因：
+    # 游戏引擎与 SDK 大版本不匹配，SDK 读不了游戏的 .rpyc），
+    # 继续走只会得到一个没有任何对话的空项目
+    tl_out = game_work_dir / 'game' / 'tl' / 'chinese'
+    has_templates = tl_out.exists() and any(
+        p.name != 'common.rpy' for p in tl_out.glob('*.rpy'))
+    if not has_templates:
+        raise Exception(
+            "SDK 未为游戏脚本生成任何翻译模板（只有 common.rpy）。\n"
+            "通常是游戏引擎版本与 SDK 不匹配——请检查游戏的 Ren'Py "
+            "版本，在模型配置页下载对应大版本的 SDK 后重新创建项目")
+    return quarantined
+
+
+def parse_tl_dir(tl_dir: Path, game_work_dir: Path,
+                 logger: TranslationLogger) -> dict:
+    """解析 SDK 生成的 tl/chinese 目录（同步，调用方放 executor）"""
+    from tl_parser import parse_translation_files
+    return parse_translation_files(tl_dir, str(game_work_dir), logger=logger)
+
+
 class ProjectCreator:
     """创建项目（异步编排；阻塞操作全部 run_in_executor）"""
 
@@ -166,26 +272,8 @@ class ProjectCreator:
             progress(0.06, '正在复制游戏文件...')
 
             copy_progress = {'current': 0, 'total': 0, 'done': False}
-
-            def _copy_game():
-                try:
-                    if game_work_dir.exists():
-                        shutil.rmtree(game_work_dir)
-                    src = Path(game_dir)
-                    total = sum(1 for _ in src.rglob('*') if _.is_file())
-                    copy_progress['total'] = total if total > 0 else 1
-                    game_work_dir.mkdir(parents=True, exist_ok=True)
-                    for root, dirs, files in os.walk(src):
-                        rel_root = Path(root).relative_to(src)
-                        dst_root = game_work_dir / rel_root
-                        dst_root.mkdir(parents=True, exist_ok=True)
-                        for f in files:
-                            shutil.copy2(Path(root) / f, dst_root / f)
-                            copy_progress['current'] += 1
-                finally:
-                    copy_progress['done'] = True
-
-            copy_task = loop.run_in_executor(None, _copy_game)
+            copy_task = loop.run_in_executor(
+                None, copy_game_files, Path(game_dir), game_work_dir, copy_progress)
             while not copy_progress['done']:
                 total = copy_progress['total']
                 current = copy_progress['current']
@@ -274,68 +362,11 @@ class ProjectCreator:
             if sdk_path:
                 progress(0.55, '正在使用 SDK 生成翻译文件...')
 
-                from sdk_manager import SDKManager
-                sdk = SDKManager()
-                sdk.sdk_path = Path(sdk_path)
-
-                def _sdk():
-                    return sdk.generate_translations(str(game_work_dir), 'chinese')
-
-                # 反编译产物可能有语法瑕疵（unrpyc 对部分语句还原不完美，
-                # 如空 scene 块），translate 解析到就整体失败。把报错的
-                # 反编译文件隔离（改名 .rpy.broken）后重试：损失该文件的
-                # 模板，但保住整项目创建。游戏自带源文件报错则不降级，原样抛。
-                err_re = re.compile(r'File "([^"]+\.rpy)", line \d+')
-                decompiled_set = set(rel_files)
-                quarantined = []
-                for attempt in range(5):
-                    sdk_result = await loop.run_in_executor(None, _sdk)
-                    if sdk_result['success']:
-                        break
-                    bad = None
-                    for m in err_re.finditer(sdk_result.get('output') or ''):
-                        rel = m.group(1).replace('\\', '/')
-                        if rel in decompiled_set:
-                            bad = rel
-                            break
-                    if bad is None:
-                        # 必须带上 SDK 输出：返回码本身无法区分是游戏脚本
-                        # 解析失败还是 SDK 版本不匹配
-                        tail = (sdk_result.get('output') or '')[-2000:].strip()
-                        detail = f'\nSDK 输出:\n{tail}' if tail else ''
-                        raise Exception(
-                            f'SDK 生成翻译文件失败: {sdk_result["message"]}{detail}')
-                    src = game_work_dir / bad
-                    src.rename(src.with_name(src.name + '.broken'))
-                    quarantined.append(bad + '.broken')
-                    self.logger.warning(
-                        f'反编译文件语法错误，已隔离（该文件的对话将缺失）: {bad}',
-                        panel='projects')
-                    progress(0.55, f'已隔离损坏的反编译文件，重试生成...')
-                else:
-                    raise Exception(
-                        'SDK 生成翻译文件失败：损坏的反编译文件过多'
-                        f'（已隔离 {len(quarantined)} 个仍有报错）')
-                if quarantined:
-                    # 隔离文件加入导出清理清单，并给用户一条汇总
-                    await loop.run_in_executor(
-                        None, db.set_meta, 'decompiled_rpy_files',
-                        _json.dumps(rel_files + quarantined))
-                    self.logger.warning(
-                        f'共隔离 {len(quarantined)} 个损坏的反编译文件，'
-                        '对应对话不会出现在翻译列表中', panel='projects')
-
-                # 只有 common.rpy = 游戏脚本一条都没进模板（典型原因：
-                # 游戏引擎与 SDK 大版本不匹配，SDK 读不了游戏的 .rpyc），
-                # 继续走只会得到一个没有任何对话的空项目
-                tl_out = game_work_dir / 'game' / 'tl' / 'chinese'
-                has_templates = tl_out.exists() and any(
-                    p.name != 'common.rpy' for p in tl_out.glob('*.rpy'))
-                if not has_templates:
-                    raise Exception(
-                        "SDK 未为游戏脚本生成任何翻译模板（只有 common.rpy）。\n"
-                        "通常是游戏引擎版本与 SDK 不匹配——请检查游戏的 Ren'Py "
-                        "版本，在模型配置页下载对应大版本的 SDK 后重新创建项目")
+                from functools import partial
+                _rie = partial(loop.run_in_executor, None)
+                await generate_tl_templates(
+                    sdk_path, game_work_dir, rel_files, db,
+                    self.logger, progress, _rie)
 
             progress(0.60, 'SDK 模板就绪')
 
@@ -369,13 +400,8 @@ class ProjectCreator:
             tl_exists = await loop.run_in_executor(None, _check_tl_dir)
             if tl_exists:
                 progress(0.80, '正在解析翻译文件...')
-
-                def _parse_tl():
-                    from tl_parser import parse_translation_files
-                    return parse_translation_files(tl_dir, str(game_work_dir),
-                                                   logger=self.logger)
-
-                tl_result = await loop.run_in_executor(None, _parse_tl)
+                tl_result = await loop.run_in_executor(
+                    None, parse_tl_dir, tl_dir, game_work_dir, self.logger)
 
                 def _save_tl():
                     db.insert_dialogues(tl_result.get('dialogues', []))
