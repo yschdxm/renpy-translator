@@ -69,6 +69,11 @@ async def job_events(job_id: str, after_seq: int = 0,
                 last = ev['seq']
                 yield {'event': ev['kind'], 'data': json.dumps(
                     {'seq': ev['seq'], **ev['data']}, ensure_ascii=False)}
+                # 订阅前任务可能已终结：回放吐出终态 status 后必须关流，
+                # 否则转直播后 queue 再无事件，协程永久挂在 queue.get()
+                if (ev['kind'] == 'status'
+                        and ev['data'].get('status') in TERMINAL):
+                    return
             # 任务已终结且无新事件 → 发一个终态 status 兜底后关流
             if record['status'] in TERMINAL:
                 yield {'event': 'status', 'data': json.dumps(

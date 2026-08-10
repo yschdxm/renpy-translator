@@ -95,6 +95,14 @@ class NameTranslationService:
     def stop(self):
         self._cancel = True
 
+    def close(self):
+        """关闭内部线程池。
+
+        names.py 以单例缓存本服务，项目切换/配置变化重建实例时
+        必须先 close 旧实例，否则 ThreadPoolExecutor 线程持续累积。
+        """
+        self._executor.shutdown(wait=False)
+
     @property
     def cancelled(self) -> bool:
         return self._cancel

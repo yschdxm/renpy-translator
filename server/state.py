@@ -131,7 +131,12 @@ class AppState:
         last = await loop.run_in_executor(
             None, self.app_db.get_setting, 'current_project', '')
         if last and self.project_manager.project_exists(last):
-            await self.open_project(last)
+            try:
+                await self.open_project(last)
+            except Exception as e:
+                # project.db 损坏等情况：记日志并保持无项目状态，
+                # 服务照常启动，用户可在界面上重新打开或删除坏项目
+                self.logger.error(f'自动打开上次项目失败（已跳过）: {last} - {e}')
         # 常备 8.x + 7.x 两个 SDK：缺哪个大版本自动后台下载补齐
         await self._ensure_sdks()
 
@@ -357,15 +362,30 @@ class AppState:
                 moved.append(name)
             return moved, leftover
 
-        moved, leftover = await loop.run_in_executor(None, _migrate)
+        from .appdb import AppDatabase
+        try:
+            moved, leftover = await loop.run_in_executor(None, _migrate)
+        except Exception:
+            # 迁移中途失败（权限/杀软占用等）：重开旧应用库恢复可用状态，
+            # 否则 self.app_db 指向已关闭的库，后续接口全部 500
+            self.app_db = AppDatabase(old_home / 'data' / 'app.db')
+            self.jobs.app_db = self.app_db
+            # 项目库迁移前已关，尽量恢复原项目（目录可能已部分搬走，失败仅记日志）
+            if was_open:
+                try:
+                    await self.open_project(was_open)
+                except Exception as e:
+                    self.logger.error(f'迁移失败后恢复原项目失败: {was_open} - {e}')
+            raise
         set_home(new_home)
 
         # 重建管理器与状态
         from config_manager import ConfigManager
         from project_manager import ProjectManager
-        from .appdb import AppDatabase
         self.root = new_home
         self.app_db = AppDatabase(new_home / 'data' / 'app.db')
+        # JobRegistry 内部缓存了 app_db 引用，重建后需同步刷新
+        self.jobs.app_db = self.app_db
         self.config_manager = ConfigManager()
         self.project_manager = ProjectManager()
         # 临时目录随数据根迁移

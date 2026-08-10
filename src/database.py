@@ -5,6 +5,7 @@
 
 import json
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,12 +14,21 @@ from functools import wraps
 
 
 def _auto_reconnect(method):
-    """装饰器：方法执行前确保数据库连接有效"""
+    """装饰器：方法执行前确保数据库连接有效，并全程持有实例锁
+
+    全库共享一条 sqlite 连接（check_same_thread=False），多线程并发
+    execute/commit 会互相破坏事务（别的线程的 commit 会把本线程未完成的
+    事务提前提交），跨线程同时 execute 还可能抛递归游标 ProgrammingError。
+    因此把锁纪律收敛到本层：所有公共读写方法都经此装饰器串行化，
+    绕过 HTTP 层 db_lock 的调用方（如 TranslationService._save_all）也安全。
+    RLock 允许方法内重入调用其他带锁方法（如 to_json_dict → get_all_meta）。
+    """
     @wraps(method)
     def wrapper(self, *args, **kwargs):
-        if self._conn is None:
-            self.connect()
-        return method(self, *args, **kwargs)
+        with self._lock:
+            if self._conn is None:
+                self.connect()
+            return method(self, *args, **kwargs)
     return wrapper
 
 
@@ -138,21 +148,25 @@ class ProjectDatabase:
     def __init__(self, db_path: str):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
+        # 实例级可重入锁：串行化对共享连接的一切读写（含事务），
+        # 所有经 @_auto_reconnect 的公共方法、connect/close/_transaction 都持有它
+        self._lock = threading.RLock()
 
     def connect(self):
         """连接数据库，启用 WAL 模式，创建表结构"""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA cache_size=-64000")
-        self._conn.executescript(_SCHEMA_SQL)
-        # 迁移：给已有表补上缺失的列
-        self._migrate_columns()
-        # 迁移：拆除 characters.display_name 的 UNIQUE 约束
-        self._migrate_characters_unique()
-        self._conn.commit()
+        with self._lock:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA cache_size=-64000")
+            self._conn.executescript(_SCHEMA_SQL)
+            # 迁移：给已有表补上缺失的列
+            self._migrate_columns()
+            # 迁移：拆除 characters.display_name 的 UNIQUE 约束
+            self._migrate_characters_unique()
+            self._conn.commit()
 
     def _migrate_columns(self):
         """给已有表补上缺失的列（兼容旧数据库）"""
@@ -198,9 +212,10 @@ class ProjectDatabase:
         ''')
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
 
     @_auto_reconnect
     def checkpoint_wal(self):
@@ -214,12 +229,15 @@ class ProjectDatabase:
     @contextmanager
     def _transaction(self):
         assert self._conn, "数据库未连接"
-        try:
-            yield self._conn
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        # 事务全程持锁（RLock，调用方方法已持锁时可重入）：
+        # 防止其他线程的 execute+commit 穿插进来把未完成的事务提前提交
+        with self._lock:
+            try:
+                yield self._conn
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     # ========== 项目元数据 ==========
 

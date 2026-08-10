@@ -77,8 +77,10 @@ def create_app(root: Path = None) -> FastAPI:
 
         @app.get('/{full_path:path}', include_in_schema=False)
         async def spa_fallback(full_path: str):
-            target = _WEB_DIST / full_path
-            if full_path and target.is_file():
+            # resolve 后必须仍在 dist 内，防止 %2e%2e/ 之类目录穿越读出任意文件
+            target = (_WEB_DIST / full_path).resolve()
+            if (full_path and target.is_relative_to(_WEB_DIST.resolve())
+                    and target.is_file()):
                 return FileResponse(target)
             # index.html 必须每次重校验：重新构建后 chunk hash 全变，
             # 缓存的旧入口会让未访问页面的动态 import 404（菜单点击无反应）。

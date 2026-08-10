@@ -159,12 +159,14 @@ def copy_game_files(src: Path, dst: Path, progress_state: dict):
 async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
                                 decompiled_rel: list, db,
                                 logger: TranslationLogger,
-                                progress, run_in_executor) -> list:
+                                progress, run_in_executor,
+                                cancel_event=None) -> list:
     """SDK 生成翻译模板（自愈重试：隔离损坏的反编译文件后重试）。
 
     阻塞调用通过 run_in_executor(fn, *args) 调度（调用方传入绑定 loop 与
     None executor 的偏函数）。db 用于回写 decompiled_rpy_files meta；
     progress(pct, text)。返回隔离的 .broken 相对路径列表。
+    cancel_event: 可选 threading.Event，置位时终止 SDK 子进程并抛异常。
     失败抛异常（含 SDK 输出尾部）。
     """
     from sdk_manager import SDKManager
@@ -172,7 +174,8 @@ async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
     sdk.sdk_path = Path(sdk_path)
 
     def _sdk():
-        return sdk.generate_translations(str(game_work_dir), 'chinese')
+        return sdk.generate_translations(str(game_work_dir), 'chinese',
+                                         cancel_event=cancel_event)
 
     # 反编译产物可能有语法瑕疵（unrpyc 对部分语句还原不完美，
     # 如空 scene 块），translate 解析到就整体失败。把报错的
@@ -185,6 +188,8 @@ async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
         sdk_result = await run_in_executor(_sdk)
         if sdk_result['success']:
             break
+        if sdk_result.get('cancelled'):
+            raise Exception('已取消：SDK 生成翻译模板被中止')
         bad = None
         for m in err_re.finditer(sdk_result.get('output') or ''):
             rel = m.group(1).replace('\\', '/')
@@ -250,9 +255,11 @@ class ProjectCreator:
         self.get_sdk_path = get_sdk_path
 
     async def create(self, name: str, game_dir: str, model: str,
-                     progress, confirm_official_chinese=None) -> dict:
+                     progress, confirm_official_chinese=None,
+                     cancel_event=None) -> dict:
         """执行创建。progress(pct, text) 同步回调；confirm_official_chinese
         为 async (file_count) -> bool（True=删除官中继续，False=取消创建）。
+        cancel_event: 可选 threading.Event，传给 SDK 子进程以便中止。
 
         用户取消：关闭 db、删除项目目录，返回 {'cancelled': True}。
         """
@@ -366,7 +373,7 @@ class ProjectCreator:
                 _rie = partial(loop.run_in_executor, None)
                 await generate_tl_templates(
                     sdk_path, game_work_dir, rel_files, db,
-                    self.logger, progress, _rie)
+                    self.logger, progress, _rie, cancel_event=cancel_event)
 
             progress(0.60, 'SDK 模板就绪')
 

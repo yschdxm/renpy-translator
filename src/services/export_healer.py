@@ -16,6 +16,7 @@
 import asyncio
 import json
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -65,6 +66,10 @@ class ExportHealer:
         self.logger = logger
         self.exporter = exporter  # GameExporter（重填 tl 用）
         self._cancel_check = None
+        # 内部取消事件：包装 cancel_check 时置位；_sdk_cancel_event 为实际
+        # 传给 SDK 子进程的事件（外部传入时指向外部事件）
+        self._cancel_event = threading.Event()
+        self._sdk_cancel_event = self._cancel_event
 
     def _check_cancel(self):
         if self._cancel_check is not None:
@@ -73,11 +78,31 @@ class ExportHealer:
     # ========== 总入口 ==========
 
     async def validate_and_heal(self, export_dir: Path, log,
-                                cancel_check=None) -> str:
+                                cancel_check=None, cancel_event=None) -> str:
         """校验导出目录并按需自愈，返回 'ok' | 'reexport' | 'fail'
 
         cancel_check: 可调用对象，抛异常即中止（任务取消用）。
+        cancel_event: 可选 threading.Event（任务取消信号），传入后 SDK
+            子进程在取消时被立即终止；不传则退化为包装 cancel_check
+            （只有检查点触发后才置位，在飞的 SDK 调用不能及时中止）。
         """
+        if cancel_event is not None:
+            # 外部事件（如 job.cancel_event），直接使用，绝不清除
+            self._sdk_cancel_event = cancel_event
+        else:
+            self._cancel_event.clear()
+            self._sdk_cancel_event = self._cancel_event
+            if cancel_check is not None:
+                # 包装一层：取消异常触发时同步置位 _cancel_event，
+                # 让正在跑的 SDK 子进程（_validate/_regen）随之终止
+                raw_check = cancel_check
+
+                def cancel_check():
+                    try:
+                        raw_check()
+                    except Exception:
+                        self._cancel_event.set()
+                        raise
         self._cancel_check = cancel_check
         loop = asyncio.get_event_loop()
         for round_no in range(1, self.MAX_ROUNDS + 1):
@@ -104,7 +129,12 @@ class ExportHealer:
         from sdk_manager import SDKManager
         sdk = SDKManager()
         sdk.sdk_path = Path(self.sdk_path)
-        result = sdk.generate_translations(str(export_dir), 'chinese')
+        result = sdk.generate_translations(
+            str(export_dir), 'chinese', cancel_event=self._sdk_cancel_event)
+        if result.get('cancelled'):
+            # 子进程因取消被终止：有 cancel_check 时抛取消异常，否则响亮失败
+            self._check_cancel()
+            raise RuntimeError('编译校验已取消')
         if result['success']:
             return []
 
@@ -324,20 +354,24 @@ class ExportHealer:
             col_end=r['col_start'] + len(r['raw']),
             raw=r['raw'], text=r['text'], kind=r['kind'],
             hint=r['hint'], confidence='') for r in rows]
-        unwrap_ids = [r['id'] for r in rows]
 
         for r in to_unwrap:
             log(f"  拆除标记（取消该处翻译）: {r['text'][:40]!r} "
                 f"({r['rel_file']}:{r['line']})")
-        unwrapped, skipped = await loop.run_in_executor(
+        done_cands, skipped = await loop.run_in_executor(
             None, unwrap_candidates, to_unwrap)
-        if not unwrapped:
+        if not done_cands:
             log('  拆除失败（源码位置已变化），无法自动修复')
             return False
         if skipped:
             log(f'  {skipped} 处位置校验失败跳过')
+        # 只对实际成功拆除的行标 skipped；位置校验失败的行保持 marked，
+        # 下轮修复仍可匹配候选重试（否则候选丢失直接 fail）
+        done_set = {id(c) for c in done_cands}
+        done_ids = [r['id'] for r, c in zip(rows, to_unwrap)
+                    if id(c) in done_set]
         await loop.run_in_executor(
-            None, self.db.set_embedded_status, unwrap_ids, 'skipped')
+            None, self.db.set_embedded_status, done_ids, 'skipped')
 
         # 工作区 SDK 重新生成模板（与内嵌管线一致，带崩溃重试）
         log('重新生成翻译模板...')
@@ -347,8 +381,10 @@ class ExportHealer:
             sdk = SDKManager()
             sdk.sdk_path = Path(self.sdk_path)
             for attempt in range(1, 6):
-                result = sdk.generate_translations(str(self.game_root), 'chinese')
-                if result['success']:
+                result = sdk.generate_translations(
+                    str(self.game_root), 'chinese',
+                    cancel_event=self._sdk_cancel_event)
+                if result['success'] or result.get('cancelled'):
                     return result
                 self.logger.warning(
                     f'SDK 生成模板第 {attempt} 次失败: {result["message"]}',
@@ -357,6 +393,10 @@ class ExportHealer:
             return result
 
         sdk_result = await loop.run_in_executor(None, _regen)
+        if sdk_result.get('cancelled'):
+            self._check_cancel()
+            log('  SDK 重新生成已取消')
+            return False
         if not sdk_result['success']:
             log(f"  SDK 重新生成失败: {sdk_result['message']}")
             return False

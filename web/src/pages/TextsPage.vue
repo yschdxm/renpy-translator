@@ -9,7 +9,7 @@ import type { DataTableColumns } from 'naive-ui'
 import { BookOutline, CodeSlashOutline, LanguageOutline, LocateOutline, RefreshOutline, SparklesOutline } from '@vicons/ionicons5'
 import { api, errorText } from '../api/client'
 import { renderIcon } from '../components/icons'
-import { useJobsStore } from '../stores/jobs'
+import { useJobsStore, JOB_TERMINAL_STATUS } from '../stores/jobs'
 import { useSessionStore } from '../stores/session'
 
 const props = defineProps<{ contentType: 'ui' | 'dialogue' }>()
@@ -148,7 +148,7 @@ async function translatePage() {
 watch(
   () => activeJobId.value && jobsStore.jobs.get(activeJobId.value)?.status,
   (status) => {
-    if (status && ['succeeded', 'failed', 'cancelled'].includes(status)) {
+    if (status && JOB_TERMINAL_STATUS.includes(status)) {
       load()
       session.refresh()
     }

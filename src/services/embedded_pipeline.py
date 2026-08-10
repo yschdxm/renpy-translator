@@ -20,6 +20,14 @@ from database import ProjectDatabase
 from logger import TranslationLogger
 
 
+def _swallow_task_error(task):
+    """取回已结束 executor 任务的异常，避免 'exception was never retrieved'"""
+    try:
+        task.result()
+    except Exception:
+        pass
+
+
 class EmbeddedPipeline:
     def __init__(self, db: ProjectDatabase, translator,
                  project_dir: str, sdk_path: str, logger: TranslationLogger):
@@ -63,12 +71,14 @@ class EmbeddedPipeline:
 
     # ---- 步骤 2: AI 预筛（只判未决，失败上抛） ----
 
-    async def screen_undecided(self, rows, on_progress=None):
+    async def screen_undecided(self, rows, on_progress=None, cancel_event=None):
         """对 ai_keep==-1 的候选跑 AI 预筛并保存判定到 db。
 
         on_progress(phase, done, total)：异步轮询友好（从事件循环线程调用）。
+        cancel_event: 可选 threading.Event（任务取消信号），置位时中止
+            预筛并抛 ScreeningCancelled（不写库，未决行保持未决）。
         """
-        from ai_screener import AIScreener
+        from ai_screener import AIScreener, ScreeningCancelled
         loop = asyncio.get_event_loop()
 
         undecided = [r for r in rows if r['ai_keep'] == -1]
@@ -80,12 +90,19 @@ class EmbeddedPipeline:
                     'finished': False}
         targets = [r['candidate'] for r in undecided]
         screen_task = loop.run_in_executor(
-            None, screener.screen_all, targets, progress)
-        while not progress.get('finished'):
-            if on_progress:
-                on_progress(progress['phase'], progress['done'], progress['total'])
-            await asyncio.sleep(0.5)
-        await screen_task
+            None, screener.screen_all, targets, progress, cancel_event)
+        try:
+            while not progress.get('finished'):
+                if cancel_event is not None and cancel_event.is_set():
+                    # screener 批次间看到同一事件会自行中止；吞掉其异常
+                    screen_task.add_done_callback(_swallow_task_error)
+                    raise ScreeningCancelled('AI 预筛已取消')
+                if on_progress:
+                    on_progress(progress['phase'], progress['done'], progress['total'])
+                await asyncio.sleep(0.5)
+            await screen_task
+        finally:
+            screener.close()
 
         # 保存判定（含静态分析的危险用途标记）
         for r in undecided:
@@ -98,7 +115,7 @@ class EmbeddedPipeline:
             r['ai_reason'] = c.ai_reason
             r['ai_danger'] = 1 if danger else 0
 
-    async def rescreen_all(self, rows, on_progress=None):
+    async def rescreen_all(self, rows, on_progress=None, cancel_event=None):
         """全部重判：清空判定后重新预筛"""
         loop = asyncio.get_event_loop()
         ids = [r['id'] for r in rows]
@@ -108,14 +125,15 @@ class EmbeddedPipeline:
             r['ai_reason'] = ''
             r['candidate'].ai_keep = None
             r['candidate'].ai_reason = ''
-        await self.screen_undecided(rows, on_progress)
+        await self.screen_undecided(rows, on_progress, cancel_event)
 
-    async def refine_rows(self, rows, on_progress=None):
+    async def refine_rows(self, rows, on_progress=None, cancel_event=None):
         """批量 agentic 精判（跳过粗筛，每行都走带工具的精审），写库
 
         on_progress(phase, done, total)：与 screen_undecided 相同。
+        cancel_event: 可选 threading.Event，置位时抛 ScreeningCancelled。
         """
-        from ai_screener import AIScreener
+        from ai_screener import AIScreener, ScreeningCancelled
         from usage_rules import UsageAnalyzer
         loop = asyncio.get_event_loop()
         if not rows:
@@ -134,16 +152,22 @@ class EmbeddedPipeline:
 
         def _run():
             try:
-                screener._refine_screen(cands, progress)
+                screener._refine_screen(cands, progress, cancel_event)
             finally:
                 progress['finished'] = True
 
         refine_task = loop.run_in_executor(None, _run)
-        while not progress.get('finished'):
-            if on_progress:
-                on_progress(progress['phase'], progress['done'], progress['total'])
-            await asyncio.sleep(0.5)
-        await refine_task
+        try:
+            while not progress.get('finished'):
+                if cancel_event is not None and cancel_event.is_set():
+                    refine_task.add_done_callback(_swallow_task_error)
+                    raise ScreeningCancelled('AI 精判已取消')
+                if on_progress:
+                    on_progress(progress['phase'], progress['done'], progress['total'])
+                await asyncio.sleep(0.5)
+            await refine_task
+        finally:
+            screener.close()
 
         for r in rows:
             c = r['candidate']
@@ -172,8 +196,11 @@ class EmbeddedPipeline:
             None, UsageAnalyzer(str(self.base_dir)).classify_all, [c])
         screener = AIScreener(self.translator, str(self.base_dir), self.logger)
         c.ai_confident = False
-        verdicts = await loop.run_in_executor(
-            None, screener._refine_batch, [(0, c)])
+        try:
+            verdicts = await loop.run_in_executor(
+                None, screener._refine_batch, [(0, c)])
+        finally:
+            screener.close()
         keep, reason = verdicts[0]
         danger = bool(getattr(c, 'static_danger', False))
         c.ai_keep, c.ai_reason = keep, reason
@@ -207,8 +234,10 @@ class EmbeddedPipeline:
 
     # ---- 步骤 4~6: 标记 → SDK 重生成 → 合并入库 ----
 
-    async def apply_selection(self, rows, chosen_rows, stage=None) -> dict:
+    async def apply_selection(self, rows, chosen_rows, stage=None,
+                              cancel_event=None) -> dict:
         """应用人工选择。stage(text) 报告阶段。
+        cancel_event: 可选 threading.Event，传给 SDK 子进程以便中止。
 
         Returns: {'wrapped': int, 'skipped': int, 'inserted': int}
         无 SDK 路径 / SDK 失败均抛异常（已标记的 _() 留在源码里无害，可重跑）。
@@ -249,8 +278,9 @@ class EmbeddedPipeline:
             # renpy.exe 在 Windows 上偶发访问冲突崩溃（0xC0000005，与负载/杀软
             # 扫描相关的间歇性崩溃），延迟重试数次
             for attempt in range(1, 6):
-                result = sdk.generate_translations(str(self.game_root), 'chinese')
-                if result['success']:
+                result = sdk.generate_translations(
+                    str(self.game_root), 'chinese', cancel_event=cancel_event)
+                if result['success'] or result.get('cancelled'):
                     return result
                 self.logger.warning(
                     f'SDK 生成模板第 {attempt} 次失败: {result["message"]}', panel='ui')
@@ -258,6 +288,9 @@ class EmbeddedPipeline:
             return result
 
         sdk_result = await loop.run_in_executor(None, _regen)
+        if sdk_result.get('cancelled'):
+            from ai_screener import ScreeningCancelled
+            raise ScreeningCancelled('SDK 重新生成模板已取消')
         if not sdk_result['success']:
             self.logger.error(f'SDK 重新生成模板失败: {sdk_result["message"]}', panel='ui')
             raise RuntimeError(f'SDK 重新生成失败: {sdk_result["message"]}')

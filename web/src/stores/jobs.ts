@@ -36,6 +36,9 @@ interface JobRecord {
 
 const TERMINAL = ['succeeded', 'failed', 'cancelled', 'interrupted']
 
+/** 任务终态列表（页面 watch 刷新用） */
+export const JOB_TERMINAL_STATUS = TERMINAL
+
 export const useJobsStore = defineStore('jobs', {
   state: () => ({
     jobs: new Map<string, JobView>(),
@@ -120,6 +123,11 @@ export const useJobsStore = defineStore('jobs', {
       const es = new EventSource(`/api/jobs/${jobId}/events?after_seq=${afterSeq}`)
       this.channels.set(jobId, es)
       let lastSeq = afterSeq
+      // 重连计数放闭包变量：连接成功即归零，
+      // 否则长跑任务累计掉线 5 次会被永久误判 sseFailed
+      let retryAttempt = attempt
+
+      es.onopen = () => { retryAttempt = 0 }
 
       const onEvent = (kind: string) => (ev: MessageEvent) => {
         const data = JSON.parse(ev.data)
@@ -156,12 +164,12 @@ export const useJobsStore = defineStore('jobs', {
         // SSE 断流：退避重连（after_seq 从 db 回放补齐）；连续失败 → 响亮报错
         const view2 = this.jobs.get(jobId)
         if (!view2 || TERMINAL.includes(view2.status)) return
-        if (attempt >= 4) {
+        if (retryAttempt >= 4) {
           view2.sseFailed = true
           return
         }
-        setTimeout(() => this._connect(jobId, lastSeq, attempt + 1),
-                   500 * 2 ** attempt)
+        setTimeout(() => this._connect(jobId, lastSeq, retryAttempt + 1),
+                   500 * 2 ** retryAttempt)
       }
     },
 
@@ -170,6 +178,8 @@ export const useJobsStore = defineStore('jobs', {
       const view = this.jobs.get(jobId)
       if (!view) return
       view.sseFailed = false
+      // 全量回放前清空日志，避免整段重复（progress/stage 回放幂等，不用管）
+      view.logs = []
       this._connect(jobId, 0)
     },
 

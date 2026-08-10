@@ -325,11 +325,13 @@ class ProjectUpdater:
         self.get_sdk_path = get_sdk_path
 
     async def update(self, name: str, new_game_dir: str,
-                     progress, confirm_official_chinese=None) -> dict:
+                     progress, confirm_official_chinese=None,
+                     cancel_event=None) -> dict:
         """执行更新。progress(pct, text) 同步回调。
 
         任何异常（含取消）都会回滚到更新前状态后重抛。
         用户拒绝官中处理时回滚并返回 {'cancelled': True}。
+        cancel_event: 可选 threading.Event，传给 SDK 子进程以便中止。
         """
         loop = asyncio.get_event_loop()
         _rie = partial(loop.run_in_executor, None)
@@ -502,7 +504,8 @@ class ProjectUpdater:
             progress(0.55, '正在使用 SDK 重新生成翻译文件...')
             await generate_tl_templates(
                 sdk_path, game_work_dir, rel_files, db,
-                self.logger, progress, _rie)
+                self.logger, progress, _rie,
+                cancel_event=cancel_event)
             progress(0.60, 'SDK 模板就绪')
 
             # 步骤8: 解析新模板

@@ -27,6 +27,7 @@ def make_download_body(state, version: str):
     async def body(job):
         import tarfile
         import urllib.request
+        import uuid
         import zipfile
         from rt_home import home
         from .jobs import JobCancelled
@@ -39,8 +40,12 @@ def make_download_body(state, version: str):
         url = f'https://www.renpy.org/dl/{version}/{fname}'
         tools_dir = home() / 'tools'
         tools_dir.mkdir(parents=True, exist_ok=True)
-        tmp_pkg = tools_dir / fname
+        # 临时文件/目录名加 uuid：并发下载同版本不会写坏同一个临时文件
+        uniq = uuid.uuid4().hex[:8]
+        tmp_pkg = tools_dir / f'.{fname}.{uniq}.part'
+        stage_dir = tools_dir / f'.{fname}.{uniq}.tmp'
         sdk_dir = tools_dir / f'renpy-{version}-sdk'
+        bak_dir = tools_dir / f'{sdk_dir.name}.{uniq}.bak'
         loop = asyncio.get_event_loop()
 
         # ---- 下载（可取消） ----
@@ -73,10 +78,8 @@ def make_download_body(state, version: str):
             raise
         log('下载完成')
 
-        # ---- 解压（可取消，逐步进度） ----
-        if sdk_dir.exists():
-            shutil.rmtree(sdk_dir)
-
+        # ---- 解压到暂存目录（可取消，逐步进度） ----
+        # 先解压+校验，全部成功后再替换旧目录，失败不会弄丢可用的旧 SDK
         def _extract_zip():
             with zipfile.ZipFile(tmp_pkg) as zf:
                 infos = zf.infolist()
@@ -84,7 +87,7 @@ def make_download_body(state, version: str):
                 for i, info in enumerate(infos, 1):
                     if i % 25 == 0 and job.cancel_event.is_set():
                         raise JobCancelled()
-                    zf.extract(info, tools_dir)
+                    zf.extract(info, stage_dir)
                     job.emit_progress(0.7 + (i / total) * 0.3,
                                       f'正在解压... ({i}/{total})')
 
@@ -95,7 +98,7 @@ def make_download_body(state, version: str):
                 for i, m in enumerate(members, 1):
                     if i % 25 == 0 and job.cancel_event.is_set():
                         raise JobCancelled()
-                    tf.extract(m, tools_dir, filter='data')
+                    tf.extract(m, stage_dir, filter='data')
                     job.emit_progress(0.7 + (i / total) * 0.3,
                                       f'正在解压... ({i}/{total})')
 
@@ -103,6 +106,7 @@ def make_download_body(state, version: str):
             import subprocess
             import tempfile
             mp = Path(tempfile.mkdtemp())
+            staged_sdk = stage_dir / sdk_dir.name
             log('挂载 dmg...')
             subprocess.run(
                 ['hdiutil', 'attach', '-nobrowse', '-mountpoint', str(mp),
@@ -112,12 +116,12 @@ def make_download_body(state, version: str):
                 if not apps:
                     raise RuntimeError('dmg 中未找到 .app')
                 job.emit_progress(0.8, f'正在拷贝 {apps[0].name}...')
-                sdk_dir.mkdir(parents=True, exist_ok=True)
-                subprocess.run(['cp', '-a', str(apps[0]), str(sdk_dir) + '/'],
+                staged_sdk.mkdir(parents=True, exist_ok=True)
+                subprocess.run(['cp', '-a', str(apps[0]), str(staged_sdk) + '/'],
                                check=True)
                 # 去掉下载隔离属性，避免 Gatekeeper 拦截
                 subprocess.run(['xattr', '-dr', 'com.apple.quarantine',
-                                str(sdk_dir)], capture_output=True)
+                                str(staged_sdk)], capture_output=True)
             finally:
                 subprocess.run(['hdiutil', 'detach', str(mp)],
                                capture_output=True)
@@ -128,16 +132,30 @@ def make_download_body(state, version: str):
             await loop.run_in_executor(
                 None, {'zip': _extract_zip, 'tarbz2': _extract_tarbz2,
                        'dmg': _extract_dmg}[kind])
-        except BaseException:
-            shutil.rmtree(sdk_dir, ignore_errors=True)
             tmp_pkg.unlink(missing_ok=True)
-            raise
-        tmp_pkg.unlink(missing_ok=True)
-        log('解压完成')
+            log('解压完成')
 
-        if not state.sdk_manager._is_valid_sdk(sdk_dir):
-            raise RuntimeError(
-                f'解压后未找到有效 SDK: {sdk_dir}（缺 renpy 可执行文件）')
+            staged_sdk = stage_dir / sdk_dir.name
+            if not state.sdk_manager._is_valid_sdk(staged_sdk):
+                raise RuntimeError(
+                    f'解压后未找到有效 SDK: {staged_sdk}（缺 renpy 可执行文件）')
+
+            # ---- 校验通过，替换旧目录（先备份，失败则恢复） ----
+            if sdk_dir.exists():
+                sdk_dir.rename(bak_dir)
+            try:
+                shutil.move(str(staged_sdk), str(sdk_dir))
+            except BaseException:
+                if bak_dir.exists():
+                    bak_dir.rename(sdk_dir)
+                raise
+            shutil.rmtree(bak_dir, ignore_errors=True)
+        except BaseException:
+            tmp_pkg.unlink(missing_ok=True)
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
         log(f'SDK 就绪: {sdk_dir}')
         job.emit_progress(1.0, 'SDK 就绪')
         return {'sdk_path': str(sdk_dir)}

@@ -565,7 +565,12 @@ class AITranslator:
             if not isinstance(idx, int) or not (1 <= idx <= expected) or idx in seen:
                 return None, []
             seen.add(idx)
-            result[idx - 1] = text if isinstance(text, str) else ''
+            # 译文必须是非空字符串：模型返回 null/数字/空串时若静默填 ''，
+            # 能通过下面的全覆盖检查而不触发重试，下游 if not text: continue
+            # 又会跳过，导致该条永远漏译；故与其他校验失败一样返回 (None, []) 触发重试
+            if not isinstance(text, str) or not text:
+                return None, []
+            result[idx - 1] = text
 
         # 必须覆盖全部 id
         if len(seen) != expected or any(r is None for r in result):

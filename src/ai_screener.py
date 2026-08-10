@@ -77,6 +77,10 @@ _REFINE_SYSTEM = """你在审查 Ren'Py 游戏源码中提取的字符串候选�
 - 完成所有判断后，调用 submit_verdicts 一次性提交本批全部判定（reason 用一句话中文说明依据）"""
 
 
+class ScreeningCancelled(Exception):
+    """AI 预筛/精审被取消（cancel_event 置位）"""
+
+
 class AIScreener:
     """内嵌文本 AI 预筛器"""
 
@@ -94,6 +98,15 @@ class AIScreener:
         self.game_sub = nested if nested.is_dir() else self.game_root
         self.logger = logger
         self._pool = ThreadPoolExecutor(max_workers=self.REFINE_CONCURRENCY)
+        self._cancel_event = None  # screen_all/_refine_screen 调用时设置
+
+    def close(self):
+        """关闭精审线程池（不等待在飞任务；screener 为一次性使用）"""
+        self._pool.shutdown(wait=False)
+
+    def _check_cancel(self):
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise ScreeningCancelled('AI 预筛已取消')
 
     def _log(self, msg):
         if self.logger:
@@ -101,16 +114,22 @@ class AIScreener:
 
     # ========== 总入口 ==========
 
-    def screen_all(self, candidates: list, progress: dict):
+    def screen_all(self, candidates: list, progress: dict, cancel_event=None):
         """规则分流 → 粗筛 → 精审全流程（同步，在线程池中调用）
 
         progress: 共享进度字典 {phase, done, total, finished}
+        cancel_event: 可选 threading.Event，批次间检查，置位则抛
+            ScreeningCancelled（已写入的判定保留在候选对象上，由调用方
+            决定是否入库）
         结果写回候选的 ai_keep / ai_confident / ai_reason。
         """
+        self._cancel_event = cancel_event
         try:
             targets = self._static_screen(candidates, progress)
             if targets:
+                self._check_cancel()
                 self._coarse_screen(targets, progress)
+                self._check_cancel()
                 self._refine_screen(targets, progress)
             # 危险用途标记（static_danger）由 pipeline 随判定一起入库，
             # 前端以独立 ⚠ 徽标展示，不拼进 reason（避免与 AI 核实结论矛盾）
@@ -171,6 +190,7 @@ class AIScreener:
 
         progress.update(phase='粗筛', done=0, total=len(items))
         for start in range(0, len(items), self.COARSE_BATCH):
+            self._check_cancel()
             batch = items[start:start + self.COARSE_BATCH]
             # 失败直接上抛，不降级
             verdicts = self._coarse_batch(batch)
@@ -208,7 +228,10 @@ class AIScreener:
 
     # ========== 阶段 2：agentic 精审 ==========
 
-    def _refine_screen(self, candidates: list, progress: dict):
+    def _refine_screen(self, candidates: list, progress: dict,
+                       cancel_event=None):
+        if cancel_event is not None:
+            self._cancel_event = cancel_event
         uncertain = [(i, c) for i, c in enumerate(candidates)
                      if not c.ai_confident]
         if not uncertain:
@@ -223,6 +246,7 @@ class AIScreener:
         futures = {self._pool.submit(self._refine_batch, b, progress): b
                    for b in batches}
         for fut in as_completed(futures):
+            self._check_cancel()
             verdicts = fut.result()
             for idx, (keep, reason) in verdicts.items():
                 candidates[idx].ai_keep = keep
@@ -257,6 +281,7 @@ class AIScreener:
         ]
 
         for round_no in range(1, self.MAX_ROUNDS + 1):
+            self._check_cancel()
             if progress is not None:
                 progress['phase'] = f'精审·第 {round_no} 轮'
             message = self.translator._call_api(

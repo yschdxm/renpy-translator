@@ -57,8 +57,16 @@ function openFromList(jobId: string) {
 
 async function onProjectChange(name: string | null) {
   if (!name) return
-  await session.open(name)
-  await projectsStore.refresh()
+  try {
+    await session.open(name)
+    await projectsStore.refresh()
+  } catch (e) {
+    // 打开失败（项目被删/db 损坏）：提示并刷新会话与列表，
+    // 选择器绑定 session.currentProject，刷新后自动回退到实际当前项目
+    message.error(errorText(e), { duration: 8000 })
+    await session.refresh()
+    await projectsStore.refresh()
+  }
 }
 
 function onMenu(key: string) {

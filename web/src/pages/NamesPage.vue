@@ -8,7 +8,7 @@ import type { DataTableColumns } from 'naive-ui'
 import { LanguageOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, errorText } from '../api/client'
 import { renderIcon } from '../components/icons'
-import { useJobsStore } from '../stores/jobs'
+import { useJobsStore, JOB_TERMINAL_STATUS } from '../stores/jobs'
 import { useSessionStore } from '../stores/session'
 
 const message = useMessage()
@@ -45,13 +45,21 @@ async function load() {
   }
 }
 
+// ---- 行内编辑 ----
+// Enter 保存后焦点仍在输入框，随后的 blur 会再发一次相同 PATCH；
+// 记录已保存值去重（与 TextsPage 的 editingId 守卫同思路）
+const savedNames = new Map<string, string>()
+
 async function saveName(row: NameRow, value: string) {
+  const key = row.original + row.variable
+  if (savedNames.get(key) === value) return
   const old = row.translated
   row.translated = value
   try {
     await api.patch(`/api/current/names/${encodeURIComponent(row.original)}`, {
       cn_name: value, variable: row.variable,
     })
+    savedNames.set(key, value)
     row.name_done = !!value.trim()
     await session.refresh()
   } catch (e) {
@@ -91,7 +99,7 @@ async function translateAll() {
 watch(
   () => activeJobId.value && jobsStore.jobs.get(activeJobId.value)?.status,
   (status) => {
-    if (status && ['succeeded', 'failed', 'cancelled'].includes(status)) {
+    if (status && JOB_TERMINAL_STATUS.includes(status)) {
       load()
       session.refresh()
     }

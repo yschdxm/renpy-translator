@@ -2,6 +2,7 @@
 import asyncio
 import shutil
 import tempfile
+import uuid
 import zipfile
 from dataclasses import asdict
 from datetime import datetime
@@ -19,9 +20,16 @@ router = APIRouter(prefix='/projects', tags=['projects'])
 
 
 def _exports_dir(state: AppState, name: str = '') -> Path:
-    """导出目录（随数据根）。传 name 时按项目分目录：exports/{name}/"""
+    """导出目录（随数据根）。传 name 时按项目分目录：exports/{name}/
+
+    name 来自路由参数，先做字符白名单校验（与 ProjectManager._get_project_dir
+    一致），防目录穿越（如 '..\\config'）；非法名直接抛 400。
+    """
     d = Path(state.root) / 'exports'
     if name:
+        safe = ''.join(c for c in name if c.isalnum() or c in '._- ').strip()
+        if safe != name or safe in ('.', '..'):
+            raise ApiError(400, 'BAD_NAME', f'非法项目名: {name}')
         d = d / name
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -65,14 +73,18 @@ def _make_create_body(state: AppState, name: str, model: str,
     async def body(job):
         from services.project_creation import ProjectCreator, extract_game_zip
         loop = asyncio.get_event_loop()
+        # 进场时记录项目是否已存在：except 清理只删本任务创建的项目，
+        # 避免并发同名建项时误删对方正在创建的项目目录
+        pre_existing = state.project_manager.project_exists(name)
 
         try:
             # zip 来源：先解压（逐项计数进度）
             if 'zip_path' in game_dir_holder:
                 job.emit_progress(0.01, '正在解压游戏文件...')
-                extract_dir = Path(game_dir_holder['zip_path']).parent / 'extracted'
-                if extract_dir.exists():
-                    shutil.rmtree(extract_dir)
+                # 解压目录名带 uuid：并发任务共用固定目录会互相 rmtree
+                extract_dir = (Path(game_dir_holder['zip_path']).parent
+                               / f'extracted-{uuid.uuid4().hex[:8]}')
+                cleanup_paths.append(extract_dir)  # 交给 finally 统一清理
 
                 def _extract():
                     return extract_game_zip(
@@ -83,6 +95,7 @@ def _make_create_body(state: AppState, name: str, model: str,
                 game_dir_holder['dir'] = await loop.run_in_executor(None, _extract)
                 job.emit_progress(0.05, '解压完成')
 
+            job.check_cancelled()
             game_dir = game_dir_holder['dir']
             if not Path(game_dir).exists():
                 raise RuntimeError(f'游戏目录不存在: {game_dir}')
@@ -101,19 +114,36 @@ def _make_create_body(state: AppState, name: str, model: str,
                 })
                 return bool(ans.get('ok'))
 
+            # 进度回调即取消检查点：复制完成、SDK 生成模板、解析入库等
+            # 各阶段之间都会经过这里，取消后不会继续把项目建完
+            def _progress(p, t):
+                job.check_cancelled()
+                job.emit_progress(p, t)
+
+            job.check_cancelled()
             result = await creator.create(
                 name, game_dir, model,
-                progress=lambda p, t: job.emit_progress(p, t),
+                progress=_progress,
                 confirm_official_chinese=_confirm,
+                cancel_event=job.cancel_event,
             )
             if result.get('cancelled'):
                 from ..jobs import JobCancelled
                 raise JobCancelled()
             return result
-        except Exception:
-            # 失败清理半成品项目目录（取消路径 creator 已自行删除）
-            await loop.run_in_executor(
-                None, state.project_manager.delete_project, name)
+        except Exception as e:
+            # 失败/取消（JobCancelled 也是 Exception）都清掉半成品项目目录，
+            # 但只清本任务创建的：进场前项目已存在，或失败原因正是"项目已存在"
+            # （create_project 抛 ValueError），说明目录属于并发任务，不能删
+            name_taken = isinstance(e, ValueError) and '已存在' in str(e)
+            if not pre_existing and not name_taken:
+                await loop.run_in_executor(
+                    None, state.project_manager.delete_project, name)
+            # SDK 中止等下游取消表现为普通异常：统一转成 JobCancelled，
+            # 让任务状态正确落为 cancelled 而非 failed
+            from ..jobs import JobCancelled
+            if job.cancel_event.is_set() and not isinstance(e, JobCancelled):
+                raise JobCancelled() from e
             raise
         finally:
             for p in cleanup_paths:
@@ -164,7 +194,6 @@ async def create_project_zip(file: UploadFile = File(...),
     if state.project_manager.project_exists(name):
         raise ApiError(409, 'NAME_EXISTS', f'项目已存在: {name}')
 
-    import uuid
     zip_path = _uploads_dir(state) / f'{uuid.uuid4().hex[:8]}.zip'
     await _save_upload(file, zip_path)
 
@@ -173,7 +202,7 @@ async def create_project_zip(file: UploadFile = File(...),
         {'name': name, 'zip': file.filename, 'model': model},
         _make_create_body(state, name, model,
                           {'zip_path': str(zip_path)},
-                          [zip_path, zip_path.parent / 'extracted']))
+                          [zip_path]))  # 解压目录由任务体生成（带 uuid）并自行登记清理
     return {'job_id': job.id}
 
 
@@ -181,7 +210,6 @@ async def create_project_zip(file: UploadFile = File(...),
 async def import_project(file: UploadFile = File(...), name: str = Form(''),
                          state: AppState = Depends(get_state)):
     import re
-    import uuid
     # 自动命名去掉导出后缀：Foo-project.zip / Foo-translated.zip → Foo
     name = re.sub(r'-(project|translated)$', '', name.strip())
     zip_path = _uploads_dir(state) / f'{uuid.uuid4().hex[:8]}.zip'
@@ -217,16 +245,22 @@ class UpdateRequest(BaseModel):
 
 
 def _check_update_allowed(state: AppState, name: str):
-    """更新前置校验：项目存在 + 无活动任务占用（翻译/导出中更新会丢数据）"""
+    """更新前置校验：项目存在 + 无活动任务占用（翻译/导出中更新会丢数据）
+
+    同一时刻只有一个打开的项目，翻译/导出/内嵌等任务都作用在它上面，
+    但它们的 payload 不一定带项目名——所以不按 payload 匹配项目，
+    只要存在 running/waiting_input 任务就拒绝更新。
+    （本校验在创建更新任务之前执行，不会把更新任务自己误判为占用。）
+    """
     if not state.project_manager.project_exists(name):
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
-    for rec in state.app_db.list_jobs(active_only=True):
-        payload = rec.get('payload') or {}
-        if payload.get('name') == name or payload.get('project') == name:
-            raise ApiError(
-                409, 'PROJECT_BUSY',
-                f'项目有正在进行的任务（{rec.get("label") or rec["kind"]}），'
-                '请等待完成或取消后再更新')
+    active = state.app_db.list_jobs(active_only=True)
+    if active:
+        rec = active[0]
+        raise ApiError(
+            409, 'PROJECT_BUSY',
+            f'有正在进行的任务（{rec.get("label") or rec["kind"]}），'
+            '请等待完成或取消后再更新')
 
 
 def _make_update_body(state: AppState, name: str,
@@ -246,9 +280,10 @@ def _make_update_body(state: AppState, name: str,
             # zip 来源：先解压（逐项计数进度）
             if 'zip_path' in game_dir_holder:
                 job.emit_progress(0.005, '正在解压游戏文件...')
-                extract_dir = Path(game_dir_holder['zip_path']).parent / 'extracted'
-                if extract_dir.exists():
-                    shutil.rmtree(extract_dir)
+                # 解压目录名带 uuid：并发任务共用固定目录会互相 rmtree
+                extract_dir = (Path(game_dir_holder['zip_path']).parent
+                               / f'extracted-{uuid.uuid4().hex[:8]}')
+                cleanup_paths.append(extract_dir)  # 交给 finally 统一清理
 
                 def _extract():
                     return extract_game_zip(
@@ -289,10 +324,17 @@ def _make_update_body(state: AppState, name: str,
                 name, game_dir,
                 progress=_progress,
                 confirm_official_chinese=_confirm,
+                cancel_event=job.cancel_event,
             )
             if result.get('cancelled'):
                 raise JobCancelled()
             return result
+        except Exception as e:
+            # SDK 中止等下游取消表现为普通异常：统一转成 JobCancelled，
+            # 让任务状态正确落为 cancelled 而非 failed
+            if job.cancel_event.is_set() and not isinstance(e, JobCancelled):
+                raise JobCancelled() from e
+            raise
         finally:
             # 更新前是当前项目的，无论成败都重新打开（失败时回滚已恢复原状）
             if was_current and state.project_manager.project_exists(name):
@@ -330,7 +372,6 @@ async def update_project_zip(name: str, file: UploadFile = File(...),
                              state: AppState = Depends(get_state)):
     _check_update_allowed(state, name)
 
-    import uuid
     zip_path = _uploads_dir(state) / f'{uuid.uuid4().hex[:8]}.zip'
     await _save_upload(file, zip_path)
 
@@ -339,7 +380,7 @@ async def update_project_zip(name: str, file: UploadFile = File(...),
         {'name': name, 'zip': file.filename},
         _make_update_body(state, name,
                           {'zip_path': str(zip_path)},
-                          [zip_path, zip_path.parent / 'extracted']))
+                          [zip_path]))  # 解压目录由任务体生成（带 uuid）并自行登记清理
     return {'job_id': job.id}
 
 
@@ -631,9 +672,10 @@ async def list_packages(name: str, state: AppState = Depends(get_state)):
 @router.get('/{name}/packages/{file}')
 async def download_package(name: str, file: str,
                            state: AppState = Depends(get_state)):
-    exports_dir = _exports_dir(state, name)
+    exports_dir = _exports_dir(state, name).resolve()
     target = (exports_dir / file).resolve()
-    if not str(target).startswith(str(exports_dir.resolve())) or not target.is_file():
+    # is_relative_to 按路径段比较，避免 startswith 误命中同前缀兄弟目录
+    if not target.is_relative_to(exports_dir) or not target.is_file():
         raise ApiError(404, 'NOT_FOUND', '项目包不存在')
     return FileResponse(target, filename=file)
 
@@ -644,12 +686,11 @@ async def reveal_package(name: str, file: str = '',
     """在系统文件管理器中打开该项目的导出目录（传 file 时选中该文件）"""
     import subprocess
     import sys
-    exports_dir = _exports_dir(state, name)
+    exports_dir = _exports_dir(state, name).resolve()
     target = exports_dir
     if file:
         target = (exports_dir / file).resolve()
-        if not str(target).startswith(str(exports_dir.resolve())) \
-                or not target.is_file():
+        if not target.is_relative_to(exports_dir) or not target.is_file():
             raise ApiError(404, 'NOT_FOUND', '项目包不存在')
 
     if sys.platform.startswith('win'):

@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import subprocess
+import time
 from pathlib import Path
 
 # 7.x 及更早：__init__.py 里字面量 version_tuple = (7, 4, 9, vc_version)
@@ -100,15 +101,19 @@ class SDKManager:
         # 都不存在时返回默认路径（_is_valid_sdk 判定失败，错误信息含路径）
         return sdk_path / 'renpy.sh'
 
-    def generate_translations(self, game_dir: str, language: str = "chinese") -> dict:
+    def generate_translations(self, game_dir: str, language: str = "chinese",
+                              cancel_event=None) -> dict:
         """调用 Ren'Py 生成翻译文件
 
         Args:
             game_dir: 游戏目录路径
             language: 目标语言
+            cancel_event: 可选 threading.Event，置位时终止子进程并返回
+                {'success': False, 'cancelled': True, ...}
 
         Returns:
             {'success': bool, 'message': str, 'output': str}
+            取消时额外含 'cancelled': True
         """
         if not self.sdk_path:
             return {'success': False, 'message': '未配置 Ren\'Py SDK 路径', 'output': ''}
@@ -117,6 +122,7 @@ class SDKManager:
         if not renpy_exe.exists():
             return {'success': False, 'message': f'找不到 {renpy_exe}', 'output': ''}
 
+        proc = None
         try:
             # 构建命令 - 使用正确的 translate 命令
             cmd = [str(renpy_exe), str(game_dir), "translate", language]
@@ -129,18 +135,39 @@ class SDKManager:
             # 游戏的、原生模块（librenpython.dll 里的 render）用 SDK 的，
             # 大版本不一致即崩溃（如 'Cache' object has no attribute
             # 'get_renders'）。cwd 在 SDK 目录时两处都来自同一 SDK，自洽。
-            result = subprocess.run(
+            #
+            # Popen + 轮询而非 subprocess.run(timeout=...)：run 阻塞期间
+            # 任务无法取消（最长 1 小时），轮询让 cancel_event 能及时生效
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=3600,
                 cwd=str(self.sdk_path)
             )
 
-            output = result.stdout + result.stderr
+            deadline = time.monotonic() + 3600
+            while proc.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    # 取消：先 terminate 给子进程退出机会，不行再强杀
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    return {'success': False, 'cancelled': True,
+                            'message': '已取消', 'output': ''}
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait()
+                    return {'success': False, 'message': '执行超时', 'output': ''}
+                time.sleep(0.5)
+
+            output = proc.stdout.read() if proc.stdout else ''
             print(f'[SDK] 输出:\n{output}')
 
-            if result.returncode == 0:
+            if proc.returncode == 0:
                 return {
                     'success': True,
                     'message': f'成功生成 {language} 翻译文件',
@@ -149,14 +176,17 @@ class SDKManager:
             else:
                 return {
                     'success': False,
-                    'message': f'生成失败 (返回码: {result.returncode})',
+                    'message': f'生成失败 (返回码: {proc.returncode})',
                     'output': output
                 }
 
-        except subprocess.TimeoutExpired:
-            return {'success': False, 'message': '执行超时', 'output': ''}
         except Exception as e:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
             return {'success': False, 'message': str(e), 'output': ''}
+        finally:
+            if proc is not None and proc.stdout:
+                proc.stdout.close()
 
     def list_languages(self, game_dir: str) -> list:
         """列出已有的翻译语言"""

@@ -145,7 +145,12 @@ def find_candidates(game_dir: str) -> list:
                 content = rpy_file.read_text(encoding='utf-8', errors='ignore')
             except OSError:
                 continue
-            rel = rpy_file.relative_to(base).as_posix()
+            try:
+                rel = rpy_file.relative_to(base).as_posix()
+            except ValueError:
+                # 游戏根目录（game/ 之外）的 .rpy 不属于 base，
+                # 改用相对 game_path 的路径，避免整个扫描崩溃
+                rel = rpy_file.relative_to(game_path).as_posix()
             _scan_file(str(rpy_file), rel, content, candidates)
 
     candidates.sort(key=lambda c: (c.rel_file, c.line, c.col_start))
@@ -354,13 +359,15 @@ def unwrap_candidates(candidates: list) -> tuple:
     从文件末尾向开头处理保持偏移有效，目标位置不匹配时跳过。
 
     Returns:
-        (拆除数, 跳过数)
+        (成功拆除的 Candidate 列表, 跳过数)——调用方只对成功行
+        更新状态，位置校验失败的行保持原状态以便下轮重试
     """
     by_file = {}
     for c in candidates:
         by_file.setdefault(c.file, []).append(c)
 
-    unwrapped = skipped = 0
+    unwrapped = []
+    skipped = 0
     for file_path, cands in by_file.items():
         path = Path(file_path)
         try:
@@ -383,7 +390,7 @@ def unwrap_candidates(candidates: list) -> tuple:
                 skipped += 1
                 continue
             lines[idx] = line[:c.col_start] + c.raw + line[end + 1:]
-            unwrapped += 1
+            unwrapped.append(c)
             changed = True
 
         if changed:

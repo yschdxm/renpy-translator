@@ -103,6 +103,13 @@ class RPAExtractor:
                     if isinstance(filename, bytes):
                         filename = filename.decode('utf-8')
 
+                    # 防目录穿越：索引来自 pickle 反序列化，恶意 .rpa 可用
+                    # ../ 或绝对路径把文件写出目标目录——拒绝非法条目
+                    _fparts = Path(filename.replace('\\', '/'))
+                    if _fparts.is_absolute() or '..' in _fparts.parts:
+                        print(f"  跳过非法路径条目: {filename}")
+                        continue
+
                     print(f"处理文件: {filename}, 类型: {type(file_info)}")
 
                     # 获取文件数据（可能是tuple或list，或者包含tuple的list）

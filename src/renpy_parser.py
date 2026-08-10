@@ -394,10 +394,30 @@ class RenpyParser:
 
     @staticmethod
     def _unescape_renpy(s: str) -> str:
-        """Ren'Py 字符串反转义（与 SDK old/new 块中的原文对齐）"""
-        return (s.replace('\\"', '"').replace("\\'", "'")
-                 .replace('\\n', '\n').replace('\\t', '\t')
-                 .replace('\\\\', '\\'))
+        """Ren'Py 字符串反转义（与 SDK old/new 块中的原文对齐）
+
+        单遍扫描实现：顺序 replace 会把字面量 \\n（反斜杠+n）错误转成换行。
+        支持的转义：\\" \\" \\' \\' \\n \\t \\\\；未知转义保持原样（含反斜杠）。
+        """
+        escape_map = {'"': '"', "'": "'", 'n': '\n', 't': '\t', '\\': '\\'}
+        out = []
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == '\\' and i + 1 < n:
+                nxt = s[i + 1]
+                if nxt in escape_map:
+                    out.append(escape_map[nxt])
+                    i += 2
+                    continue
+                # 未知转义序列：保留反斜杠，下一字符按普通字符处理
+                out.append(ch)
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
 
     def locate_ui_string_contexts(self, game_dir: str) -> dict:
         """回扫游戏源码，定位 UI 字符串的出处

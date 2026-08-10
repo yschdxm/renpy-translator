@@ -32,10 +32,12 @@ async def export_game(state: AppState = Depends(require_project)):
         raise ApiError(409, 'NOTHING_TO_EXPORT', '没有已翻译的内容可导出')
 
     project_dir = state.project_manager._get_project_dir(state.current_project)
-    sdk_path = state.resolve_sdk_path(project_dir)
+    # 引擎目录在项目根的 game/ 子目录下，版本探测必须基于它
+    game_work_dir = project_dir / 'game'
+    sdk_path = state.resolve_sdk_path(game_work_dir)
     if not sdk_path:
         from sdk_manager import detect_engine_version
-        gv = detect_engine_version(project_dir)
+        gv = detect_engine_version(game_work_dir)
         hint = (f"（游戏引擎为 Ren'Py {'.'.join(map(str, gv))}，"
                 f'需要 {gv[0]}.x 的 SDK）' if gv else '')
         # 不降级：tl 模板生成本就依赖 SDK，无 SDK 的导出没有意义
@@ -86,7 +88,8 @@ async def export_game(state: AppState = Depends(require_project)):
                     job.check_cancelled()
                     status = await healer.validate_and_heal(
                         work_dir, log=job.emit_log,
-                        cancel_check=job.check_cancelled)
+                        cancel_check=job.check_cancelled,
+                        cancel_event=job.cancel_event)
                     if status == 'ok':
                         break
                     if status == 'reexport' and attempt < 2:

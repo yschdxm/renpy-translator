@@ -240,7 +240,8 @@ async def generate_style_guide(state: AppState = Depends(require_project)):
         raise ApiError(409, 'NO_TRANSLATOR', '请先配置翻译器（模型配置）')
     loop = asyncio.get_event_loop()
 
-    sample = await loop.run_in_executor(None, _sample_dialogue_text, state.db)
+    # 采样走 db_call（executor + db_lock），不再裸放 executor 直读连接
+    sample = await state.db_call(_sample_dialogue_text, state.db)
     if not sample:
         raise ApiError(409, 'NO_DIALOGUES', '项目暂无对话文本，无法生成风格指南')
     guide = await loop.run_in_executor(
@@ -256,10 +257,13 @@ def _sample_dialogue_text(db) -> str:
     每个 label 取前 3 句 + 随机 50 句，总量限 ~30K 字符。
     """
     import random
-    rows = db._conn.execute(
-        "SELECT label, character, original_text FROM dialogues "
-        "WHERE length(original_text) > 5 ORDER BY file_path, line_number"
-    ).fetchall()
+    # 自定义 SQL 无对应公共方法，直读原始连接时需持有 database 层
+    # RLock（database.py 的锁纪律已收敛到该层），避免与并发写撞游标
+    with db._lock:
+        rows = db._conn.execute(
+            "SELECT label, character, original_text FROM dialogues "
+            "WHERE length(original_text) > 5 ORDER BY file_path, line_number"
+        ).fetchall()
     if not rows:
         return ""
 

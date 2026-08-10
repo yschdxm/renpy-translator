@@ -46,9 +46,12 @@ def parse_translation_files(tl_dir, game_dir: str, logger=None) -> dict:
 
 def _parse_dialogue_blocks(lines, tl_file, game_path, dialogues, ui_texts):
     """解析对话格式的翻译块，提取 label 归属"""
-    current_file = str(tl_file.relative_to(tl_file.parent.parent.parent))
-    if current_file.startswith('tl/chinese/'):
-        current_file = current_file[len('tl/chinese/'):]
+    # Windows 上 relative_to 产生反斜杠路径，先统一为正斜杠再做前缀判断
+    current_file = str(tl_file.relative_to(tl_file.parent.parent.parent)).replace('\\', '/')
+    # tl 目录结构为 tl/<语言>/<源脚本相对路径>，通用剥掉前两段（语言名不写死）
+    parts = current_file.split('/')
+    if len(parts) >= 3 and parts[0] == 'tl':
+        current_file = '/'.join(parts[2:])
 
     current_label = ""
     current_line_no = 0
@@ -64,7 +67,9 @@ def _parse_dialogue_blocks(lines, tl_file, game_path, dialogues, ui_texts):
         if translate_match:
             raw_label = translate_match.group(1)
             # 去掉末尾的 hex hash 段（如 luna_gallery_intro_71d6afad → luna_gallery_intro）
-            current_label = re.sub(r'_[0-9a-f]{6,}$', '', raw_label)
+            # Ren'Py 生成的 translate id 哈希固定为 8 位 hex；
+            # 必须恰好 8 位，否则 scene_facade、act_decade 等全 a-f 结尾的合法 label 会被误截
+            current_label = re.sub(r'_[0-9a-f]{8}$', '', raw_label)
             continue
 
         # 提取行号注释：# game/xxx.rpy:15（在 translate 行之前，作为后续 block 的行号）
@@ -107,10 +112,22 @@ def _parse_dialogue_blocks(lines, tl_file, game_path, dialogues, ui_texts):
             }
             # 只按文件名判断是否为界面文本文件，避免目录名（如 *_screens/）误判
             file_name = current_file.replace('\\', '/').rsplit('/', 1)[-1]
-            if any(f in file_name for f in ['screens', 'gui', 'options', 'common']):
+            if _is_ui_file(file_name):
                 ui_texts.append(entry)
             else:
                 dialogues.append(entry)
+
+
+def _is_ui_file(file_name: str) -> bool:
+    """判断文件名是否属于界面脚本（screens/gui/options/common）
+
+    不能用子串匹配：guild.rpy、guidance.rpy 等含 'gui' 的对话脚本会被误判。
+    要求整词匹配（去扩展名后完整相等，或以下划线为词边界的前后缀，
+    如 screens.rpy 与 my_screens.rpy 都算 UI，guidance.rpy 不算）。
+    """
+    stem = file_name.rsplit('.', 1)[0].lower()
+    return any(re.fullmatch(rf'(?:.*_)?{word}(?:_.*)?', stem)
+               for word in ('screens', 'gui', 'options', 'common'))
 
 
 def _parse_strings_block(lines, tl_file, game_path, ui_texts):
