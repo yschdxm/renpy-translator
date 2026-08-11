@@ -9,32 +9,7 @@
 
 import logging
 import sys
-from typing import Callable, Optional
-
-
-class UILogHandler(logging.Handler):
-    """将日志推送到 NiceGUI ui.log 组件的 Handler"""
-
-    def __init__(self):
-        super().__init__()
-        self._callbacks: dict[str, Callable[[str], None]] = {}
-
-    def register(self, panel_key: str, callback: Callable[[str], None]):
-        """注册 UI 日志回调"""
-        self._callbacks[panel_key] = callback
-
-    def unregister(self, panel_key: str):
-        """取消注册"""
-        self._callbacks.pop(panel_key, None)
-
-    def emit(self, record: logging.LogRecord):
-        msg = self.format(record)
-        for panel_key, callback in self._callbacks.items():
-            try:
-                callback(msg)
-            except Exception as e:
-                # 不能用 self.logger 记录，会无限递归，用 print 输出到控制台
-                print(f'[日志系统] UI回调失败 ({panel_key}): {e}')
+from logging.handlers import RotatingFileHandler
 
 
 class TranslationLogger:
@@ -46,19 +21,30 @@ class TranslationLogger:
         logger.debug("API 请求详情", panel="translator")
         logger.error("翻译失败: xxx", panel="names")
 
-        # 绑定 UI 日志面板
-        logger.bind_ui("dialogue", ui_log_push_fn)
+    handler 构成：控制台（stdout）+ 轮转文件（数据根 logs/app.log）。
+    内存环形缓冲 handler 由 server/state.py 挂接到 _logger（/api/logs 数据源）。
     """
 
     # 日志格式
     FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
     DATE_FORMAT = "%H:%M:%S"
+    # 文件日志带日期与面板名（renpy_translator.<panel>）
+    FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    FILE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+    FILE_MAX_BYTES = 5 * 1024 * 1024  # 5MB
+    FILE_BACKUP_COUNT = 3
 
     def __init__(self, level: int = logging.DEBUG):
         # 主日志器
         self._logger = logging.getLogger("renpy_translator")
         self._logger.setLevel(level)
-        self._logger.handlers.clear()
+        # 重复实例化时先关掉旧 handler（文件句柄不释放会导致轮转失败）
+        for h in self._logger.handlers[:]:
+            self._logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
 
         # 控制台 handler
         console_handler = logging.StreamHandler(sys.stdout)
@@ -66,14 +52,31 @@ class TranslationLogger:
         console_handler.setFormatter(logging.Formatter(self.FORMAT, self.DATE_FORMAT))
         self._logger.addHandler(console_handler)
 
-        # UI handler
-        self._ui_handler = UILogHandler()
-        self._ui_handler.setLevel(logging.INFO)
-        self._ui_handler.setFormatter(logging.Formatter(self.FORMAT, self.DATE_FORMAT))
-        self._logger.addHandler(self._ui_handler)
+        # 轮转文件 handler（数据根/logs/app.log；目录不可写时静默跳过，
+        # 不影响控制台与 ring buffer）
+        file_handler = self._make_file_handler()
+        if file_handler is not None:
+            self._logger.addHandler(file_handler)
 
         # 独立的面板日志器缓存
         self._panel_loggers: dict[str, logging.Logger] = {}
+
+    def _make_file_handler(self):
+        """构建轮转文件 handler；数据根解析/目录创建失败时返回 None"""
+        try:
+            from rt_home import home
+            log_dir = home() / 'logs'
+            log_dir.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                log_dir / 'app.log', maxBytes=self.FILE_MAX_BYTES,
+                backupCount=self.FILE_BACKUP_COUNT, encoding='utf-8')
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(
+                logging.Formatter(self.FILE_FORMAT, self.FILE_DATE_FORMAT))
+            return handler
+        except Exception as e:
+            print(f'[日志系统] 文件日志初始化失败（仅控制台输出）: {e}')
+            return None
 
     def _get_panel_logger(self, panel: str) -> logging.Logger:
         """获取面板专属日志器"""
@@ -82,19 +85,6 @@ class TranslationLogger:
             logger.setLevel(logging.DEBUG)
             self._panel_loggers[panel] = logger
         return self._panel_loggers[panel]
-
-    def bind_ui(self, panel_key: str, push_callback: Callable[[str], None]):
-        """绑定 UI 日志面板
-
-        Args:
-            panel_key: 面板标识 (names/strings/dialogue/export/analysis)
-            push_callback: ui.log 的 push 方法或等效回调
-        """
-        self._ui_handler.register(panel_key, push_callback)
-
-    def unbind_ui(self, panel_key: str):
-        """解绑 UI 日志面板"""
-        self._ui_handler.unregister(panel_key)
 
     def set_level(self, level: int):
         """设置全局日志级别"""

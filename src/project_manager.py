@@ -60,7 +60,7 @@ class ProjectManager:
         self.projects_dir = Path(projects_dir)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_project_dir(self, name: str) -> Path:
+    def project_dir(self, name: str) -> Path:
         """获取项目目录路径"""
         safe_name = "".join(c for c in name if c.isalnum() or c in "._- ")
         safe_name = safe_name.strip()
@@ -68,7 +68,7 @@ class ProjectManager:
 
     def _get_db_path(self, name: str) -> Path:
         """获取项目数据库文件路径"""
-        return self._get_project_dir(name) / "project.db"
+        return self.project_dir(name) / "project.db"
 
     def list_projects(self) -> List[ProjectInfo]:
         """列出所有项目"""
@@ -152,7 +152,7 @@ class ProjectManager:
     def delete_project(self, name: str) -> bool:
         """删除项目"""
         try:
-            project_dir = self._get_project_dir(name)
+            project_dir = self.project_dir(name)
             if project_dir.exists():
                 shutil.rmtree(project_dir)
             return True
@@ -217,7 +217,7 @@ class ProjectManager:
             package_dir = db_file.parent
 
             # 复制数据库文件
-            project_dir = self._get_project_dir(project_name)
+            project_dir = self.project_dir(project_name)
             project_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(db_file, project_dir / "project.db")
 

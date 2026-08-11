@@ -64,10 +64,15 @@ _ASSIGN_PREFIX_RE = re.compile(
 class UsageAnalyzer:
     """对一批候选做静态用途分流"""
 
-    def __init__(self, game_root: str):
-        """game_root: 与 find_candidates 的 rel_file 基准一致的源码根目录"""
+    def __init__(self, game_root: str, files: dict = None):
+        """game_root: 与 find_candidates 的 rel_file 基准一致的源码根目录
+        files: 可选的预加载 {rel_path: 行列表}（如 SourceTree.as_dict()），
+            传入后跳过全树扫描（与 AI 预筛共用同一源码缓存）"""
         self.root = Path(game_root)
         # rel_path -> 行列表（排除引擎/资源目录与注释行在查找时处理）
+        if files is not None:
+            self.files = files
+            return
         self.files = {}
         for rpy in sorted(self.root.rglob('*.rpy')):
             if _EXCLUDE_DIRS & set(rpy.parts):

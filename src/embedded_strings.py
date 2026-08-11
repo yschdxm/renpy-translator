@@ -49,6 +49,17 @@ _SCOPE_PATTERNS = [
 _SCOPE_KIND_NAMES = {'screen': '界面', 'label': '场景'}
 
 
+def resolve_source_root(game_root) -> Path:
+    """find_candidates 的 rel_file 基准：game/game 存在则下钻一层
+
+    AI 预筛、内嵌管线、导出自愈的源码读取都以此为根，
+    三处共用此推导避免基准不一致导致工具读文件 404。
+    """
+    root = Path(game_root)
+    nested = root / 'game'
+    return nested if nested.is_dir() else root
+
+
 @dataclass
 class Candidate:
     """一个可提取的内嵌字符串候选"""

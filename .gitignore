@@ -39,12 +39,13 @@ renpy-*-sdk/
 
 # 日志
 *.log
+*.log.*
+logs/
 
-# 测试脚本与临时产物
-test_*.py
-fix_*.py
+# 测试脚本与临时产物（根目录的临时脚本；tests/ 是正式测试目录，不忽略）
+/test_*.py
+/fix_*.py
 rpyc_test/
-tests/
 
 # 应用级数据库
 data/

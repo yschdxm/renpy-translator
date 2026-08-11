@@ -1,5 +1,4 @@
 """SDK 下载/安装：手动下载接口与启动时自动补装共用"""
-import asyncio
 import shutil
 from pathlib import Path
 
@@ -46,7 +45,6 @@ def make_download_body(state, version: str):
         stage_dir = tools_dir / f'.{fname}.{uniq}.tmp'
         sdk_dir = tools_dir / f'renpy-{version}-sdk'
         bak_dir = tools_dir / f'{sdk_dir.name}.{uniq}.bak'
-        loop = asyncio.get_event_loop()
 
         # ---- 下载（可取消） ----
         log(f'下载 {url}')
@@ -72,7 +70,7 @@ def make_download_body(state, version: str):
                                 f'正在下载 SDK... '
                                 f'{downloaded >> 20}/{total >> 20} MB')
 
-            await loop.run_in_executor(None, _download)
+            await state.run_sync(_download)
         except BaseException:
             tmp_pkg.unlink(missing_ok=True)
             raise
@@ -129,14 +127,13 @@ def make_download_body(state, version: str):
 
         log(f'正在解压（{kind}）...')
         try:
-            await loop.run_in_executor(
-                None, {'zip': _extract_zip, 'tarbz2': _extract_tarbz2,
-                       'dmg': _extract_dmg}[kind])
+            await state.run_sync({'zip': _extract_zip, 'tarbz2': _extract_tarbz2,
+                                  'dmg': _extract_dmg}[kind])
             tmp_pkg.unlink(missing_ok=True)
             log('解压完成')
 
             staged_sdk = stage_dir / sdk_dir.name
-            if not state.sdk_manager._is_valid_sdk(staged_sdk):
+            if not state.sdk_manager.is_valid_sdk(staged_sdk):
                 raise RuntimeError(
                     f'解压后未找到有效 SDK: {staged_sdk}（缺 renpy 可执行文件）')
 

@@ -9,7 +9,8 @@ import asyncio
 from typing import Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
-from translator import AITranslator, FatalAPIError, _count_tokens
+from translator import AITranslator, FatalAPIError
+from token_budget import TokenBudget, count_tokens
 from database import ProjectDatabase
 from logger import TranslationLogger
 
@@ -43,27 +44,23 @@ class TranslationService:
         if batch_lines is not None:
             self.batch_lines = batch_lines
 
+    def close(self):
+        """关闭内部线程池。
+
+        项目关闭/切换时由 state 调用；不 shutdown 的话 ThreadPoolExecutor
+        线程只能靠 GC 回收，反复开关项目会持续累积线程。
+        """
+        self._executor.shutdown(wait=False)
+
     def _calc_context_count(self, glossary_text: str = "", character_profile: str = "") -> int:
         """根据模型上下文能力和提示词实际大小动态计算上下文行数
 
-        可用 token = 模型上下文窗口 - 已占用部分
+        可用 token = 模型上下文窗口 - 已占用部分（模板常量 + 术语表/角色特征实测）
         """
-        total_tokens = self.max_context_k * 1024
-
-        # 估算已占用的 token（系统提示词模板约 270 token，加上术语表与角色特征实测值）
-        fixed_overhead = 270
-        if glossary_text:
-            fixed_overhead += _count_tokens(glossary_text)
-        if character_profile:
-            fixed_overhead += _count_tokens(character_profile)
-
-        # 每行上下文约 50 token（原文 + 译文 + 角色名）
-        tokens_per_line = 50
-
-        available = total_tokens - fixed_overhead
-        count = max(3, available // tokens_per_line)
-
-        return min(count, 20)
+        return TokenBudget(self.max_context_k * 1024).context_line_count(
+            glossary_tokens=count_tokens(glossary_text),
+            profile_tokens=count_tokens(character_profile),
+        )
 
     @property
     def is_running(self) -> bool:
@@ -111,36 +108,28 @@ class TranslationService:
 
     # ===== 批次翻译 =====
 
-    _BATCH_FIXED_TOKENS = 1000  # 系统提示词模板 + 用户提示词模板/格式说明 + 前文参考 + tool schema 的估算开销
-
-    def group_into_batches(self, items: list, glossary_text: str = "",
-                           character_profiles: str = "") -> list:
+    def group_into_batches(self, items: list, glossary_tokens: int = 0,
+                           profile_tokens: int = 0) -> list:
         """按句数与 token 双重上限分组
 
         1. 每批最多 batch_lines 句（模型配置）
         2. 整体输入（含提示词）+ 估算输出（批原文 × 1.2 + 300）≤ 上下文窗口
         3. 估算输出 ≤ 模型声明 max_tokens
-        """
-        window_tokens = self.max_context_k * 1024
-        # 固定开销：模板常量 + 术语表/角色特征实测 token
-        fixed_tokens = self._BATCH_FIXED_TOKENS
-        if glossary_text:
-            fixed_tokens += _count_tokens(glossary_text)
-        if character_profiles:
-            fixed_tokens += _count_tokens(character_profiles)
 
-        # fixed + src + src×1.2+300 ≤ window  →  src ≤ (window − fixed − 300) / 2.2
-        window_cap = int((window_tokens - fixed_tokens - 300) / 2.2)
-        # src×1.2+300 ≤ max_tokens  →  src ≤ (max_tokens − 300) / 1.2
-        declared_cap = int((self.max_tokens - 300) / 1.2)
-        budget = max(500, min(window_cap, declared_cap))
+        glossary_tokens / profile_tokens 为调用方实测的术语表与角色特征 token 数。
+        """
+        budget = TokenBudget(self.max_context_k * 1024).batch_src_token_budget(
+            glossary_tokens=glossary_tokens,
+            profile_tokens=profile_tokens,
+            declared_max_tokens=self.max_tokens,
+        )
 
         batches, current, used = [], [], 0
         for item in items:
             char = item.get('character', '')
             # 编号 + [角色] 标记 + 格式开销
-            line_tokens = _count_tokens(item.get('original_text', '')) \
-                + (_count_tokens(char) + 2 if char else 0) + 4
+            line_tokens = count_tokens(item.get('original_text', '')) \
+                + (count_tokens(char) + 2 if char else 0) + 4
             if current and (len(current) >= self.batch_lines
                             or used + line_tokens > budget):
                 batches.append(current)
@@ -152,7 +141,7 @@ class TranslationService:
         return batches
 
     async def prepare_batches(self, items: list, content_type: str) -> list:
-        """读取术语表后按预算分组（预算中预留角色特征开销）
+        """读取术语表与角色特征后按实测 token 预算分组
 
         每次批量翻译前通过 config_provider 拉取最新模型配置，
         配置面板保存后无需重新打开项目即可生效。
@@ -163,9 +152,22 @@ class TranslationService:
             if cfg:
                 self.max_context_k, self.max_tokens, self.batch_lines = cfg
         glossary_text = await loop.run_in_executor(None, self._get_glossary_text)
-        # 对话批次需携带批内角色特征，预留 ~700 token（2000 字符的中文/混排）；UI 无此开销
-        profile_placeholder = '预' * 2000 if content_type == 'dialogue' else ''
-        return self.group_into_batches(items, glossary_text, profile_placeholder)
+        glossary_tokens = count_tokens(glossary_text)
+
+        # 对话批次需携带批内角色特征：按全部待译角色的特征汇总实测 token
+        # （逐批精确值要等分组后才知道，用全体角色汇总是其上界，稳妥不超重）
+        profile_tokens = 0
+        if content_type == 'dialogue':
+            chars = sorted({it.get('character', '') for it in items
+                            if it.get('character')})
+            if chars:
+                profiles_text = await loop.run_in_executor(
+                    None, lambda: self._format_character_profiles(
+                        chars, self.db.get_profile)
+                )
+                profile_tokens = count_tokens(profiles_text)
+
+        return self.group_into_batches(items, glossary_tokens, profile_tokens)
 
     async def translate_batch(self, items: list, content_type: str) -> dict:
         """批次翻译一组条目（一次 API 调用），返回 {item_id: translated}

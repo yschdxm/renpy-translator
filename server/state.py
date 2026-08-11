@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 from collections import deque
+from functools import partial
 from pathlib import Path
 
 
@@ -105,6 +106,8 @@ class AppState:
         self.db = None                # ProjectDatabase
         self.translator = None        # AITranslator
         self.translation_service = None
+        self.name_service = None      # NameTranslationService（随项目会话缓存）
+        self._name_service_key = None
         self.db_lock = asyncio.Lock()
         self.interrupted_count = 0    # 启动时标记的中断任务数（前端汇总提示用）
 
@@ -177,17 +180,64 @@ class AppState:
         # 先取消所有未完成任务并等其退出，再关库（否则任务收尾写库撞关库）
         for rec in self.app_db.list_jobs(active_only=True):
             self.jobs.cancel(rec['id'])
-        for _ in range(30):
+        for _ in range(100):  # 最多等 10s
             active = [self.jobs.get(r['id'])
                       for r in self.app_db.list_jobs(active_only=True)]
             if all(j is None or j.done for j in active):
                 break
             await asyncio.sleep(0.1)
+        # 超时兜底：仍未退出的任务直接标终态，不留 running 僵尸
+        # （任务收尾写库已被 registry._finalize 防御，这里覆盖其失败窗口）
+        leftover = self.app_db.list_jobs(active_only=True)
+        for rec in leftover:
+            try:
+                self.app_db.update_job(rec['id'], status='interrupted')
+            except Exception as e:
+                self.logger.warning(f'关停兜底标记任务失败: {rec["id"]} - {e}')
+        if leftover:
+            self.logger.warning(
+                f'关停等待超时，{len(leftover)} 个任务被标记为 interrupted')
+        self._close_session_services()
         if self.db is not None:
             db = self.db
             self.db = None
             await loop.run_in_executor(None, db.close)
         await loop.run_in_executor(None, self.app_db.close)
+
+    def _close_session_services(self):
+        """关闭项目会话内持有线程池的服务（翻译服务 + 人名服务缓存）"""
+        if self.name_service is not None:
+            self.name_service.close()
+            self.name_service = None
+            self._name_service_key = None
+        if self.translation_service is not None:
+            self.translation_service.close()
+            self.translation_service = None
+
+    def get_name_service(self, max_context_k: int = 8):
+        """人名翻译服务（随项目会话缓存复用，hooks 由调用方接）
+
+        服务内部持有 ThreadPoolExecutor，每次新建而不 shutdown 会泄漏线程，
+        因此按 (db, translator, translation_service, max_context_k) 缓存复用；
+        项目切换/模型配置变化导致任一依赖变更时，关闭旧实例线程池后重建。
+        """
+        from .errors import ApiError
+        if not self.translation_service or not self.translator:
+            raise ApiError(409, 'NO_TRANSLATOR', '请先配置翻译器（模型配置）')
+        key = (id(self.db), id(self.translator),
+               id(self.translation_service), max_context_k)
+        if self.name_service is not None and self._name_service_key == key:
+            return self.name_service
+        # 依赖变化：释放旧实例线程池后重建
+        if self.name_service is not None:
+            self.name_service.close()
+        from services.name_translation import NameTranslationService
+        self.name_service = NameTranslationService(
+            db=self.db, translator=self.translator,
+            translation_service=self.translation_service,
+            logger=self.logger, max_context_k=max_context_k)
+        self._name_service_key = key
+        return self.name_service
 
     # ---- SDK 路径（固定默认目录 tools/，不支持自定义） ----
 
@@ -222,7 +272,8 @@ class AppState:
             from .errors import ApiError
             raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
 
-        # 先关旧库（Windows 上不关会导致文件锁）
+        # 先关旧会话服务（释放线程池）与旧库（Windows 上不关会导致文件锁）
+        self._close_session_services()
         if self.db is not None:
             old = self.db
             self.db = None
@@ -282,22 +333,26 @@ class AppState:
 
     async def close_project(self):
         loop = asyncio.get_event_loop()
+        self._close_session_services()
         if self.db is not None:
             db = self.db
             self.db = None
             await loop.run_in_executor(None, db.close)
         self.translator = None
-        self.translation_service = None
         self.current_project = ''
         await loop.run_in_executor(
             None, self.app_db.set_setting, 'current_project', '')
 
+    async def run_sync(self, fn, *args, **kwargs):
+        """阻塞函数放默认 executor 执行的通用桥（不持 db_lock）"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, partial(fn, *args, **kwargs))
+
     async def db_call(self, fn, *args, **kwargs):
         """项目库调用：executor + 锁，避免并发写"""
         async with self.db_lock:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                None, lambda: fn(*args, **kwargs))
+            return await self.run_sync(fn, *args, **kwargs)
 
     # ---- 数据目录迁移 ----
 
@@ -461,6 +516,8 @@ class AppState:
     # ---- API 日志（移植自旧 main.py::_on_api_log）----
 
     _api_log_lock = None
+    # api.log 超过该尺寸滚动为 api.log.1（只保留两代，防长期开启撑爆磁盘）
+    _API_LOG_MAX_BYTES = 5 * 1024 * 1024
 
     def _on_api_log(self, request_body: dict, response_body: dict, task_type: str):
         """API 日志回调：完整请求体/返回体写入 logs/api.log（API_LOG 环境变量控制）
@@ -499,6 +556,9 @@ class AppState:
         with self._api_log_lock:
             try:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
+                if (log_path.exists()
+                        and log_path.stat().st_size > self._API_LOG_MAX_BYTES):
+                    log_path.replace(log_path.with_name(log_path.name + '.1'))
                 with open(log_path, 'a', encoding='utf-8') as f:
                     f.write(entry)
             except OSError as e:

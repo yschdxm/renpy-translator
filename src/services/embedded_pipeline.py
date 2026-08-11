@@ -33,14 +33,14 @@ class EmbeddedPipeline:
                  project_dir: str, sdk_path: str, logger: TranslationLogger):
         if not translator:
             raise RuntimeError('AI 预筛需要翻译器，请先配置模型')
+        from embedded_strings import resolve_source_root
         self.db = db
         self.translator = translator
         self.project_dir = Path(project_dir)
         self.game_root = self.project_dir / 'game'
         # find_candidates 的 rel_file 基准：game/ 子目录存在时以它为根
         # （否则源码查看/精判的工具读文件会错位到 game_root 下而 404）
-        self.base_dir = (self.game_root / 'game'
-                         if (self.game_root / 'game').exists() else self.game_root)
+        self.base_dir = resolve_source_root(self.game_root)
         self.sdk_path = sdk_path
         self.logger = logger
 
@@ -134,6 +134,7 @@ class EmbeddedPipeline:
         cancel_event: 可选 threading.Event，置位时抛 ScreeningCancelled。
         """
         from ai_screener import AIScreener, ScreeningCancelled
+        from source_tree import SourceTree
         from usage_rules import UsageAnalyzer
         loop = asyncio.get_event_loop()
         if not rows:
@@ -142,11 +143,16 @@ class EmbeddedPipeline:
         cands = [r['candidate'] for r in rows]
         for c in cands:
             c.ai_confident = False
-        # 静态用途分析先行：证据/危险用途注入精审输入
+        # 静态用途分析先行：证据/危险用途注入精审输入。
+        # 静态分析与精审工具共用同一源码缓存（一次调用一棵树）
+        tree = SourceTree(str(self.base_dir))
         await loop.run_in_executor(
-            None, UsageAnalyzer(str(self.base_dir)).classify_all, cands)
+            None,
+            UsageAnalyzer(str(self.base_dir), files=tree.as_dict()).classify_all,
+            cands)
 
-        screener = AIScreener(self.translator, str(self.base_dir), self.logger)
+        screener = AIScreener(self.translator, str(self.base_dir), self.logger,
+                              source_tree=tree)
         progress = {'phase': '精审', 'done': 0, 'total': len(cands),
                     'finished': False}
 
@@ -189,12 +195,18 @@ class EmbeddedPipeline:
         danger 作为独立标记入库/返回，不拼进 reason。
         """
         from ai_screener import AIScreener
+        from source_tree import SourceTree
         from usage_rules import UsageAnalyzer
         loop = asyncio.get_event_loop()
         c = row['candidate']
+        # 静态分析与精审工具共用同一源码缓存（单句也免两次全树扫描）
+        tree = SourceTree(str(self.base_dir))
         await loop.run_in_executor(
-            None, UsageAnalyzer(str(self.base_dir)).classify_all, [c])
-        screener = AIScreener(self.translator, str(self.base_dir), self.logger)
+            None,
+            UsageAnalyzer(str(self.base_dir), files=tree.as_dict()).classify_all,
+            [c])
+        screener = AIScreener(self.translator, str(self.base_dir), self.logger,
+                              source_tree=tree)
         c.ai_confident = False
         try:
             verdicts = await loop.run_in_executor(

@@ -13,28 +13,40 @@ export class ApiError extends Error {
   }
 }
 
+/** 从错误响应体组装 ApiError：优先 error.code/message/detail，
+ *  兼容 FastAPI 风格的 detail 字段（字符串或对象数组） */
+function toApiError(status: number, statusText: string, data: unknown): ApiError {
+  let code = 'HTTP_' + status
+  let message = statusText
+  let detail = ''
+  const body = data as {
+    error?: { code?: string; message?: string; detail?: string }
+    detail?: unknown
+  } | null
+  if (body?.error) {
+    code = body.error.code ?? code
+    message = body.error.message ?? message
+    detail = body.error.detail ?? ''
+  } else if (body?.detail != null) {
+    message = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
+  }
+  return new ApiError(status, code, message, detail)
+}
+
+/** 读取 fetch 错误响应体并抛出 ApiError（非 JSON 体退化为 HTTP_状态码） */
+async function throwResponseError(resp: Response): Promise<never> {
+  let data: unknown = null
+  try { data = await resp.json() } catch { /* 非 JSON 错误体 */ }
+  throw toApiError(resp.status, resp.statusText, data)
+}
+
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
   const resp = await fetch(url, {
     method,
     headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
-  if (!resp.ok) {
-    let code = 'HTTP_' + resp.status
-    let message = resp.statusText
-    let detail = ''
-    try {
-      const data = await resp.json()
-      if (data?.error) {
-        code = data.error.code ?? code
-        message = data.error.message ?? message
-        detail = data.error.detail ?? ''
-      } else if (data?.detail) {
-        message = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)
-      }
-    } catch { /* 非 JSON 错误体 */ }
-    throw new ApiError(resp.status, code, message, detail)
-  }
+  if (!resp.ok) await throwResponseError(resp)
   return resp.json() as Promise<T>
 }
 
@@ -47,20 +59,7 @@ export const api = {
   /** multipart 表单（文件上传；不能设 Content-Type，浏览器自带 boundary） */
   postForm: async <T>(url: string, form: FormData): Promise<T> => {
     const resp = await fetch(url, { method: 'POST', body: form })
-    if (!resp.ok) {
-      let code = 'HTTP_' + resp.status
-      let message = resp.statusText
-      let detail = ''
-      try {
-        const data = await resp.json()
-        if (data?.error) {
-          code = data.error.code ?? code
-          message = data.error.message ?? message
-          detail = data.error.detail ?? ''
-        }
-      } catch { /* 非 JSON 错误体 */ }
-      throw new ApiError(resp.status, code, message, detail)
-    }
+    if (!resp.ok) await throwResponseError(resp)
     return resp.json() as Promise<T>
   },
   /** 带上传进度的 multipart（fetch 不支持上传进度，用 XHR） */
@@ -78,9 +77,7 @@ export const api = {
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve(data as T)
         } else {
-          const err = (data as { error?: { code?: string; message?: string; detail?: string } })?.error
-          reject(new ApiError(xhr.status, err?.code ?? 'HTTP_' + xhr.status,
-                              err?.message ?? xhr.statusText, err?.detail ?? ''))
+          reject(toApiError(xhr.status, xhr.statusText, data))
         }
       }
       xhr.onerror = () => reject(new ApiError(0, 'NETWORK', '网络错误', ''))

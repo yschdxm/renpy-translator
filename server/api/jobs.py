@@ -1,4 +1,4 @@
-"""任务 API：查询/回答/取消/SSE 事件流（after_seq 从 db 回放）"""
+"""任务 API：查询/回答/取消/SSE 事件流（db 轮询回放，after_seq 游标）"""
 import asyncio
 import json
 
@@ -8,11 +8,10 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..deps import get_state
 from ..errors import ApiError
+from ..jobs import TERMINAL_STATUSES
 from ..state import AppState
 
 router = APIRouter(prefix='/jobs', tags=['jobs'])
-
-TERMINAL = ('succeeded', 'failed', 'cancelled', 'interrupted')
 
 
 class AnswerRequest(BaseModel):
@@ -53,43 +52,57 @@ async def cancel_job(job_id: str, state: AppState = Depends(get_state)):
 @router.get('/{job_id}/events')
 async def job_events(job_id: str, after_seq: int = 0,
                      state: AppState = Depends(get_state)):
-    """SSE 事件流：先订阅（防漏），再从 db 回放 after_seq 之后的事件，
-    然后转直播（seq 去重）；终态 status 事件后关流。"""
+    """SSE 事件流：db 是唯一事实源，按 after_seq 轮询增量拉取。
+
+    终态 status 事件送达后关流；任务记录已终态但终态事件缺失
+    （收尾写库失败等）时发兜底 status 关流。"""
     record = state.app_db.get_job(job_id)
     if not record:
         raise ApiError(404, 'JOB_NOT_FOUND', f'任务不存在: {job_id}')
 
-    queue = state.bus.subscribe(job_id)
+    def _fmt(ev: dict) -> dict:
+        return {'event': ev['kind'], 'data': json.dumps(
+            {'seq': ev['seq'], **ev['data']}, ensure_ascii=False)}
+
+    def _is_terminal_status(ev: dict) -> bool:
+        return (ev['kind'] == 'status'
+                and ev['data'].get('status') in TERMINAL_STATUSES)
 
     async def gen():
         last = after_seq
-        try:
-            # 回放（db 是唯一事实源；回放期间的新事件进了 queue，靠 seq 去重）
-            for ev in state.app_db.get_events(job_id, after_seq):
+        while True:
+            events = await state.run_sync(
+                state.app_db.get_events, job_id, last)
+            terminal_sent = False
+            for ev in events:
                 last = ev['seq']
-                yield {'event': ev['kind'], 'data': json.dumps(
-                    {'seq': ev['seq'], **ev['data']}, ensure_ascii=False)}
-                # 订阅前任务可能已终结：回放吐出终态 status 后必须关流，
-                # 否则转直播后 queue 再无事件，协程永久挂在 queue.get()
-                if (ev['kind'] == 'status'
-                        and ev['data'].get('status') in TERMINAL):
-                    return
-            # 任务已终结且无新事件 → 发一个终态 status 兜底后关流
-            if record['status'] in TERMINAL:
-                yield {'event': 'status', 'data': json.dumps(
-                    {'seq': last + 1, 'status': record['status']}, ensure_ascii=False)}
+                yield _fmt(ev)
+                if _is_terminal_status(ev):
+                    # 终态 status 是任务的最后一个事件（收尾时最后落库）
+                    terminal_sent = True
+            if terminal_sent:
                 return
-            # 直播
-            while True:
-                event = await queue.get()
-                if event['seq'] <= last:
-                    continue
-                last = event['seq']
-                yield {'event': event['kind'], 'data': json.dumps(
-                    {'seq': event['seq'], **event['data']}, ensure_ascii=False)}
-                if event['kind'] == 'status':
-                    return
-        finally:
-            state.bus.unsubscribe(job_id, queue)
+            if events:
+                continue  # 事件还在写入，立刻再拉
+            rec = await state.run_sync(state.app_db.get_job, job_id)
+            if not (rec and rec['status'] in TERMINAL_STATUSES):
+                await asyncio.sleep(0.3)
+                continue
+            # 记录已终态但终态事件未出现：收尾是「先 update_job 后落事件」，
+            # 撞微窗口时多确认两轮（仍无新事件说明事件写库失败）再兜底关流
+            quiet = True
+            for _ in range(2):
+                await asyncio.sleep(0.15)
+                more = await state.run_sync(
+                    state.app_db.get_events, job_id, last)
+                if more:
+                    quiet = False
+                    break
+            if not quiet:
+                continue
+            yield {'event': 'status', 'data': json.dumps(
+                {'seq': last + 1, 'status': rec['status']},
+                ensure_ascii=False)}
+            return
 
     return EventSourceResponse(gen(), ping=15)

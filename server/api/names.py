@@ -11,31 +11,6 @@ from ..state import AppState
 router = APIRouter(prefix='/current/names', tags=['names'])
 
 
-def _name_service(state: AppState, max_context_k: int = 8):
-    """人名翻译服务单例缓存（hooks 由调用方接）
-
-    服务内部持有 ThreadPoolExecutor，每次新建而不 shutdown 会泄漏线程，
-    因此按 (db, translator, translation_service, max_context_k) 缓存复用；
-    项目切换/模型配置变化导致任一依赖变更时，关闭旧实例线程池后重建。
-    """
-    if not state.translation_service or not state.translator:
-        raise ApiError(409, 'NO_TRANSLATOR', '请先配置翻译器（模型配置）')
-    from services.name_translation import NameTranslationService
-    key = (id(state.db), id(state.translator),
-           id(state.translation_service), max_context_k)
-    cached = getattr(state, '_name_service_cache', None)
-    if cached and cached[0] == key:
-        return cached[1]
-    if cached:
-        cached[1].close()  # 释放旧实例的线程池
-    service = NameTranslationService(
-        db=state.db, translator=state.translator,
-        translation_service=state.translation_service,
-        logger=state.logger, max_context_k=max_context_k)
-    state._name_service_cache = (key, service)
-    return service
-
-
 async def _max_context_k(state: AppState) -> int:
     provider = state.translation_service.config_provider \
         if state.translation_service else None
@@ -91,13 +66,10 @@ class TranslateOneIn(BaseModel):
 async def translate_one(display_name: str, req: TranslateOneIn,
                         state: AppState = Depends(require_project)):
     """单条翻译+分析（同步；分段台词时可能较久）"""
-    service = _name_service(state, await _max_context_k(state))
-    # 单例复用需清掉上次批量任务的残留状态：
-    # 取消标记（否则分段循环直接 break）与指向已结束 job 的 hooks
-    service._cancel = False
-    service.on_progress = None
-    service.on_row_busy = None
-    service.on_row_done = None
+    service = state.get_name_service(await _max_context_k(state))
+    # 服务实例随项目会话缓存复用：清掉上次批量任务的残留状态
+    # （取消标记与指向已结束 job 的 hooks），理由见 begin_single()
+    service.begin_single()
     await service.translate_and_analyze(
         display_name, variable=req.variable or None)
     c = await state.db_call(state.db.get_character_by_name, display_name)
@@ -107,7 +79,7 @@ async def translate_one(display_name: str, req: TranslateOneIn,
 
 @router.post('/translate-all')
 async def translate_all(state: AppState = Depends(require_project)):
-    service = _name_service(state, await _max_context_k(state))
+    service = state.get_name_service(await _max_context_k(state))
 
     async def body(job):
         service.on_progress = lambda i, total, text: job.emit_progress(
@@ -125,7 +97,8 @@ async def translate_all(state: AppState = Depends(require_project)):
         job.emit_progress(1.0, '完成')
         return result
 
-    job = state.jobs.create('names.translate-all', '全部翻译+分析（人名）', {}, body)
+    job = state.jobs.create('names.translate-all', '全部翻译+分析（人名）', {}, body,
+                            exclusive=True)
     return {'job_id': job.id}
 
 

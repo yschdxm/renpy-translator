@@ -9,13 +9,13 @@ import type { DataTableColumns } from 'naive-ui'
 import { BookOutline, CodeSlashOutline, LanguageOutline, LocateOutline, RefreshOutline, SparklesOutline } from '@vicons/ionicons5'
 import { api, errorText } from '../api/client'
 import { renderIcon } from '../components/icons'
-import { useJobsStore, JOB_TERMINAL_STATUS } from '../stores/jobs'
+import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
 
 const props = defineProps<{ contentType: 'ui' | 'dialogue' }>()
 const message = useMessage()
-const jobsStore = useJobsStore()
 const session = useSessionStore()
+const { runJob } = useJobTask()
 
 interface Row {
   id: number
@@ -36,7 +36,6 @@ const query = reactive({
 })
 const characters = ref<Array<{ label: string; value: string }>>([])
 const translatingIds = ref<Set<number>>(new Set())
-const activeJobId = ref('')
 
 const isDialogue = computed(() => props.contentType === 'dialogue')
 const title = computed(() => (isDialogue.value ? '对话翻译' : '字符串翻译'))
@@ -113,46 +112,20 @@ async function translateOne(row: Row) {
   }
 }
 
-// ---- 批量翻译（任务） ----
+// ---- 批量翻译（任务）：终态后刷新表格与统计 ----
 async function translateAll() {
-  try {
-    const data = await api.post<{ job_id: string | null; message?: string }>(
-      `/api/current/texts/${props.contentType}/translate-all`)
-    if (!data.job_id) {
-      message.info(data.message ?? '没有待翻译的内容')
-      return
-    }
-    activeJobId.value = data.job_id
-    jobsStore.track(data.job_id)
-  } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
-  }
+  await runJob(
+    () => api.post(`/api/current/texts/${props.contentType}/translate-all`),
+    () => load(),
+    { emptyMessage: '没有待翻译的内容' })
 }
 
 async function translatePage() {
-  try {
-    const data = await api.post<{ job_id: string | null; message?: string }>(
-      `/api/current/texts/${props.contentType}/translate-page`, { ...query })
-    if (!data.job_id) {
-      message.info(data.message ?? '本页没有待翻译的内容')
-      return
-    }
-    activeJobId.value = data.job_id
-    jobsStore.track(data.job_id)
-  } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
-  }
+  await runJob(
+    () => api.post(`/api/current/texts/${props.contentType}/translate-page`, { ...query }),
+    () => load(),
+    { emptyMessage: '本页没有待翻译的内容' })
 }
-
-// 任务终结 → 刷新表格与统计
-watch(
-  () => activeJobId.value && jobsStore.jobs.get(activeJobId.value)?.status,
-  (status) => {
-    if (status && JOB_TERMINAL_STATUS.includes(status)) {
-      load()
-      session.refresh()
-    }
-  })
 
 // ---- 上下文对话框 ----
 const contextVisible = ref(false)
@@ -172,25 +145,16 @@ async function showContext(row: Row) {
 
 // ---- 重建上下文（UI 字符串） ----
 async function rebuildHints() {
-  try {
-    const data = await api.post<{ job_id: string }>(
-      `/api/current/texts/ui/hints/rebuild`)
-    activeJobId.value = data.job_id
-    jobsStore.track(data.job_id)
-  } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
-  }
+  await runJob(
+    () => api.post(`/api/current/texts/ui/hints/rebuild`),
+    () => load())
 }
 
 // ---- 提取内嵌文本（UI 字符串） ----
 async function extractEmbedded() {
-  try {
-    const data = await api.post<{ job_id: string }>('/api/current/embedded/scan')
-    activeJobId.value = data.job_id
-    jobsStore.track(data.job_id)
-  } catch (e) {
-    message.error(errorText(e), { duration: 8000, closable: true })
-  }
+  await runJob(
+    () => api.post('/api/current/embedded/scan'),
+    () => load())
 }
 
 // ---- 风格指南（对话） ----

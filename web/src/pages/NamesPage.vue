@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 人名翻译页：翻译+分析融合流程 */
-import { h, onMounted, ref, watch } from 'vue'
+import { h, onMounted, ref } from 'vue'
 import {
   NButton, NDataTable, NInput, NModal, NSpace, NTag, NText, useMessage,
 } from 'naive-ui'
@@ -8,12 +8,12 @@ import type { DataTableColumns } from 'naive-ui'
 import { LanguageOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, errorText } from '../api/client'
 import { renderIcon } from '../components/icons'
-import { useJobsStore, JOB_TERMINAL_STATUS } from '../stores/jobs'
+import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
 
 const message = useMessage()
-const jobsStore = useJobsStore()
 const session = useSessionStore()
+const { runJob } = useJobTask()
 
 interface NameRow {
   variable: string
@@ -28,7 +28,6 @@ const rows = ref<NameRow[]>([])
 const stats = ref({ total: 0, translated: 0, analyzed: 0 })
 const loading = ref(false)
 const processing = ref<Set<string>>(new Set())
-const activeJobId = ref('')
 
 async function load() {
   loading.value = true
@@ -87,23 +86,10 @@ async function translateOne(row: NameRow) {
 }
 
 async function translateAll() {
-  try {
-    const data = await api.post<{ job_id: string }>('/api/current/names/translate-all')
-    activeJobId.value = data.job_id
-    jobsStore.track(data.job_id)
-  } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
-  }
+  await runJob(
+    () => api.post('/api/current/names/translate-all'),
+    () => load())
 }
-
-watch(
-  () => activeJobId.value && jobsStore.jobs.get(activeJobId.value)?.status,
-  (status) => {
-    if (status && JOB_TERMINAL_STATUS.includes(status)) {
-      load()
-      session.refresh()
-    }
-  })
 
 // ---- 画像对话框 ----
 const profileVisible = ref(false)

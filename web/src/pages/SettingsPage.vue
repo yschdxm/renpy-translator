@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import {
   NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputGroup, NInputNumber,
   NModal, NPopconfirm, NSpace, NSpin, NTag, NText, useMessage,
@@ -8,12 +8,12 @@ import { AddOutline, CloudDownloadOutline, FolderOpenOutline } from '@vicons/ion
 import { api, errorText } from '../api/client'
 import { renderIcon } from '../components/icons'
 import { nativeReady, pickDirectory } from '../api/native'
-import { useJobsStore } from '../stores/jobs'
+import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
 
 const message = useMessage()
-const jobsStore = useJobsStore()
 const session = useSessionStore()
+const { runJob } = useJobTask()
 
 interface ModelConfig {
   name: string
@@ -145,27 +145,16 @@ async function testConnection() {
 }
 
 // ---- SDK 下载（任务） ----
-const sdkJobId = ref('')
-
 async function downloadSdk(version: string) {
-  try {
-    const data = await api.post<{ job_id: string }>(
-      '/api/settings/sdk/download', { version })
-    sdkJobId.value = data.job_id
-    jobsStore.track(data.job_id)
-  } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
-  }
+  await runJob(
+    () => api.post('/api/settings/sdk/download', { version }),
+    async (status) => {
+      if (status === 'succeeded') {
+        await refresh()
+        message.success('SDK 下载完成')
+      }
+    })
 }
-
-watch(
-  () => sdkJobId.value && jobsStore.jobs.get(sdkJobId.value)?.status,
-  async (status) => {
-    if (status === 'succeeded') {
-      await refresh()
-      message.success('SDK 下载完成')
-    }
-  })
 
 onMounted(async () => {
   guiMode.value = await nativeReady()

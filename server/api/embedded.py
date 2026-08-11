@@ -1,7 +1,4 @@
 """内嵌文本提取 API：扫描任务（含复核 ask/重判循环）、单句精判、源码查看"""
-import asyncio
-from pathlib import Path
-
 from fastapi import APIRouter, Depends
 
 from ..deps import require_project
@@ -14,7 +11,7 @@ router = APIRouter(prefix='/current/embedded', tags=['embedded'])
 
 def _pipeline(state: AppState):
     from services.embedded_pipeline import EmbeddedPipeline
-    project_dir = state.project_manager._get_project_dir(state.current_project)
+    project_dir = state.project_manager.project_dir(state.current_project)
     # 引擎目录在项目根的 game/ 子目录下，SDK 大版本选择必须基于它
     sdk_path = state.resolve_sdk_path(project_dir / 'game')
     return EmbeddedPipeline(state.db, state.translator, str(project_dir),
@@ -49,71 +46,68 @@ async def scan(state: AppState = Depends(require_project)):
     pipe = _pipeline(state)
 
     async def body(job):
-        from ai_screener import ScreeningCancelled
         job.emit_stage('正在扫描源码中的内嵌文本...')
         rows = await pipe.scan_and_merge()
         if not rows:
             return {'message': '未发现可提取的内嵌文本（或全部已处理）', 'wrapped': 0}
         job.emit_log(f'扫描到 {len(rows)} 条候选')
 
-        # 筛查/精判/拆除阶段的取消表现为 ScreeningCancelled，转成 JobCancelled
-        # 让任务状态正确落为 cancelled 而非 failed
-        try:
-            while True:
-                job.check_cancelled()
-                # AI 预筛（只判未决；失败即任务失败，不降级）
-                await pipe.screen_undecided(
-                    rows,
+        # 筛查/精判/拆除阶段取消时抛 ScreeningCancelled（cancel_event 已置位），
+        # 由 registry 统一归一化为 cancelled
+        while True:
+            job.check_cancelled()
+            # AI 预筛（只判未决；失败即任务失败，不降级）
+            await pipe.screen_undecided(
+                rows,
+                on_progress=lambda phase, done, total: job.emit_progress(
+                    done / max(total, 1) * 0.9,
+                    f'AI 预筛（{phase}）: {done}/{total}'),
+                cancel_event=job.cancel_event)
+
+            answer = await job.ask('embedded_review', {
+                'rows': [_row_payload(r) for r in rows],
+            })
+            action = answer.get('action')
+
+            # 重判/精判都基于前端筛出的行（row_ids），未传则作用于全部
+            def _target_rows():
+                ids = set(answer.get('row_ids') or [])
+                return [r for r in rows if r['id'] in ids] if ids else rows
+
+            if action == 'rescreen':
+                target = _target_rows()
+                job.emit_log(f'重判 {len(target)} 条：清空判定，重新 AI 预筛')
+                await pipe.rescreen_all(
+                    target,
                     on_progress=lambda phase, done, total: job.emit_progress(
                         done / max(total, 1) * 0.9,
-                        f'AI 预筛（{phase}）: {done}/{total}'),
+                        f'AI 重判（{phase}）: {done}/{total}'),
                     cancel_event=job.cancel_event)
-
-                answer = await job.ask('embedded_review', {
-                    'rows': [_row_payload(r) for r in rows],
-                })
-                action = answer.get('action')
-
-                # 重判/精判都基于前端筛出的行（row_ids），未传则作用于全部
-                def _target_rows():
-                    ids = set(answer.get('row_ids') or [])
-                    return [r for r in rows if r['id'] in ids] if ids else rows
-
-                if action == 'rescreen':
-                    target = _target_rows()
-                    job.emit_log(f'重判 {len(target)} 条：清空判定，重新 AI 预筛')
-                    await pipe.rescreen_all(
-                        target,
-                        on_progress=lambda phase, done, total: job.emit_progress(
-                            done / max(total, 1) * 0.9,
-                            f'AI 重判（{phase}）: {done}/{total}'),
-                        cancel_event=job.cancel_event)
-                    continue
-                if action == 'refine_all':
-                    target = _target_rows()
-                    job.emit_log(f'精判 {len(target)} 条（agentic 精审）')
-                    await pipe.refine_rows(
-                        target,
-                        on_progress=lambda phase, done, total: job.emit_progress(
-                            done / max(total, 1) * 0.9,
-                            f'AI 精判（{phase}）: {done}/{total}'),
-                        cancel_event=job.cancel_event)
-                    continue
-                if action == 'cancel':
-                    raise JobCancelled()
-
-                chosen_ids = set(answer.get('chosen_ids') or [])
-                chosen = [r for r in rows if r['id'] in chosen_ids]
-                result = await pipe.apply_selection(
-                    rows, chosen,
-                    stage=lambda text: job.emit_stage(text),
+                continue
+            if action == 'refine_all':
+                target = _target_rows()
+                job.emit_log(f'精判 {len(target)} 条（agentic 精审）')
+                await pipe.refine_rows(
+                    target,
+                    on_progress=lambda phase, done, total: job.emit_progress(
+                        done / max(total, 1) * 0.9,
+                        f'AI 精判（{phase}）: {done}/{total}'),
                     cancel_event=job.cancel_event)
-                job.emit_progress(1.0, '完成')
-                return result
-        except ScreeningCancelled:
-            raise JobCancelled()
+                continue
+            if action == 'cancel':
+                raise JobCancelled()
 
-    job = state.jobs.create('embedded.scan', '提取内嵌文本', {}, body)
+            chosen_ids = set(answer.get('chosen_ids') or [])
+            chosen = [r for r in rows if r['id'] in chosen_ids]
+            result = await pipe.apply_selection(
+                rows, chosen,
+                stage=lambda text: job.emit_stage(text),
+                cancel_event=job.cancel_event)
+            job.emit_progress(1.0, '完成')
+            return result
+
+    job = state.jobs.create('embedded.scan', '提取内嵌文本', {}, body,
+                            exclusive=True)
     return {'job_id': job.id}
 
 
@@ -135,7 +129,7 @@ async def refine(row_id: int, state: AppState = Depends(require_project)):
 async def snippet(file: str, line: int, ctx: int = 6,
                   state: AppState = Depends(require_project)):
     """候选处源码（前后 ctx 行）；file 为相对 game/game/ 的路径（防目录穿越）"""
-    project_dir = state.project_manager._get_project_dir(state.current_project)
+    project_dir = state.project_manager.project_dir(state.current_project)
     # 与 find_candidates 的 rel_file 基准一致：game/ 子目录存在时以它为根
     base = project_dir / 'game'
     if (base / 'game').is_dir():
@@ -144,8 +138,6 @@ async def snippet(file: str, line: int, ctx: int = 6,
     target = (base / file).resolve()
     if not str(target).startswith(str(base)) or not target.is_file():
         raise ApiError(404, 'NOT_FOUND', f'文件不存在: {file}')
-
-    loop = asyncio.get_event_loop()
 
     def _read():
         lines = target.read_text(encoding='utf-8', errors='ignore').split('\n')
@@ -156,4 +148,4 @@ async def snippet(file: str, line: int, ctx: int = 6,
             for i in range(start, end + 1)
         ]
 
-    return {'file': file, 'line': line, 'lines': await loop.run_in_executor(None, _read)}
+    return {'file': file, 'line': line, 'lines': await state.run_sync(_read)}

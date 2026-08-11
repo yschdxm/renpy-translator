@@ -1,12 +1,9 @@
 """文本翻译 API：UI 字符串与对话（分页/编辑/单翻/批翻任务/上下文/风格指南/重建出处）"""
-import asyncio
-
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from ..deps import require_project
 from ..errors import ApiError
-from ..jobs import JobCancelled
 from ..state import AppState
 
 router = APIRouter(prefix='/current', tags=['texts'])
@@ -154,7 +151,8 @@ async def translate_all(content_type: str,
         f'texts.translate-all.{content_type}',
         f'全部翻译（{"对话" if content_type == "dialogue" else "字符串"}）',
         {'content_type': content_type},
-        _make_translate_job(state, content_type, items))
+        _make_translate_job(state, content_type, items),
+        exclusive=True)
     return {'job_id': job.id}
 
 
@@ -198,13 +196,12 @@ async def translate_page(content_type: str, req: TranslatePageIn,
 async def rebuild_hints(state: AppState = Depends(require_project)):
     async def body(job):
         from renpy_parser import RenpyParser
-        loop = asyncio.get_event_loop()
-        project_dir = state.project_manager._get_project_dir(state.current_project)
+        project_dir = state.project_manager.project_dir(state.current_project)
         game_root = project_dir / 'game'
 
         job.emit_log('正在回扫源码定位字符串出处...')
-        hints = await loop.run_in_executor(
-            None, RenpyParser().locate_ui_string_contexts, str(game_root))
+        hints = await state.run_sync(
+            RenpyParser().locate_ui_string_contexts, str(game_root))
         matched = await state.db_call(state.db.update_ui_hints, hints)
         counts = await state.db_call(state.db.get_ui_text_count)
         job.emit_progress(1.0, f'完成: {matched}/{counts["total"]} 条命中')
@@ -238,56 +235,15 @@ async def generate_style_guide(state: AppState = Depends(require_project)):
     """AI 生成风格指南（同步；采样对话文本）"""
     if not state.translator:
         raise ApiError(409, 'NO_TRANSLATOR', '请先配置翻译器（模型配置）')
-    loop = asyncio.get_event_loop()
 
-    # 采样走 db_call（executor + db_lock），不再裸放 executor 直读连接
-    sample = await state.db_call(_sample_dialogue_text, state.db)
+    # 采样走 db_call（executor + db_lock）。
+    # db.sample_dialogue_texts(limit: int = 30000) -> str：
+    #   每个 label 前 3 句 + 随机 50 句，拼成 "角色: 文本" 行，
+    #   总长超 limit 字符截断；无对话时返回 ""
+    sample = await state.db_call(state.db.sample_dialogue_texts, 30000)
     if not sample:
         raise ApiError(409, 'NO_DIALOGUES', '项目暂无对话文本，无法生成风格指南')
-    guide = await loop.run_in_executor(
-        None, state.translator.generate_style_guide, sample)
+    guide = await state.run_sync(state.translator.generate_style_guide, sample)
     if not guide:
         raise ApiError(502, 'GENERATE_FAILED', '风格指南生成失败（空结果）')
     return {'style_guide': guide}
-
-
-def _sample_dialogue_text(db) -> str:
-    """抽样对话文本用于风格分析（移植自 text_panel._sample_dialogue_text）
-
-    每个 label 取前 3 句 + 随机 50 句，总量限 ~30K 字符。
-    """
-    import random
-    # 自定义 SQL 无对应公共方法，直读原始连接时需持有 database 层
-    # RLock（database.py 的锁纪律已收敛到该层），避免与并发写撞游标
-    with db._lock:
-        rows = db._conn.execute(
-            "SELECT label, character, original_text FROM dialogues "
-            "WHERE length(original_text) > 5 ORDER BY file_path, line_number"
-        ).fetchall()
-    if not rows:
-        return ""
-
-    # 每个 label 前 3 句
-    samples, seen_labels = [], set()
-    for r in rows:
-        label = r['label'] or ''
-        if label not in seen_labels:
-            seen_labels.add(label)
-            label_rows = [x for x in rows if (x['label'] or '') == label][:3]
-            samples.extend(label_rows)
-
-    # 随机补 50 句
-    pool = [r for r in rows if r not in samples]
-    if pool:
-        samples.extend(random.sample(pool, min(50, len(pool))))
-
-    # 拼装，限 30K 字符
-    lines, total = [], 0
-    for r in samples:
-        char = r['character'] or '旁白'
-        line = f"{char}: {r['original_text']}"
-        if total + len(line) > 30000:
-            break
-        lines.append(line)
-        total += len(line)
-    return "\n".join(lines)

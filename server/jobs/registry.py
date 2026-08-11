@@ -1,5 +1,6 @@
 """Job / JobRegistry：任务生命周期、事件发射、ask/answer、取消"""
 import asyncio
+import logging
 import threading
 import time
 import traceback
@@ -7,7 +8,10 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from ..appdb import AppDatabase
+from ..errors import ApiError
 from .events import EventBus
+
+_log = logging.getLogger(__name__)
 
 TERMINAL_STATUSES = ('succeeded', 'failed', 'cancelled', 'interrupted')
 
@@ -31,14 +35,10 @@ class Job:
         self._answer_future: asyncio.Future | None = None
         self._question_id: str = ''
 
-    # ---- 事件发射（线程安全；db 先写，bus 后扇出） ----
+    # ---- 事件发射（线程安全；落库即唯一事实源，SSE 端轮询回放） ----
 
     def _emit(self, kind: str, data: dict):
-        db = self.registry.app_db
-        seq = db.add_event(self.id, kind, data)
-        event = {'seq': seq, 'kind': kind, 'data': data}
-        self._loop.call_soon_threadsafe(
-            self.registry.bus.publish, self.id, event)
+        self.registry.app_db.add_event(self.id, kind, data)
 
     def emit_log(self, text: str):
         self._emit('log', {'text': text})
@@ -120,32 +120,52 @@ class JobRegistry:
         self._jobs: dict[str, Job] = {}
 
     def create(self, kind: str, label: str, payload: dict,
-               body: Callable[[Job], Awaitable[Any]]) -> Job:
-        """创建并启动任务。body(job) 为协程，返回值写入 result。"""
+               body: Callable[[Job], Awaitable[Any]],
+               exclusive: bool = False) -> Job:
+        """创建并启动任务。body(job) 为协程，返回值写入 result。
+
+        exclusive=True 时同 kind 已有活跃任务（running/waiting_input）则抛 409。
+        """
+        if exclusive:
+            for rec in self.app_db.list_jobs(active_only=True):
+                if rec['kind'] == kind:
+                    raise ApiError(
+                        409, 'JOB_ACTIVE',
+                        f'已有同类型任务正在进行: {rec["label"] or rec["id"]}')
         job_id = self.app_db.create_job(kind, label, payload)
         job = Job(self, job_id, kind, label)
         self._jobs[job_id] = job
 
         async def _run():
-            db = self.app_db
             try:
                 result = await body(job)
                 if job.cancel_event.is_set():
-                    db.update_job(job_id, status='cancelled')
-                    job._emit('status', {'status': 'cancelled'})
+                    self._finalize(job, {'status': 'cancelled'},
+                                   {'status': 'cancelled'})
                 else:
-                    db.update_job(job_id, status='succeeded', result=result or {},
-                                  progress=1.0)
-                    job._emit('status', {'status': 'succeeded',
-                                         'result': result or {}})
+                    self._finalize(
+                        job,
+                        {'status': 'succeeded', 'result': result or {},
+                         'progress': 1.0},
+                        {'status': 'succeeded', 'result': result or {}})
             except JobCancelled:
-                db.update_job(job_id, status='cancelled')
-                job._emit('status', {'status': 'cancelled'})
+                self._finalize(job, {'status': 'cancelled'},
+                               {'status': 'cancelled'})
             except Exception as e:
-                err = f'{e}\n\n{traceback.format_exc()}'
-                db.update_job(job_id, status='failed', error=err)
-                job._emit('status', {'status': 'failed', 'error': str(e),
-                                     'detail': traceback.format_exc()})
+                if job.cancel_event.is_set():
+                    # 取消归一化：cancel 后任务体在飞操作撞到的异常（连接中断、
+                    # 文件占用等）一律按取消处理，任务体无需各自判断；
+                    # 异常留痕——取消窗口内的真实错误（磁盘/代码缺陷）不应消失
+                    _log.info('任务 %s 取消窗口内异常已归一化为 cancelled: %s',
+                              job.id, e, exc_info=True)
+                    self._finalize(job, {'status': 'cancelled'},
+                                   {'status': 'cancelled'})
+                else:
+                    err = f'{e}\n\n{traceback.format_exc()}'
+                    self._finalize(
+                        job, {'status': 'failed', 'error': err},
+                        {'status': 'failed', 'error': str(e),
+                         'detail': traceback.format_exc()})
             finally:
                 job.done = True
                 # 句柄保留在内存中直到终态事件送达（前端可能立刻 answer/cancel 已结束的任务）
@@ -153,6 +173,31 @@ class JobRegistry:
 
         asyncio.create_task(_run())
         return job
+
+    def _finalize(self, job: Job, fields: dict, event: dict):
+        """终态收尾：先更新任务记录、后落终态事件（SSE 轮询端据此关流）。
+
+        关停窗口内库可能已关闭：失败仅记日志，shutdown 兜底会把
+        残留活跃任务标为 interrupted。
+        """
+        try:
+            self.app_db.update_job(job.id, **fields)
+            job._emit('status', event)
+        except Exception as e:
+            _log.warning('任务 %s 终态写库失败: %s', job.id, e, exc_info=True)
+            # 非关停场景（如 result 含不可 JSON 序列化对象）不能把任务
+            # 留成 running 僵尸（SSE 永不关流、exclusive 永久 409）：
+            # 降级补落 failed（纯字符串 payload，不会再因序列化失败）；
+            # 关停窗口内库已关闭时内层 try 兜住，由 shutdown 兜底标 interrupted
+            if fields.get('status') != 'failed':
+                try:
+                    self.app_db.update_job(
+                        job.id, status='failed',
+                        error=f'任务收尾失败: {e}')
+                    job._emit('status', {'status': 'failed',
+                                         'error': f'任务收尾失败: {e}'})
+                except Exception:
+                    _log.warning('任务 %s 降级收尾也失败', job.id, exc_info=True)
 
     def _loop_gc(self, job_id: str):
         """终态任务句柄延迟回收（10 分钟，够前端重连取终态）"""

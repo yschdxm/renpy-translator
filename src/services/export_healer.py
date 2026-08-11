@@ -55,13 +55,13 @@ class ExportHealer:
 
     def __init__(self, db: ProjectDatabase, translator, project_dir: str,
                  sdk_path: str, logger: TranslationLogger, exporter):
+        from embedded_strings import resolve_source_root
         self.db = db
         self.translator = translator
         self.project_dir = Path(project_dir)
         self.game_root = self.project_dir / 'game'
         # 与 find_candidates 一致的 rel_file 基准
-        self.base_dir = (self.game_root / 'game'
-                         if (self.game_root / 'game').exists() else self.game_root)
+        self.base_dir = resolve_source_root(self.game_root)
         self.sdk_path = sdk_path
         self.logger = logger
         self.exporter = exporter  # GameExporter（重填 tl 用）

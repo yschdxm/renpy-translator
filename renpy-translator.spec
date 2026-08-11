@@ -5,6 +5,15 @@
 #   dist/renpy-translator/renpy-translator.exe   入口（GUI 默认）
 #   dist/renpy-translator/_internal/            解释器 + 依赖 + src/ + web/dist
 #   <exe 目录>/projects|config|logs|data|exports|fonts|tools   用户数据（RT_HOME，运行时生成/自带）
+#
+# 惰性加载清单（运行期首次使用才初始化，静态分析/普通冒烟覆盖不到，
+# 由 CI 的 /api/health/deep 深度冒烟验证；改动依赖收集时同步核对）：
+#   - openai            首次翻译请求才建 client（httpx/anyio 后端随其拉入）
+#   - tiktoken          get_encoding('cl100k_base') 首次计数才加载编码表，
+#                       依赖 tiktoken_ext 命名空间包（下方 collect_all 收集）
+#   - PIL / pillow      图标与图片处理按需导入
+#   - pystray           托盘模式才导入（server 模式不加载）
+#   - webview(pywebview) 桌面窗口模式才导入（平台后端见 hiddenimports）
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 import sys

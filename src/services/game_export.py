@@ -92,13 +92,8 @@ class GameExporter:
 
     def build_translation_dict(self) -> dict:
         """从库构建 原文 -> 译文 字典（导出与导出后自愈重填共用）"""
-        translation_dict = {}
-        for d in self.db.get_dialogues_page(0, 999999, filter_mode='translated')[0]:
-            if d.get('translated_text'):
-                translation_dict[d['original_text']] = d['translated_text']
-        for u in self.db.get_ui_texts_page(0, 999999, filter_mode='translated')[0]:
-            if u.get('translated_text'):
-                translation_dict[u['original_text']] = u['translated_text']
+        # 只取已翻译条目的原文/译文两列，绕开分页拉全量
+        translation_dict = dict(self.db.iter_translated_pairs())
         for c in self.db.get_characters():
             if c['cn_name'] and c['cn_name'].strip():
                 translation_dict[c['display_name']] = c['cn_name']
@@ -120,7 +115,7 @@ class GameExporter:
         self._cancel_event = cancel_event
         try:
             self._check_cancel()
-            project_dir = self.project_manager._get_project_dir(project_name)
+            project_dir = self.project_manager.project_dir(project_name)
             game_work_dir = project_dir / 'game'
             export_dir = Path(export_dir) if export_dir else project_dir / 'output'
 
@@ -216,8 +211,13 @@ class GameExporter:
             log(f'导出异常: {str(e)}')
             return {'success': False, 'message': str(e)}
 
-    def _fill_dialogue(self, tl_dir: Path, translation_dict: dict, progress_cb=None) -> int:
-        """填充对话翻译，progress_cb(已处理文件数, 总文件数) 回报进度"""
+    def _rewrite_tl_files(self, tl_dir: Path, line_handler, progress_cb=None) -> int:
+        """填充骨架：rglob 所有 .rpy → 读入 → 行扫描状态机改写 → 写回 → 进度回调。
+
+        line_handler(lines) -> (new_lines, 本文件填充条数)：行匹配规则由
+        调用方提供（对话发言 / strings old-new 两种）。
+        progress_cb(已处理文件数, 总文件数) 回报进度。返回总填充条数。
+        """
         filled = 0
         files = list(tl_dir.rglob('*.rpy'))
         total = len(files) or 1
@@ -227,117 +227,114 @@ class GameExporter:
                 with open(tl_file, 'r', encoding='utf-8') as f:
                     content = f.read()
 
-                lines = content.split('\n')
-                new_lines = []
-                i = 0
-                while i < len(lines):
-                    line = lines[i]
-                    comment_match = re.match(r'^\s+#\s+(.*)', line)
-                    if comment_match:
-                        comment_text = comment_match.group(1).strip()
-                        # 跳过源文件位置注释（# game/xxx.rpy:123、# renpy/common/00sync.rpy:305 等），
-                        # 它们后面跟的是 old/new 行而不是对话，不能按对话处理
-                        if (not comment_text or comment_text.startswith('game/')
-                                or re.match(r'^[\w./-]+\.rpym?:\d+', comment_text)):
+                new_lines, file_filled = line_handler(content.split('\n'))
+                filled += file_filled
+
+                with open(tl_file, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(new_lines))
+
+            except Exception as e:
+                self.logger.error(f'填充失败 {tl_file.name}: {e}', panel='export')
+
+            if progress_cb:
+                progress_cb(file_idx, total)
+
+        return filled
+
+    def _fill_dialogue(self, tl_dir: Path, translation_dict: dict, progress_cb=None) -> int:
+        """填充对话翻译，progress_cb(已处理文件数, 总文件数) 回报进度"""
+
+        def _handle(lines):
+            filled = 0
+            new_lines = []
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                comment_match = re.match(r'^\s+#\s+(.*)', line)
+                if comment_match:
+                    comment_text = comment_match.group(1).strip()
+                    # 跳过源文件位置注释（# game/xxx.rpy:123、# renpy/common/00sync.rpy:305 等），
+                    # 它们后面跟的是 old/new 行而不是对话，不能按对话处理
+                    if (not comment_text or comment_text.startswith('game/')
+                            or re.match(r'^[\w./-]+\.rpym?:\d+', comment_text)):
+                        new_lines.append(line)
+                        i += 1
+                        continue
+
+                    if i + 1 < len(lines) and re.match(r'^\s+#\s+(.*)', lines[i + 1]):
+                        if re.match(r'^\s+#\s+(.*)', lines[i + 1]).group(1).strip() == comment_text:
                             new_lines.append(line)
                             i += 1
                             continue
 
-                        if i + 1 < len(lines) and re.match(r'^\s+#\s+(.*)', lines[i + 1]):
-                            if re.match(r'^\s+#\s+(.*)', lines[i + 1]).group(1).strip() == comment_text:
-                                new_lines.append(line)
-                                i += 1
-                                continue
-
-                        new_lines.append(line)
-
-                        if i + 1 < len(lines):
-                            content_match = re.match(r'^\s+(\w+)\s+"(.*)"', lines[i + 1])
-                            narration_match = re.match(r'^\s+"(.*)"', lines[i + 1])
-
-                            # old/new 是 strings 块的行，绝不能当对话发言处理
-                            if content_match and content_match.group(1) not in ('old', 'new'):
-                                text = content_match.group(2).replace('\\"', '"')
-                                if text in translation_dict:
-                                    translated = escape_translation(translation_dict[text])
-                                    new_lines.append(f'    {content_match.group(1)} "{translated}"')
-                                    filled += 1
-                                else:
-                                    new_lines.append(lines[i + 1])
-                                i += 2
-                                continue
-                            elif narration_match:
-                                text = narration_match.group(1).replace('\\"', '"')
-                                if text in translation_dict:
-                                    translated = escape_translation(translation_dict[text])
-                                    new_lines.append(f'    "{translated}"')
-                                    filled += 1
-                                else:
-                                    new_lines.append(lines[i + 1])
-                                i += 2
-                                continue
-
                     new_lines.append(line)
-                    i += 1
 
-                with open(tl_file, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(new_lines))
+                    if i + 1 < len(lines):
+                        content_match = re.match(r'^\s+(\w+)\s+"(.*)"', lines[i + 1])
+                        narration_match = re.match(r'^\s+"(.*)"', lines[i + 1])
 
-            except Exception as e:
-                self.logger.error(f'填充失败 {tl_file.name}: {e}', panel='export')
+                        # old/new 是 strings 块的行，绝不能当对话发言处理
+                        if content_match and content_match.group(1) not in ('old', 'new'):
+                            text = content_match.group(2).replace('\\"', '"')
+                            if text in translation_dict:
+                                translated = escape_translation(translation_dict[text])
+                                new_lines.append(f'    {content_match.group(1)} "{translated}"')
+                                filled += 1
+                            else:
+                                new_lines.append(lines[i + 1])
+                            i += 2
+                            continue
+                        elif narration_match:
+                            text = narration_match.group(1).replace('\\"', '"')
+                            if text in translation_dict:
+                                translated = escape_translation(translation_dict[text])
+                                new_lines.append(f'    "{translated}"')
+                                filled += 1
+                            else:
+                                new_lines.append(lines[i + 1])
+                            i += 2
+                            continue
 
-            if progress_cb:
-                progress_cb(file_idx, total)
+                new_lines.append(line)
+                i += 1
 
-        return filled
+            return new_lines, filled
+
+        return self._rewrite_tl_files(tl_dir, _handle, progress_cb)
 
     def _fill_strings(self, tl_dir: Path, translation_dict: dict, progress_cb=None) -> int:
         """填充字符串翻译，progress_cb(已处理文件数, 总文件数) 回报进度"""
-        filled = 0
-        files = list(tl_dir.rglob('*.rpy'))
-        total = len(files) or 1
-        for file_idx, tl_file in enumerate(files, 1):
-            self._check_cancel()
-            try:
-                with open(tl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
 
-                lines = content.split('\n')
-                new_lines = []
-                i = 0
-                while i < len(lines):
-                    line = lines[i]
-                    old_match = re.match(r'^\s+old\s+"(.*)"\s*$', line)
-                    if old_match:
-                        old_text = old_match.group(1).replace('\\"', '"')
-                        new_lines.append(line)
-                        translated = translation_dict.get(old_text)
-
-                        if i + 1 < len(lines):
-                            new_match = re.match(r'^\s+new\s+"(.*)"\s*$', lines[i + 1])
-                            if new_match:
-                                if translated:
-                                    escaped = escape_translation(translated, percent='string')
-                                    new_lines.append(f'    new "{escaped}"')
-                                    filled += 1
-                                else:
-                                    new_lines.append(lines[i + 1])
-                                i += 2
-                                continue
-
+        def _handle(lines):
+            filled = 0
+            new_lines = []
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                old_match = re.match(r'^\s+old\s+"(.*)"\s*$', line)
+                if old_match:
+                    old_text = old_match.group(1).replace('\\"', '"')
                     new_lines.append(line)
-                    i += 1
+                    translated = translation_dict.get(old_text)
 
-                with open(tl_file, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(new_lines))
+                    if i + 1 < len(lines):
+                        new_match = re.match(r'^\s+new\s+"(.*)"\s*$', lines[i + 1])
+                        if new_match:
+                            if translated:
+                                escaped = escape_translation(translated, percent='string')
+                                new_lines.append(f'    new "{escaped}"')
+                                filled += 1
+                            else:
+                                new_lines.append(lines[i + 1])
+                            i += 2
+                            continue
 
-            except Exception as e:
-                self.logger.error(f'填充失败 {tl_file.name}: {e}', panel='export')
+                new_lines.append(line)
+                i += 1
 
-            if progress_cb:
-                progress_cb(file_idx, total)
+            return new_lines, filled
 
-        return filled
+        return self._rewrite_tl_files(tl_dir, _handle, progress_cb)
 
     def _write_character_names(self, export_dir: Path, log) -> int:
         """生成角色名翻译文件，返回处理的角色变量数

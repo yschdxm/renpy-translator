@@ -1,0 +1,92 @@
+"""术语仓库：glossary 表（静态 UI 参考译表见 prompt_data.UI_GLOSSARY）"""
+
+from .base import _auto_reconnect
+from prompt_data import UI_GLOSSARY
+
+
+class GlossaryRepo:
+    """glossary 表"""
+
+    # 常见游戏 UI 标准翻译（静态参考，不存入数据库）
+    # 数据本体在 prompt_data.py（prompt 参考数据，不属于 DB 层），
+    # 此处保留类属性别名以维持 ProjectDatabase.UI_GLOSSARY 公共面不变
+    UI_GLOSSARY = UI_GLOSSARY
+
+    @_auto_reconnect
+    def get_glossary(self, term_type: str = None) -> dict[str, str]:
+        """获取术语表"""
+        if term_type:
+            rows = self._conn.execute(
+                "SELECT en_term, cn_term FROM glossary WHERE term_type=?",
+                (term_type,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT en_term, cn_term FROM glossary"
+            ).fetchall()
+        return {r["en_term"]: r["cn_term"] for r in rows}
+
+    @_auto_reconnect
+    def add_glossary_term(self, en: str, cn: str, term_type: str = 'other',
+                           source: str = 'manual'):
+        """添加术语"""
+        from datetime import datetime
+        self._conn.execute(
+            """INSERT OR REPLACE INTO glossary
+               (en_term, cn_term, term_type, source, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (en, cn, term_type, source, datetime.now().isoformat())
+        )
+        self._conn.commit()
+
+    @_auto_reconnect
+    def add_glossary_batch(self, terms: list[dict]):
+        """批量添加术语（去重，不覆盖已有）"""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        with self._transaction():
+            for t in terms:
+                en = t.get("en_term", "").strip()
+                cn = t.get("cn_term", "").strip()
+                if not en or not cn:
+                    continue
+                # 大小写不敏感去重
+                existing = self._conn.execute(
+                    "SELECT en_term, cn_term FROM glossary WHERE LOWER(en_term)=LOWER(?)",
+                    (en,)
+                ).fetchone()
+                if existing:
+                    continue
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO glossary
+                       (en_term, cn_term, term_type, source, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (en, cn, t.get("term_type", "other"),
+                     t.get("source", "auto"), now)
+                )
+
+    @_auto_reconnect
+    def get_glossary_for_prompt(self) -> str:
+        """获取术语表文本（用于提示词，供 AI 参考）"""
+        # 数据库中的术语（用户手动添加/自动提取）
+        db_rows = self._conn.execute(
+            "SELECT en_term, cn_term, term_type FROM glossary WHERE cn_term != '' AND cn_term IS NOT NULL"
+        ).fetchall()
+
+        lines = ["已有术语表（以下术语已有翻译，请直接使用，不要重复提取）："]
+
+        # 静态 UI 术语
+        lines.append("")
+        lines.append("【UI/菜单文字】")
+        for en, cn in self.UI_GLOSSARY.items():
+            lines.append(f"  {en} → {cn}")
+
+        # 数据库中的游戏术语
+        game_terms = [r for r in db_rows if r["term_type"] != "ui"]
+        if game_terms:
+            lines.append("")
+            lines.append("【游戏术语】")
+            for r in game_terms:
+                lines.append(f"  {r['en_term']} → {r['cn_term']}")
+
+        return "\n".join(lines)

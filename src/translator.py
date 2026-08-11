@@ -1,60 +1,26 @@
-"""AI翻译器 - 使用OpenAI兼容接口进行翻译"""
+"""AI翻译器 - 业务门面
+
+LLM 调用封装（client 生命周期、重试、错误分类）见 llm_client.py；
+提示词模板见 prompts.py。本模块只保留翻译业务流程与响应解析。
+"""
 
 import json
-import re
-import time
-from typing import List, Optional, Dict, Any, Callable
-import openai
-from openai import OpenAI
 from dataclasses import dataclass
-import tiktoken
+from typing import List, Optional, Dict, Any, Callable
 
-# BPE 编码器（cl100k_base，对 GPT 系列精确，对国产模型是误差 <15% 的近似，
-# 远好于 len//3 对中文的 3 倍失真）。惰性加载：打包环境若缺 tiktoken_ext
-# 插件元数据，get_encoding 会在导入期炸掉整个项目打开流程，降级为粗估即可。
-_ENC = None
-_ENC_FAILED = False
-
-
-def _count_tokens(text: str) -> int:
-    """估算文本 token 数（编码器不可用时退化为 len//3 粗估）"""
-    global _ENC, _ENC_FAILED
-    if _ENC is None and not _ENC_FAILED:
-        try:
-            _ENC = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            _ENC_FAILED = True
-    if _ENC is None:
-        return len(text or "") // 3
-    return len(_ENC.encode(text or ""))
-
-
-class FatalAPIError(Exception):
-    """不可重试的 API 错误（认证失败、余额不足等），批量任务应立即中止"""
-
-    def __init__(self, status_code: int, message: str):
-        self.status_code = status_code
-        super().__init__(message)
-
-
-# 致命错误码（不可重试）及中文说明
-_FATAL_REASONS = {
-    400: '请求格式错误（请检查模型名称是否正确、参数是否合法、消息格式是否符合接口要求）',
-    401: 'API Key 无效或认证失败（请检查 API Key 与 Base URL 是否匹配、请求头格式是否正确）',
-    402: '账户余额不足，请及时充值',
-    403: '拒绝访问（服务暂不支持当前地区，或 API Key 被风控，请尝试新建 API Key）',
-    404: '接口或模型不存在（请检查模型名称与 Base URL 是否正确）',
-}
-
-# 可重试错误码及中文说明
-_RETRYABLE_REASONS = {
-    421: '内容审核拦截',
-    429: '请求频率超限',
-    500: '服务器内部故障',
-    502: '网关错误',
-    503: '服务器负载过高',
-    504: '网关超时',
-}
+from llm_client import LLMClient, FatalAPIError  # noqa: F401  (FatalAPIError 供旧路径 import)
+from prompts import (
+    ANALYSIS_SYSTEM_PROMPT,
+    STYLE_GUIDE_PROMPT,
+    build_batch_user_prompt,
+    build_name_system_prompt,
+    build_name_user_prompt,
+    build_system_prompt,
+    build_ui_system_prompt,
+    build_ui_user_prompt,
+    build_user_prompt,
+)
+from token_budget import TokenBudget, count_tokens
 
 
 @dataclass
@@ -69,189 +35,64 @@ class TranslationConfig:
     timeout: int = 30
 
 
+def _strip_speaker_prefix(text: str, character: str) -> str:
+    """剥掉模型误加/误抄进译文开头的说话人标记（[角色]/【角色】/角色:）"""
+    if character and text:
+        for prefix in (f'[{character}]', f'【{character}】', f'{character}:', f'{character}：'):
+            if text.startswith(prefix):
+                return text[len(prefix):].strip()
+    return text
+
+
+def clean_name_result(raw: str) -> str:
+    """清洗人名翻译结果：去掉模型误带的引号与句号"""
+    return raw.replace('"', '').replace("'", '').replace('。', '')
+
+
 class AITranslator:
     """AI翻译器"""
 
-    MAX_RETRIES = 3  # 可重试错误的最大尝试次数
+    MAX_RETRIES = LLMClient.MAX_RETRIES  # 可重试错误的最大尝试次数
 
     def __init__(self, config: TranslationConfig):
         self.config = config
-        self.client: Optional[OpenAI] = None
-        self.api_log_callback: Optional[Callable[[dict, dict, str], None]] = None
-        # api_log_callback(request_body, response_body, task_type)
-        self._init_client()
+        self._llm = LLMClient(config)
 
-    def _init_client(self):
-        if self.config.api_key:
-            self.client = OpenAI(
-                api_key=self.config.api_key,
-                base_url=self.config.api_base,
-                max_retries=0,  # 关闭 SDK 自带重试，由 _call_api 统一控制
-            )
+    @property
+    def client(self):
+        """底层 OpenAI client（未配置 API Key 时为 None）"""
+        return self._llm.client
+
+    @property
+    def api_log_callback(self) -> Optional[Callable[[dict, dict, str], None]]:
+        return self._llm.api_log_callback
+
+    @api_log_callback.setter
+    def api_log_callback(self, callback):
+        self._llm.api_log_callback = callback
 
     def update_config(self, config: TranslationConfig):
         self.config = config
-        self._init_client()
+        self._llm.update_config(config)
+
+    def chat_completion(self, messages: list, temperature: float = None,
+                        max_tokens: int = None, tools: list = None,
+                        tool_choice=None, return_message: bool = False,
+                        task_type: str = ''):
+        """公开的底层 LLM 调用接口（temperature/max_tokens 缺省取 config）"""
+        return self._llm.chat_completion(
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice=tool_choice,
+            return_message=return_message, task_type=task_type)
 
     def _call_api(self, messages: list, temperature: float, max_tokens: int,
                   tools: list = None, tool_choice: dict = None,
-                  return_message: bool = False, task_type: str = '') -> str:
-        """统一的 API 调用：按错误码分类处理
-
-        - 致命错误（400/401/402/403/404）：抛出 FatalAPIError，批量任务应立即中止
-        - 可重试错误（421/429/5xx/超时/连接错误/空内容拦截）：指数退避重试，最多 MAX_RETRIES 次
-        - 重试耗尽：抛出普通异常，调用方记失败并跳过该条目
-        - return_message=True 时返回完整 message（用于 tool calls），否则返回 content 文本
-        - api_log_callback 存在时，成功响应后将完整请求体/返回体交给回调记录
-        """
-        reason = '未知错误'
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            try:
-                kwargs = dict(
-                    model=self.config.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=self.config.timeout,
-                )
-                if tools:
-                    kwargs['tools'] = tools
-                    kwargs['tool_choice'] = tool_choice
-                response = self.client.chat.completions.create(**kwargs)
-                if self.api_log_callback:
-                    try:
-                        self.api_log_callback(kwargs, response.model_dump(), task_type)
-                    except Exception:
-                        pass  # 日志失败不影响翻译
-                message = response.choices[0].message
-                if return_message:
-                    return message
-                content = message.content
-                if content is not None:
-                    return content.strip()
-                # 内容审核拦截时部分服务返回空内容，按可重试错误处理
-                reason = '内容审核拦截（返回空内容）'
-            except openai.APIStatusError as e:
-                code = e.status_code
-                if code in _FATAL_REASONS:
-                    raise FatalAPIError(code, f'API 错误 {code}：{_FATAL_REASONS[code]}') from e
-                reason = _RETRYABLE_REASONS.get(code, f'HTTP {code} 错误')
-            except openai.APITimeoutError:
-                reason = '请求超时'
-            except openai.APIConnectionError:
-                reason = '网络连接错误'
-
-            if attempt < self.MAX_RETRIES:
-                delay = min(2 ** attempt, 30)
-                print(f'[API] {reason}，{delay} 秒后进行第 {attempt + 1}/{self.MAX_RETRIES} 次尝试...')
-                time.sleep(delay)
-
-        raise Exception(f'API 调用失败（已重试 {self.MAX_RETRIES} 次）：{reason}')
-
-    def _build_system_prompt(self, character: str = "",
-                              glossary_text: str = "",
-                              character_profile: str = "",
-                              style_guide: str = "") -> str:
-        """构建系统提示词"""
-        prompt = """你是一位资深的游戏本地化翻译家。请将以下文本翻译成简体中文。
-
-核心规则：
-- 只翻译【请翻译以下文本】中的内容，【前文参考】和【后文参考】不翻译
-- 如果原文只有标点符号或空白，直接原样返回，不要翻译
-
-标点风格规则：
-- 保留原文的标点风格：原文首尾若用双引号包裹（游戏的对话显示风格），译文首尾也必须用双引号包裹
-- 原文中用于强调、引用的引号，以及省略号、感叹号、问号等标点的语气和用法在译文中保留
-- 不要自行添加或删除首尾引号
-
-代码标记规则（以下内容直接保留原样，不翻译、不删除、不修改）：
-- 方括号内容：[变量名]（如 [player_name]）
-- 花括号内容：{标签}（如 {b}、{/b}、{w=2}、{color=#fff}）
-- 美元符内容：$变量 或 $表达式
-- 格式化占位符：%s、%d、%% 等
-- 转义字符：\\n、\\t 等
-
-翻译风格：
-- 对话和旁白使用自然流畅的中文，像真人说话
-- 根据角色性格和语境调整语气和用词
-- 俚语、咒骂、感叹等按中文习惯本土化，保留原始情感强度
-- 避免翻译腔，善用中文成语、俗语、语气词
-
-术语提取规则：
-- 只提取游戏内出现的专有名词：地名、物品名、技能名、组织名、种族名、特殊称呼等
-- 不要提取：通用词汇、UI文字、技术术语、许可证名称、框架名称、软件名称
-- 人名对照表中已有的人物名不要放入术语；但只在台词中被提及、未作为角色出场的人物名，可以作为专有名词放入术语
-- 如果术语表中已有该词的翻译，不要重复添加
-- 如果没有新的游戏专有名词，不输出术语部分"""
-
-        # 作品风格指南
-        if style_guide:
-            prompt += f"\n\n【作品风格指南】\n{style_guide}"
-
-        # 术语表
-        if glossary_text:
-            prompt += f"\n\n{glossary_text}"
-
-        # 角色特征
-        if character_profile:
-            prompt += f"\n\n{character_profile}"
-
-        return prompt
-
-    def _build_user_prompt(self, text: str, character: str = "",
-                           context_before: List[dict] = None,
-                           context_after: List[dict] = None) -> str:
-        """构建用户提示词
-
-        context_before/after 格式：
-        [{'original_text': '...', 'translated_text': '...', 'character': '...'}]
-        """
-        prompt = ""
-
-        # 前文参考（已翻译 + 未翻译）
-        if context_before:
-            prompt += "【前文参考 - 用于理解剧情和翻译风格】\n"
-            for item in context_before:
-                char = item.get('character', '') or '旁白'
-                orig = item.get('original_text', '')
-                trans = item.get('translated_text', '')
-                if trans:
-                    prompt += f"[已译] {char}: \"{orig}\" → \"{trans}\"\n"
-                else:
-                    prompt += f"{char}: \"{orig}\"\n"
-            prompt += "\n"
-
-        # 待翻译文本
-        prompt += f"【请翻译以下文本】\n{text}"
-
-        # 角色信息
-        if character:
-            prompt += f"\n\n【角色信息】\n说话角色：{character}"
-            prompt += "\n请根据该角色的身份和性格，使用符合其特点的语言风格翻译。"
-
-        # 后文参考
-        if context_after:
-            prompt += "\n\n【后文参考 - 用于理解剧情走向】\n"
-            for item in context_after:
-                char = item.get('character', '') or '旁白'
-                orig = item.get('original_text', '')
-                trans = item.get('translated_text', '')
-                if trans:
-                    prompt += f"[已译] {char}: \"{orig}\" → \"{trans}\"\n"
-                else:
-                    prompt += f"{char}: \"{orig}\"\n"
-
-        prompt += """
-
-【输出格式】
-第一行：翻译结果（只输出译文，不要加任何前缀）
-如果原文中有新的游戏专有名词（地名、物品名、技能名等，且术语表中没有），在译文后空一行输出：
-【术语】
-原文1 → 译文1
-原文2 → 译文2
-如果术语表中已有，或没有新的游戏专有名词，不输出【术语】部分。"""
-
-        return prompt
+                  return_message: bool = False, task_type: str = ''):
+        """兼容旧签名，委托给 LLMClient.chat_completion"""
+        return self._llm.chat_completion(
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice=tool_choice,
+            return_message=return_message, task_type=task_type)
 
     def translate_text(self, text: str, character: str = "",
                        context_before: List[dict] = None,
@@ -274,13 +115,12 @@ class AITranslator:
         if not any(c.isalnum() for c in text):
             return text, []
 
-        system_prompt = self._build_system_prompt(
-            character=character,
+        system_prompt = build_system_prompt(
             glossary_text=glossary_text,
             character_profile=character_profile,
             style_guide=style_guide,
         )
-        user_prompt = self._build_user_prompt(
+        user_prompt = build_user_prompt(
             text, character, context_before, context_after
         )
 
@@ -304,11 +144,7 @@ class AITranslator:
         translated, terms = self._parse_translation_response(raw)
 
         # 兜底：剥掉模型误加的说话人前缀（[角色]/【角色】/角色:）
-        if character and translated:
-            for prefix in (f'[{character}]', f'【{character}】', f'{character}:', f'{character}：'):
-                if translated.startswith(prefix):
-                    translated = translated[len(prefix):].strip()
-                    break
+        translated = _strip_speaker_prefix(translated, character)
 
         if debug:
             print(f'[翻译] 翻译结果: {translated}')
@@ -367,19 +203,8 @@ class AITranslator:
         if not any(c.isalnum() for c in name):
             return name
 
-        system_prompt = """你是一位游戏翻译专家。请将以下人名翻译成中文，只返回中文名。
-
-规则：
-- 只返回翻译后的中文名，不要添加解释
-- 如果原文只有标点符号或空白，直接原样返回
-- 方括号内容是变量占位符（如 [xxx_name]），直接返回原文
-- $ 开头是代码变量，直接返回原文
-- 只翻译真正的人名"""
-
-        if glossary_text:
-            system_prompt += f"\n\n{glossary_text}"
-
-        user_prompt = f"请将以下人名翻译成中文，只返回中文名：\n{name}"
+        system_prompt = build_name_system_prompt(glossary_text)
+        user_prompt = build_name_user_prompt(name)
 
         if debug:
             print(f'\n{"="*50}')
@@ -395,47 +220,12 @@ class AITranslator:
             max_tokens=self.config.max_tokens,
             task_type='name',
         )
-        result = raw.replace('"', '').replace("'", '').replace('。', '')
+        result = clean_name_result(raw)
 
         if debug:
             print(f'[人名翻译] 翻译结果: {result}')
 
         return result
-
-    @staticmethod
-    def _build_ui_system_prompt(glossary_text: str = "",
-                                style_guide: str = "") -> str:
-        """构建 UI 翻译系统提示词"""
-        system_prompt = """你是一位游戏本地化翻译家。请将以下文本翻译成简体中文。
-
-核心规则：
-- 如果原文只有标点符号或空白，直接原样返回
-- 按钮和菜单文字要简洁，符合中文游戏用语习惯
-- 保留原文的标点风格：原文首尾若用双引号包裹，译文首尾也用双引号包裹，不要自行添加或删除
-
-代码标记规则（以下内容直接保留原样，不翻译、不删除、不修改）：
-- 方括号内容：[变量名]
-- 花括号内容：{标签}
-- 美元符内容：$变量
-- 格式化占位符：%s、%d、%% 等
-
-翻译风格：
-- 简洁明了，符合中文表达习惯
-- 专业术语保持一致
-- 适当本地化，保留原意
-
-术语提取规则：
-- 只提取游戏内出现的专有名词：地名、物品名、技能名、组织名、种族名、特殊称呼等
-- 不要提取：通用词汇、UI文字、技术术语
-- 人名对照表中已有的人物名不要放入术语；但只在台词中被提及、未作为角色出场的人物名，可以作为专有名词放入术语
-- 如果术语表中已有该词的翻译，不要重复添加
-- 如果没有新的游戏专有名词，不输出术语部分"""
-
-        if style_guide:
-            system_prompt += f"\n\n【作品风格指南】\n{style_guide}"
-        if glossary_text:
-            system_prompt += f"\n\n{glossary_text}"
-        return system_prompt
 
     def translate_ui(self, text: str, glossary_text: str = "",
                      character_dict: Dict[str, str] = None,
@@ -452,16 +242,8 @@ class AITranslator:
         if not any(c.isalnum() for c in text):
             return text, []
 
-        system_prompt = self._build_ui_system_prompt(glossary_text, style_guide=style_guide)
-
-        user_prompt = f"""请翻译：\n{text}
-
-【输出格式】
-第一行：翻译结果（只输出译文）
-如果原文中有专有名词，空一行输出：
-【术语】
-原文1 → 译文1
-没有专有名词则不输出【术语】部分。"""
+        system_prompt = build_ui_system_prompt(glossary_text, style_guide=style_guide)
+        user_prompt = build_ui_user_prompt(text)
 
         raw = self._call_api(
             messages=[
@@ -474,66 +256,6 @@ class AITranslator:
         )
         translated, terms = self._parse_translation_response(raw)
         return translated, terms
-
-    def _build_batch_user_prompt(self, items: List[dict],
-                                 context_before: List[dict] = None,
-                                 content_type: str = 'dialogue') -> str:
-        """构建批次翻译用户提示词（JSON 结构化输入）
-
-        待译文本以 JSON 数组给出，每项含 id/speaker/text/scene/hint，
-        speaker 在独立字段中，模型不会把它当待译文本翻译。
-        输出靠 id 对齐，不要求位置对应。
-        """
-        prompt = ""
-
-        if context_before:
-            prompt += "【前文参考 - 用于理解剧情和翻译风格】\n"
-            for item in context_before:
-                char = item.get('character', '') or '旁白'
-                orig = item.get('original_text', '')
-                trans = item.get('translated_text', '')
-                if trans:
-                    prompt += f"[已译] {char}: \"{orig}\" → \"{trans}\"\n"
-                else:
-                    prompt += f"{char}: \"{orig}\"\n"
-            prompt += "\n"
-
-        n = len(items)
-        structured = []
-        for i, item in enumerate(items, 1):
-            entry = {"id": i, "text": item.get('original_text', '').replace('\n', ' ')}
-            char = item.get('character', '')
-            if char:
-                entry["speaker"] = char
-            if content_type == 'dialogue':
-                label = item.get('label', '')
-                if label:
-                    entry["scene"] = label
-            else:
-                hint = item.get('context_hint', '')
-                if hint:
-                    entry["hint"] = hint
-            structured.append(entry)
-
-        prompt += f"【请翻译以下 JSON 数组中每一项的 text 字段，共 {n} 条】\n"
-        prompt += json.dumps(structured, ensure_ascii=False, indent=None)
-
-        prompt += f"""
-
-【字段说明】
-- id：条目编号，输出时用它与译文一一对应
-- text：待翻译的原文（唯一需要翻译的字段）
-- speaker：说话人（仅参考语气，不要翻译，不要放进译文）
-- scene：所属场景标签（仅提供语境，不要翻译）
-- hint：字符串出处提示（仅帮助推断词义，不要翻译）
-
-【输出要求】
-- 调用 submit_translations 函数提交结果
-- translations 数组必须恰好包含 {n} 条，每条用 id 对应输入条目的译文，不要合并、拆分或跳过任何一条
-- 只翻译 text 字段；speaker/scene/hint 只是上下文，绝不翻译也不出现在译文中
-- 原文中新出现的游戏专有名词（地名、物品名、技能名等，且术语表中没有的）放入 terms 数组；人名对照表中已有的人物名不要放入，但只在台词中被提及、未出场的人物名可以放入；术语表中已有或没有新名词时传空数组"""
-
-        return prompt
 
     @staticmethod
     def _parse_tool_response(message, expected: int) -> tuple[Optional[List[str]], List[dict]]:
@@ -600,14 +322,14 @@ class AITranslator:
             return [], []
 
         if content_type == 'ui':
-            system_prompt = self._build_ui_system_prompt(glossary_text, style_guide=style_guide)
+            system_prompt = build_ui_system_prompt(glossary_text, style_guide=style_guide)
         else:
-            system_prompt = self._build_system_prompt(
+            system_prompt = build_system_prompt(
                 glossary_text=glossary_text,
                 character_profile=character_profiles,
                 style_guide=style_guide,
             )
-        user_prompt = self._build_batch_user_prompt(items, context_before, content_type)
+        user_prompt = build_batch_user_prompt(items, context_before, content_type)
 
         if debug:
             print(f'\n{"="*50}')
@@ -616,13 +338,14 @@ class AITranslator:
             print(f'[批次翻译] 用户提示词:\n{user_prompt}')
             print(f'{"="*50}\n')
 
-        # 输出长度按批放大：译文长度通常不超过原文（英→中会缩短），1.2 倍余量确保不被截断
-        est_input_tokens = sum(_count_tokens(it.get('original_text', '')) for it in items)
-        max_tokens = max(self.config.max_tokens, int(est_input_tokens * 1.2) + 300)
+        # 输出长度按批放大：译文长度通常不超过原文（英→中会缩短），1.2 倍余量确保不被截断；
+        # 给出上下文窗口时再钳制到 窗口 - 实际输入（deepseek 等服务超限直接返回 400）
+        est_input_tokens = sum(count_tokens(it.get('original_text', '')) for it in items)
+        actual_input = None
         if context_window_tokens:
-            # 输入 + 输出不得超出模型上下文窗口（deepseek 等服务超限直接返回 400）
-            est_total_input = _count_tokens(system_prompt) + _count_tokens(user_prompt)
-            max_tokens = min(max_tokens, max(1000, context_window_tokens - est_total_input))
+            actual_input = count_tokens(system_prompt) + count_tokens(user_prompt)
+        max_tokens = TokenBudget(context_window_tokens or 0).output_max_tokens(
+            est_input_tokens, self.config.max_tokens, input_tokens=actual_input)
 
         # Tool Calls：translations 用 {id, translation} 对象数组，靠 id 对齐
         n = len(items)
@@ -691,16 +414,10 @@ class AITranslator:
 
         if translated_list is not None:
             # 兜底：剥掉模型误抄进译文开头的说话人标记（[角色]/【角色】/角色:）
-            cleaned = []
-            for it, text in zip(items, translated_list):
-                char = it.get('character', '')
-                if char and text:
-                    for prefix in (f'[{char}]', f'【{char}】', f'{char}:', f'{char}：'):
-                        if text.startswith(prefix):
-                            text = text[len(prefix):].strip()
-                            break
-                cleaned.append(text)
-            translated_list = cleaned
+            translated_list = [
+                _strip_speaker_prefix(text, it.get('character', ''))
+                for it, text in zip(items, translated_list)
+            ]
 
         if debug:
             if translated_list is None:
@@ -720,11 +437,9 @@ class AITranslator:
         if not prompt.strip():
             return ""
 
-        system_prompt = "你是一个专业的文本分析师。请按照用户的要求进行分析，直接输出分析结果，不要添加额外的解释。"
-
         return self._call_api(
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ],
             temperature=self.config.temperature,
@@ -732,81 +447,11 @@ class AITranslator:
             task_type='analysis',
         )
 
-    # 风格指南分析提示词模板
-    _STYLE_GUIDE_PROMPT = """你是一位资深的游戏本地化专家。以下是某部视觉小说/游戏的台词抽样，请分析这部作品的文字风格，生成一份供翻译人员使用的【作品风格指南】。
-
-台词抽样：
-{sample}
-
-请按以下维度输出（每项 1-3 句，直接给出结论，不要复述台词）：
-
-【题材基调】作品的题材、氛围、世界观调性（如：暗黑奇幻、轻松日常、悬疑惊悚……）
-【叙事人称与视角】旁白的人称、视角特点、与读者的距离感
-【作者文风】句式长短与节奏、用词习惯（文雅/口语/粗俗）、修辞特点、幽默或抒情的方式
-【情感强度】情感表达是克制还是外露，激烈场景的语言烈度
-【翻译基调建议】中译时应保持的整体口吻、应避免的译法、需要特别注意的语言习惯（如口癖、双关、梗）"""
-
     def generate_style_guide(self, sample_text: str) -> str:
         """根据台词抽样生成作品风格指南"""
         if not sample_text.strip():
             return ""
-        return self.analyze_text(self._STYLE_GUIDE_PROMPT.format(sample=sample_text))
-
-    # 内嵌文本 AI 预筛提示词模板
-    _CLASSIFY_STRINGS_PROMPT = """你是游戏本地化专家。以下是从 Ren'Py 游戏源码中扫描出的字符串候选（JSON 数组），请逐条判断它是否是【玩家可见、应当翻译的显示文本】。
-
-判定标准：
-- keep=true：界面文字、按钮、菜单标题、提示、叙事/消息/帖子内容等玩家会直接读到的文本
-- keep=false：内部标识符、字典键名、技术串、格式模板、变量占位、代码用字符串、图片/音频/字体相关名称、纯数字或时间标记（如 "20h"、"1d"）
-
-字段说明：text=候选原文，hint=源码出处，kind=screen(屏幕语言)/python(脚本数据)
-
-候选：
-{items_json}
-
-只输出 JSON 数组，不要输出任何其他文字：[{{"id": 1, "keep": true}}, {{"id": 2, "keep": false}}, ...]"""
-
-    def classify_strings(self, items: list) -> dict:
-        """AI 预筛内嵌文本候选：判断每条是否是玩家可见、应当翻译的文本
-
-        Args:
-            items: [{'id': int, 'text': str, 'hint': str, 'kind': str}]
-
-        Returns:
-            {id: bool}——keep 判定。解析失败时抛异常，由调用方降级为启发式默认值。
-        """
-        import json as _json
-
-        if not items:
-            return {}
-        if not self.client:
-            raise ValueError("请先配置API Key")
-
-        items_json = _json.dumps(
-            [{'id': it['id'], 'text': it['text'], 'hint': it.get('hint', ''),
-              'kind': it.get('kind', '')} for it in items],
-            ensure_ascii=False
-        )
-        result = self.analyze_text(
-            self._CLASSIFY_STRINGS_PROMPT.format(items_json=items_json)
-        )
-
-        # 宽松解析：提取第一个 JSON 数组
-        m = re.search(r'\[.*\]', result, re.S)
-        if not m:
-            raise ValueError(f'AI 预筛返回无法解析: {result[:100]}')
-        try:
-            parsed = _json.loads(m.group(0))
-        except _json.JSONDecodeError as e:
-            raise ValueError(f'AI 预筛 JSON 解析失败: {e}') from e
-
-        verdicts = {}
-        for entry in parsed:
-            if isinstance(entry, dict) and 'id' in entry:
-                verdicts[entry['id']] = bool(entry.get('keep', True))
-        if not verdicts:
-            raise ValueError('AI 预筛返回为空')
-        return verdicts
+        return self.analyze_text(STYLE_GUIDE_PROMPT.format(sample=sample_text))
 
     def test_connection(self) -> Dict[str, Any]:
         """测试API连接"""
@@ -827,4 +472,3 @@ class AITranslator:
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
-

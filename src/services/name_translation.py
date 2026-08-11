@@ -11,8 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from database import ProjectDatabase
 from logger import TranslationLogger
+from prompts import (build_analyze_only_prompt, build_continue_prompt,
+                     build_merge_summaries_prompt, build_translate_analyze_prompt)
+from token_budget import TokenBudget
 from translation_service import TranslationService
-from translator import AITranslator, FatalAPIError
+from translator import AITranslator, FatalAPIError, clean_name_result
 
 PROFILE_KEYS = ['性格特点', '外貌特征', '说话风格', '行为习惯',
                 '人物关系', '背景故事', '角色定位', '翻译建议']
@@ -21,27 +24,18 @@ PROFILE_KEYS = ['性格特点', '外貌特征', '说话风格', '行为习惯',
 def calc_batch_size(total_lines: int, max_context_k: int) -> int:
     """根据模型上下文大小动态计算每段台词数
 
-    - 可用 token = 模型上下文 - 提示词开销 - 输出预留
-    - 每条台词约 20 token（英文平均）
-    - 为安全起见，使用 60% 的可用空间
+    可用 token = 模型上下文 - 提示词开销 - 输出预留；
+    每条台词约 20 token（英文平均），为安全起见只用 60% 可用空间。
+    常数集中在 token_budget.TokenBudget。
     """
-    total_tokens = max_context_k * 1024
-    # 提示词开销约 800 token，输出预留 2000 token
-    prompt_overhead = 800
-    output_reserve = 2000
-    available = total_tokens - prompt_overhead - output_reserve
-    tokens_per_line = 20
-    batch_size = max(10, int(available * 0.6 / tokens_per_line))
-    return min(batch_size, total_lines)
+    return TokenBudget(max_context_k * 1024).name_batch_size(total_lines)
 
 
 def extract_name(text: str) -> str:
     """从 AI 返回中提取人名翻译"""
     match = re.search(r'【人名翻译】\s*\n\s*中文名[：:]\s*(.+)', text)
     if match:
-        name = match.group(1).strip()
-        name = name.replace('"', '').replace("'", '').replace('。', '')
-        return name
+        return clean_name_result(match.group(1).strip())
     return ''
 
 
@@ -98,10 +92,21 @@ class NameTranslationService:
     def close(self):
         """关闭内部线程池。
 
-        names.py 以单例缓存本服务，项目切换/配置变化重建实例时
+        本服务由 state 按项目会话缓存，项目切换/配置变化重建实例时
         必须先 close 旧实例，否则 ThreadPoolExecutor 线程持续累积。
         """
         self._executor.shutdown(wait=False)
+
+    def begin_single(self):
+        """单条翻译前重置批量任务残留状态。
+
+        服务实例在项目会话内被缓存复用：上次批量任务可能留下取消标记
+        （不重置会让分段循环直接 break）和指向已结束 job 的 hooks。
+        """
+        self._cancel = False
+        self.on_progress = None
+        self.on_row_busy = None
+        self.on_row_done = None
 
     @property
     def cancelled(self) -> bool:
@@ -145,7 +150,7 @@ class NameTranslationService:
                             var_name = var
                             break
                 if var_name:
-                    dialogues = self.db.get_dialogues_page(0, 999999, character=var_name)[0]
+                    dialogues = self.db.get_dialogues_by_character(var_name)
                     return [d['original_text'] for d in dialogues]
                 return []
 
@@ -297,26 +302,7 @@ class NameTranslationService:
     async def _merge_summaries(self, name: str, summaries: list) -> dict:
         """合并多段分析结果为最终人物特征"""
         loop = asyncio.get_event_loop()
-        summaries_text = '\n\n'.join([f'第{i+1}批分析：\n{s}' for i, s in enumerate(summaries)])
-
-        prompt = f"""根据以下对角色 "{name}" 的多段分析，合并为一个完整的人物特征报告。
-
-{summaries_text}
-
-重要规则：
-- 方括号包裹的内容（如 [cleo_name]）是变量占位符，不要翻译
-- 翻译建议仅针对角色 "{name}" 的台词，不要给其他角色的翻译建议
-
-请按以下格式输出完整的人物特征（合并所有发现，去除重复）：
-
-性格特点：
-外貌特征：
-说话风格：
-行为习惯：
-人物关系：
-背景故事：
-角色定位：
-翻译建议："""
+        prompt = build_merge_summaries_prompt(name, summaries)
 
         result = await loop.run_in_executor(
             self._executor,
@@ -324,90 +310,16 @@ class NameTranslationService:
         )
         return parse_profile(result)
 
-    # ---- 提示词构建 ----
+    # ---- 提示词构建（实现在 prompts.py） ----
 
     @staticmethod
     def _build_analyze_only_prompt(en_name, lines_text, batch_idx, total_batches):
-        return f"""【任务类型：文本分析，不是翻译】
-
-分析游戏角色 "{en_name}" 的台词，总结人物特征。
-
-重要规则：
-- 方括号包裹的内容（如 [cleo_name]、[mc_name]）是 Ren'Py 变量占位符，绝对不要翻译，直接保留原样
-- 花括号包裹的内容（如 {{i}}、{{/i}}、{{size=-5}}）是 Ren'Py 标记标签，不是文本内容，忽略它们
-- $ 开头的内容是代码变量，不要翻译
-
-以下是该角色的台词（第{batch_idx+1}批，共{total_batches}批）：
-{lines_text}
-
-请按以下格式输出分析结果：
-
-性格特点：
-说话风格：<语气、句长、用词雅俗、情绪表达方式>
-口癖与口头禅：<反复出现的口头禅、语气词、句尾习惯，没有则写"无">
-称谓习惯：<如何称呼他人（名字/昵称/敬语/蔑称），举例>
-外貌特征：
-行为习惯：
-人物关系：
-背景故事：
-角色定位：
-代表台词：<摘 1-2 句最能体现该角色口吻的原文台词>
-翻译建议：<仅针对该角色 "{en_name}" 的台词翻译给出建议，如语气、用词风格、特殊表达的处理方式，不要给其他角色的翻译建议>"""
+        return build_analyze_only_prompt(en_name, lines_text, batch_idx, total_batches)
 
     @staticmethod
     def _build_translate_analyze_prompt(en_name, lines_text, batch_idx, total_batches, dict_text):
-        return f"""你是一位资深的游戏本地化专家。请同时完成以下两个任务：
-
-## 任务1：翻译人名
-将角色名 "{en_name}" 翻译成中文。
-
-翻译时请考虑：
-- 从台词中推断角色的性格、背景、文化特征
-- 音译、意译还是混合？选择最符合角色气质的方式
-- 是否有双关、谐音、文化梗需要保留？
-- 与已有的人名翻译保持风格一致
-
-重要规则：
-- 方括号包裹的内容（如 [cleo_name]、[mc_name]）是 Ren'Py 变量占位符，绝对不要翻译，直接保留原样
-- 花括号包裹的内容（如 {{i}}、{{/i}}、{{size=-5}}）是 Ren'Py 标记标签，不是文本内容，忽略它们
-- $ 开头的内容是代码变量，不要翻译
-
-## 任务2：分析角色
-从台词中分析该角色的人物特征。
-
-以下是该角色的台词（第{batch_idx+1}批，共{total_batches}批）：
-{lines_text}
-
-{"已有的人名翻译（供参考）：" + chr(10) + dict_text if dict_text else ""}
-
-## 输出格式（严格按此格式，不要添加其他内容）
-
-【人名翻译】
-中文名：<翻译结果>
-
-【人物分析】
-性格特点：<分析>
-说话风格：<语气、句长、用词雅俗、情绪表达方式>
-口癖与口头禅：<反复出现的口头禅、语气词、句尾习惯，没有则写"无">
-称谓习惯：<如何称呼他人（名字/昵称/敬语/蔑称），举例>
-外貌特征：<分析>
-行为习惯：<分析>
-人物关系：<分析>
-背景故事：<分析>
-角色定位：<分析>
-代表台词：<摘 1-2 句最能体现该角色口吻的原文台词>
-翻译建议：<仅针对该角色 "{en_name}" 的台词翻译给出建议，如语气、用词风格、特殊表达的处理方式，不要给其他角色的翻译建议>"""
+        return build_translate_analyze_prompt(en_name, lines_text, batch_idx, total_batches, dict_text)
 
     @staticmethod
     def _build_continue_prompt(en_name, lines_text, batch_idx, total_batches, summaries):
-        return f"""【任务类型：文本分析，不是翻译】
-
-继续分析游戏角色 "{en_name}" 的更多台词（第{batch_idx+1}批，共{total_batches}批）。
-
-之前已有的分析摘要：
-{chr(10).join(summaries[-2:]) if summaries else "无"}
-
-新的台词：
-{lines_text}
-
-请简要总结这批台词中展现的新特征（性格、说话风格、关系变化等），补充到已有分析中。不要重复已有内容。"""
+        return build_continue_prompt(en_name, lines_text, batch_idx, total_batches, summaries)

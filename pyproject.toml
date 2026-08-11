@@ -1,7 +1,7 @@
 [project]
 name = "renpy-translator"
 version = "0.1.2"
-description = "Add your description here"
+description = "Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内嵌文本提取、一键导出成品游戏"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -27,3 +27,6 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# 只收集 tests/：tools/test_*.py 是模块级副作用脚本（直接执行用例并
+# sys.exit），裸跑 pytest 误收集会在导入期炸掉整个会话
+testpaths = ["tests"]

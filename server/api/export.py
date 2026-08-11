@@ -31,7 +31,7 @@ async def export_game(state: AppState = Depends(require_project)):
     if d['translated'] == 0:
         raise ApiError(409, 'NOTHING_TO_EXPORT', '没有已翻译的内容可导出')
 
-    project_dir = state.project_manager._get_project_dir(state.current_project)
+    project_dir = state.project_manager.project_dir(state.current_project)
     # 引擎目录在项目根的 game/ 子目录下，版本探测必须基于它
     game_work_dir = project_dir / 'game'
     sdk_path = state.resolve_sdk_path(game_work_dir)
@@ -46,14 +46,12 @@ async def export_game(state: AppState = Depends(require_project)):
                        '，请在模型配置页下载对应版本的 SDK')
 
     async def body(job):
-        import asyncio
         import tempfile
         from pathlib import Path
         from services.game_export import (
             ExportCancelled, GameExporter, zip_directory)
         from .projects import _exports_dir
         from ..jobs import JobCancelled
-        loop = asyncio.get_event_loop()
         exporter = GameExporter(state.project_manager, state.db, state.logger)
 
         # 导出组装在临时目录完成（与导入/导出项目包一致），
@@ -64,18 +62,17 @@ async def export_game(state: AppState = Depends(require_project)):
                 work_dir = Path(tmp) / 'out'
 
                 def _export():
-                    try:
-                        return exporter.export(
-                            state.current_project,
-                            log=lambda msg: job.emit_log(msg),
-                            progress=lambda v, t: job.emit_progress(v, t),
-                            export_dir=work_dir,
-                            cancel_event=job.cancel_event,
-                        )
-                    except ExportCancelled:
-                        raise JobCancelled()
+                    # 取消时 exporter 抛 ExportCancelled（cancel_event 已置位），
+                    # 由 registry 统一归一化为 cancelled
+                    return exporter.export(
+                        state.current_project,
+                        log=lambda msg: job.emit_log(msg),
+                        progress=lambda v, t: job.emit_progress(v, t),
+                        export_dir=work_dir,
+                        cancel_event=job.cancel_event,
+                    )
 
-                result = await loop.run_in_executor(None, _export)
+                result = await state.run_sync(_export)
                 job.check_cancelled()
                 if not result['success']:
                     raise RuntimeError(result['message'])
@@ -94,7 +91,7 @@ async def export_game(state: AppState = Depends(require_project)):
                         break
                     if status == 'reexport' and attempt < 2:
                         job.emit_log('内嵌标记已拆除，重新导出...')
-                        result = await loop.run_in_executor(None, _export)
+                        result = await state.run_sync(_export)
                         job.check_cancelled()
                         if not result['success']:
                             raise RuntimeError(result['message'])
@@ -108,28 +105,26 @@ async def export_game(state: AppState = Depends(require_project)):
                 job.emit_log(f'打包导出结果: {zip_path.name}')
 
                 def _zip():
-                    try:
-                        zip_directory(
-                            work_dir, zip_path,
-                            progress=lambda v, t: job.emit_progress(
-                                0.95 + v * 0.05, t),
-                            cancel_event=job.cancel_event)
-                    except ExportCancelled:
-                        raise JobCancelled()
+                    zip_directory(
+                        work_dir, zip_path,
+                        progress=lambda v, t: job.emit_progress(
+                            0.95 + v * 0.05, t),
+                        cancel_event=job.cancel_event)
 
-                await loop.run_in_executor(None, _zip)
+                await state.run_sync(_zip)
                 job.emit_log(f'导出包: {zip_path}')
                 result['package'] = str(zip_path)
                 result['package_name'] = zip_path.name
                 result['message'] = f'导出包: {zip_path}'
                 job.emit_progress(1.0, '导出完成（编译校验通过）')
                 return result
-        except JobCancelled:
+        except (JobCancelled, ExportCancelled):
             # 删除半成品 zip，避免被当成完整导出包下载
+            # （ExportCancelled 由 registry 归一化为 cancelled，此处先清现场）
             if zip_path is not None:
                 zip_path.unlink(missing_ok=True)
             raise
 
     job = state.jobs.create('export.game', f'导出游戏（{state.current_project}）',
-                            {}, body)
+                            {}, body, exclusive=True)
     return {'job_id': job.id}

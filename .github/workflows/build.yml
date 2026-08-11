@@ -113,6 +113,10 @@ jobs:
             sleep 1
           done
           [ -n "$ok" ] || { echo "SMOKE FAILED: server did not come up"; exit 1; }
+          # 深度冒烟：触发惰性加载的重依赖（openai/tiktoken 的 cl100k_base 编码表），
+          # 验证打包收集完整——普通 health 通过不代表这些首次使用才初始化的依赖可用
+          curl -sf http://127.0.0.1:7861/api/health/deep \
+            || { echo "SMOKE FAILED: deep health check (lazy deps)"; exit 1; }
           "$EXE" --mode stop || true
 
       - name: Compute version

@@ -1,7 +1,8 @@
 """项目创建服务（从 project_panel 抽取，无 UI 依赖）
 
 管线：建库 → 复制游戏文件 → 解包 rpa/反编译 rpyc → 官中检测(需用户确认)
-→ SDK 生成模板 → 解析角色 → 解析 tl → 定位 UI 上下文 → 清理冲突。
+→ SDK 生成模板 → 解析 tl → 解析角色 → 定位 UI 上下文 → 清理冲突。
+与更新管线共用的编排步骤在 services/game_pipeline.py。
 
 用法:
     creator = ProjectCreator(project_manager, logger, get_sdk_path)
@@ -16,32 +17,20 @@ UnrpycMissingError 原样上抛（调用方负责提示安装方法并清理项�
 """
 import asyncio
 import json as _json
-import os
 import re
 import shutil
-import sys
 import zipfile
-
-
-def _unrpyc_python_exe() -> str:
-    """unrpyc 子进程的解释器：冻结 exe 无 sys.executable 可用解释器，
-    回退到用户数据根的 tools/python-embed（缺失则响亮报错）"""
-    if getattr(sys, 'frozen', False):
-        from rt_home import find_resource
-        for rel in ('tools/python-embed/python.exe',
-                    'tools/python-embed/bin/python3'):
-            embed = find_resource(rel)
-            if embed:
-                return str(embed)
-        raise RuntimeError(
-            '反编译需要 Python 解释器，但 tools/python-embed/ 不存在。'
-            '请放置对应平台的 embeddable/standalone Python')
-    return sys.executable
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 from logger import TranslationLogger
 from project_manager import ProjectManager
+from services.game_pipeline import (  # noqa: F401（_unrpyc_python_exe/copy_game_files 为兼容旧导入再导出）
+    _unrpyc_python_exe, copy_game_files, copy_with_progress,
+    locate_ui_hints, refresh_characters, resolve_sdk_or_raise,
+    unpack_and_decompile,
+)
 
 # 中文相关语言目录名（小写匹配）
 CHINESE_LANG_NAMES = {
@@ -131,29 +120,6 @@ def extract_game_zip(zip_path, extract_dir: Path, progress_cb=None) -> str:
     if len(entries) == 1 and entries[0].is_dir():
         return str(entries[0])
     return str(extract_dir)
-
-
-def copy_game_files(src: Path, dst: Path, progress_state: dict):
-    """逐文件复制游戏目录（同步，调用方放 executor 并轮询 progress_state）。
-
-    progress_state: {'current': int, 'total': int, 'done': bool}
-    """
-    try:
-        if dst.exists():
-            shutil.rmtree(dst)
-        src = Path(src)
-        total = sum(1 for _ in src.rglob('*') if _.is_file())
-        progress_state['total'] = total if total > 0 else 1
-        dst.mkdir(parents=True, exist_ok=True)
-        for root, dirs, files in os.walk(src):
-            rel_root = Path(root).relative_to(src)
-            dst_root = dst / rel_root
-            dst_root.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                shutil.copy2(Path(root) / f, dst_root / f)
-                progress_state['current'] += 1
-    finally:
-        progress_state['done'] = True
 
 
 async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
@@ -264,71 +230,31 @@ class ProjectCreator:
         用户取消：关闭 db、删除项目目录，返回 {'cancelled': True}。
         """
         loop = asyncio.get_event_loop()
+        _rie = partial(loop.run_in_executor, None)
         db = None
         try:
             # 步骤1: 创建项目数据库
             progress(0.05, '正在初始化项目...')
 
-            db = await loop.run_in_executor(
-                None, self.project_manager.create_project, name, game_dir, model or ''
+            db = await _rie(
+                self.project_manager.create_project, name, game_dir, model or ''
             )
-            project_dir = self.project_manager._get_project_dir(name)
+            project_dir = self.project_manager.project_dir(name)
             game_work_dir = project_dir / 'game'
 
             # 步骤2: 复制游戏文件（逐文件复制，带进度）
             progress(0.06, '正在复制游戏文件...')
-
-            copy_progress = {'current': 0, 'total': 0, 'done': False}
-            copy_task = loop.run_in_executor(
-                None, copy_game_files, Path(game_dir), game_work_dir, copy_progress)
-            while not copy_progress['done']:
-                total = copy_progress['total']
-                current = copy_progress['current']
-                if total > 0:
-                    progress(0.06 + (current / total) * 0.04,
-                             f'正在复制游戏文件... ({current}/{total})')
-                await asyncio.sleep(0.3)
-            await copy_task
+            await copy_with_progress(_rie, game_dir, game_work_dir, progress,
+                                     0.06, 0.10)
             progress(0.30, '游戏文件复制完成')
 
             # 步骤3: 解包 rpa & 反编译 rpyc
-            # 反编译必须在 SDK 生成前：translate 只能从 .rpy 源生成模板
-            # （实测：同一脚本编译成 .rpyc 删掉 .rpy 后就不再产出模板），
-            # 纯 .rpyc 游戏的反编译产物是模板生成的唯一来源
-            progress(0.30, '正在解包游戏资源...')
-
-            from renpy_parser import RenpyParser
-            parser = RenpyParser()
-
-            def _parse():
-                return parser.parse_directory(
-                    str(game_work_dir), extract_rpa=True,
-                    work_dir=str(game_work_dir),
-                    decompile_rpyc=True, python_exe=_unrpyc_python_exe()
-                )
-
-            result = await loop.run_in_executor(None, _parse)
-            progress(0.50, '解包完成')
-
-            # rpyc 反编译结果：记录日志，产出清单存 meta 供导出时清理
-            if result.get('decompiled_rpyc_ok') or result.get('decompiled_rpyc_fail'):
-                self.logger.info(
-                    f'rpyc 反编译: {result["decompiled_rpyc_ok"]} 成功, '
-                    f'{result["decompiled_rpyc_fail"]} 失败', panel='projects')
-            rel_files = [
-                Path(p).relative_to(game_work_dir).as_posix()
-                for p in result.get('decompiled_files', [])
-            ]
-            if rel_files:
-                await loop.run_in_executor(
-                    None, db.set_meta, 'decompiled_rpy_files', _json.dumps(rel_files)
-                )
+            rel_files = await unpack_and_decompile(
+                _rie, game_work_dir, db, self.logger, progress)
 
             # 步骤3.5: 检测官方中文翻译，确认后删除（否则与 SDK 模板重复入库）
             # 必须在解包后（官中可能在 rpa 里）、SDK 生成前检测
-            official_tl = await loop.run_in_executor(
-                None, detect_official_chinese, game_work_dir
-            )
+            official_tl = await _rie(detect_official_chinese, game_work_dir)
             if official_tl:
                 progress(0.50, '检测到游戏自带中文翻译...')
                 if confirm_official_chinese is None:
@@ -337,116 +263,56 @@ class ProjectCreator:
                 if not use_sdk:
                     # 用户取消：关闭 db、删除已生成的项目目录
                     progress(0.50, '已取消创建')
-                    await loop.run_in_executor(None, db.close)
+                    await _rie(db.close)
                     db = None
-                    await loop.run_in_executor(
-                        None, self.project_manager.delete_project, name
-                    )
+                    await _rie(self.project_manager.delete_project, name)
                     self.logger.info('用户取消创建：检测到游戏自带中文翻译', panel='projects')
                     return {'cancelled': True}
                 progress(0.50, '正在删除官方中文翻译...')
-                await loop.run_in_executor(
-                    None, remove_official_chinese, game_work_dir, self.logger
-                )
+                await _rie(remove_official_chinese, game_work_dir, self.logger)
                 self.logger.info(f'已删除官方中文翻译（{official_tl} 个文件）', panel='projects')
 
             # 步骤4: SDK 生成翻译文件（自愈重试）
-            sdk_path = (self.get_sdk_path(str(game_work_dir))
-                        if self.get_sdk_path else '')
-            if not sdk_path:
-                # 游戏版本可探测但没有匹配大版本的 SDK（Ren'Py 7 与 8 的
-                # .rpyc 互不兼容），继续走只会得到没有对话的空项目
-                from sdk_manager import detect_engine_version
-                gv = detect_engine_version(game_work_dir)
-                if gv:
-                    hint = '（7.x 建议 7.4.11）' if gv[0] == 7 else ''
-                    raise Exception(
-                        f"游戏引擎为 Ren'Py {'.'.join(map(str, gv))}，"
-                        f'但未安装 {gv[0]}.x 的 SDK。\n'
-                        '启动时的自动补装可能仍在下载（见任务列表），'
-                        '请稍候重新创建；若下载失败，请在模型配置页'
-                        f'手动下载对应版本的 SDK{hint}')
+            sdk_path = await resolve_sdk_or_raise(
+                _rie, self.get_sdk_path, game_work_dir, '创建')
             if sdk_path:
                 progress(0.55, '正在使用 SDK 生成翻译文件...')
-
-                from functools import partial
-                _rie = partial(loop.run_in_executor, None)
                 await generate_tl_templates(
                     sdk_path, game_work_dir, rel_files, db,
                     self.logger, progress, _rie, cancel_event=cancel_event)
 
             progress(0.60, 'SDK 模板就绪')
 
-            # 步骤5: 解析角色信息
-            progress(0.70, '正在解析角色信息...')
-
-            fresh_parser = RenpyParser()
-
-            def _parse_chars():
-                return fresh_parser.parse_directory(
-                    str(game_work_dir), extract_rpa=False
-                )
-
-            char_result = await loop.run_in_executor(None, _parse_chars)
-
-            characters = [{"variable": c.variable, "display_name": c.name}
-                          for c in char_result['characters']]
-
-            def _save_chars():
-                db.insert_characters(characters)
-
-            await loop.run_in_executor(None, _save_chars)
-            progress(0.80, '角色信息已保存')
-
-            # 步骤6: 解析翻译文件
+            # 步骤5: 解析翻译文件
             tl_dir = game_work_dir / 'game' / 'tl' / 'chinese'
-
-            def _check_tl_dir():
-                return tl_dir.exists()
-
-            tl_exists = await loop.run_in_executor(None, _check_tl_dir)
+            tl_exists = await _rie(tl_dir.exists)
+            tl_result = {}
             if tl_exists:
-                progress(0.80, '正在解析翻译文件...')
-                tl_result = await loop.run_in_executor(
-                    None, parse_tl_dir, tl_dir, game_work_dir, self.logger)
+                progress(0.70, '正在解析翻译文件...')
+                tl_result = await _rie(
+                    parse_tl_dir, tl_dir, game_work_dir, self.logger)
 
                 def _save_tl():
                     db.insert_dialogues(tl_result.get('dialogues', []))
                     db.insert_ui_texts(tl_result.get('ui_texts', []))
 
-                    # 统计每个角色的台词数并更新 characters 表
-                    line_counts = {}
-                    for d in tl_result.get('dialogues', []):
-                        char = d.get('character', '')
-                        if char:
-                            line_counts[char] = line_counts.get(char, 0) + 1
+                await _rie(_save_tl)
 
-                    # variable_map: variable -> display_name
-                    var_map = db.get_variable_map()
-                    for var_name, count in line_counts.items():
-                        display_name = var_map.get(var_name, var_name)
-                        db.update_character_lines_count(display_name, count)
+            # 步骤6: 解析角色 + 统计台词数（无模板时也保留角色清单）
+            progress(0.80, '正在解析角色信息...')
+            await _rie(refresh_characters, game_work_dir, db,
+                       tl_result.get('dialogues', []))
 
-                await loop.run_in_executor(None, _save_tl)
-
-                # 步骤6.5: 回扫源码定位 UI 字符串出处
+            # 步骤6.5: 回扫源码定位 UI 字符串出处
+            if tl_exists:
                 progress(0.90, '正在定位字符串上下文...')
-
-                def _locate_hints():
-                    p = RenpyParser()
-                    return p.locate_ui_string_contexts(str(game_work_dir))
-
-                try:
-                    hints = await loop.run_in_executor(None, _locate_hints)
-                    matched = await loop.run_in_executor(None, db.update_ui_hints, hints)
-                    self.logger.info(f'UI 上下文定位: {matched} 条命中', panel='projects')
-                except Exception as e:
-                    self.logger.warning(f'UI 上下文定位失败（不影响建项）: {e}', panel='projects')
+                await locate_ui_hints(
+                    _rie, game_work_dir, db, self.logger, '建项')
 
             progress(0.95, '正在清理冲突文件...')
 
             # 步骤7: 清理冲突文件
-            await loop.run_in_executor(None, cleanup_conflicts, game_work_dir, self.logger)
+            await _rie(cleanup_conflicts, game_work_dir, self.logger)
 
             # 更新时间戳和统计
             def _finalize():
@@ -456,7 +322,7 @@ class ProjectCreator:
                 db.close()
                 return d_count, u_count
 
-            d_count, u_count = await loop.run_in_executor(None, _finalize)
+            d_count, u_count = await _rie(_finalize)
             db = None
 
             progress(1.0, f'✅ 创建成功！{d_count["total"]} 条对话, {u_count["total"]} 条字符串')
@@ -466,7 +332,7 @@ class ProjectCreator:
         except Exception:
             if db is not None:
                 try:
-                    await loop.run_in_executor(None, db.close)
+                    await _rie(db.close)
                 except Exception:
                     pass
             raise

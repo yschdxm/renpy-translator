@@ -38,10 +38,13 @@ from pathlib import Path
 
 from logger import TranslationLogger
 from project_manager import ProjectManager
+from services.game_pipeline import (
+    copy_with_progress, locate_ui_hints, refresh_characters,
+    resolve_sdk_or_raise, unpack_and_decompile,
+)
 from services.project_creation import (
-    _unrpyc_python_exe, cleanup_conflicts, copy_game_files,
-    detect_official_chinese, generate_tl_templates, parse_tl_dir,
-    remove_official_chinese,
+    cleanup_conflicts, detect_official_chinese, generate_tl_templates,
+    parse_tl_dir, remove_official_chinese,
 )
 
 _FUZZY_AUTO = 0.95    # ≥ 自动继承（留痕）
@@ -336,7 +339,7 @@ class ProjectUpdater:
         loop = asyncio.get_event_loop()
         _rie = partial(loop.run_in_executor, None)
 
-        project_dir = self.project_manager._get_project_dir(name)
+        project_dir = self.project_manager.project_dir(name)
         game_work_dir = project_dir / 'game'
         db_file = project_dir / 'project.db'
         ts = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -424,42 +427,14 @@ class ProjectUpdater:
 
             # 步骤3: 复制新版本游戏文件
             progress(0.05, '正在复制新版本游戏文件...')
-            copy_progress = {'current': 0, 'total': 0, 'done': False}
-            copy_task = loop.run_in_executor(
-                None, copy_game_files, Path(new_game_dir), game_work_dir,
-                copy_progress)
-            while not copy_progress['done']:
-                total, current = copy_progress['total'], copy_progress['current']
-                if total > 0:
-                    progress(0.05 + (current / total) * 0.25,
-                             f'正在复制新版本游戏文件... ({current}/{total})')
-                await asyncio.sleep(0.3)
-            await copy_task
+            await copy_with_progress(_rie, new_game_dir, game_work_dir,
+                                     progress, 0.05, 0.30,
+                                     label='正在复制新版本游戏文件...')
             progress(0.30, '新版本文件复制完成')
 
             # 步骤4: 解包 rpa & 反编译 rpyc（参数与建项一致）
-            progress(0.30, '正在解包游戏资源...')
-            from renpy_parser import RenpyParser
-            parser = RenpyParser()
-
-            def _parse():
-                return parser.parse_directory(
-                    str(game_work_dir), extract_rpa=True,
-                    work_dir=str(game_work_dir),
-                    decompile_rpyc=True, python_exe=_unrpyc_python_exe()
-                )
-            result = await _rie(_parse)
-            if result.get('decompiled_rpyc_ok') or result.get('decompiled_rpyc_fail'):
-                self.logger.info(
-                    f'rpyc 反编译: {result["decompiled_rpyc_ok"]} 成功, '
-                    f'{result["decompiled_rpyc_fail"]} 失败', panel='projects')
-            rel_files = [
-                Path(p).relative_to(game_work_dir).as_posix()
-                for p in result.get('decompiled_files', [])
-            ]
-            # 覆盖写（旧版本/旧 .broken 条目已不存在，追加会留垃圾）
-            await _rie(db.set_meta, 'decompiled_rpy_files', _json.dumps(rel_files))
-            progress(0.50, '解包完成')
+            rel_files = await unpack_and_decompile(
+                _rie, game_work_dir, db, self.logger, progress)
 
             # 步骤5: 新版本官中重检
             official_tl = await _rie(detect_official_chinese, game_work_dir)
@@ -488,19 +463,8 @@ class ProjectUpdater:
                     f'内嵌文本重标记: {rewrapped} 成功, {lost} 丢失', panel='projects')
 
             # 步骤7: SDK 重新生成模板
-            sdk_path = (self.get_sdk_path(str(game_work_dir))
-                        if self.get_sdk_path else '')
-            if not sdk_path:
-                from sdk_manager import detect_engine_version
-                gv = detect_engine_version(game_work_dir)
-                if gv:
-                    hint = '（7.x 建议 7.4.11）' if gv[0] == 7 else ''
-                    raise Exception(
-                        f"游戏引擎为 Ren'Py {'.'.join(map(str, gv))}，"
-                        f'但未安装 {gv[0]}.x 的 SDK。\n'
-                        '请在模型配置页下载对应版本的 SDK'
-                        f'{hint} 后重新更新')
-                raise Exception("未配置 Ren'Py SDK 路径")
+            sdk_path = await resolve_sdk_or_raise(
+                _rie, self.get_sdk_path, game_work_dir, '更新')
             progress(0.55, '正在使用 SDK 重新生成翻译文件...')
             await generate_tl_templates(
                 sdk_path, game_work_dir, rel_files, db,
@@ -541,35 +505,13 @@ class ProjectUpdater:
             # 步骤10: 角色重解析（insert_characters 按变量名合并，
             # 保留 cn_name/profile；新版删除的角色保留不删）
             progress(0.85, '正在更新角色信息...')
-
-            def _refresh_chars():
-                char_result = RenpyParser().parse_directory(
-                    str(game_work_dir), extract_rpa=False)
-                characters = [{"variable": c.variable, "display_name": c.name}
-                              for c in char_result['characters']]
-                db.reset_character_lines_count()
-                db.insert_characters(characters)
-                line_counts = {}
-                for d in merged['dialogues']:
-                    char = d.get('character', '')
-                    if char:
-                        line_counts[char] = line_counts.get(char, 0) + 1
-                var_map = db.get_variable_map()
-                for var_name, count in line_counts.items():
-                    db.update_character_lines_count(
-                        var_map.get(var_name, var_name), count)
-            await _rie(_refresh_chars)
+            await _rie(refresh_characters, game_work_dir, db,
+                       merged['dialogues'], True)
 
             # 步骤11: UI 上下文定位
             progress(0.90, '正在定位字符串上下文...')
-            try:
-                hints = await _rie(
-                    RenpyParser().locate_ui_string_contexts, str(game_work_dir))
-                matched = await _rie(db.update_ui_hints, hints)
-                self.logger.info(f'UI 上下文定位: {matched} 条命中', panel='projects')
-            except Exception as e:
-                self.logger.warning(
-                    f'UI 上下文定位失败（不影响更新）: {e}', panel='projects')
+            await locate_ui_hints(
+                _rie, game_work_dir, db, self.logger, '更新')
 
             # 步骤12: 收尾
             progress(0.95, '正在清理...')

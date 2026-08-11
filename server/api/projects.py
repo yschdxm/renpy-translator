@@ -22,7 +22,7 @@ router = APIRouter(prefix='/projects', tags=['projects'])
 def _exports_dir(state: AppState, name: str = '') -> Path:
     """导出目录（随数据根）。传 name 时按项目分目录：exports/{name}/
 
-    name 来自路由参数，先做字符白名单校验（与 ProjectManager._get_project_dir
+    name 来自路由参数，先做字符白名单校验（与 ProjectManager.project_dir
     一致），防目录穿越（如 '..\\config'）；非法名直接抛 400。
     """
     d = Path(state.root) / 'exports'
@@ -72,7 +72,6 @@ def _make_create_body(state: AppState, name: str, model: str,
     """建项目任务体：game_dir_holder['dir'] 在任务内解析（可能先解压 zip）"""
     async def body(job):
         from services.project_creation import ProjectCreator, extract_game_zip
-        loop = asyncio.get_event_loop()
         # 进场时记录项目是否已存在：except 清理只删本任务创建的项目，
         # 避免并发同名建项时误删对方正在创建的项目目录
         pre_existing = state.project_manager.project_exists(name)
@@ -92,7 +91,7 @@ def _make_create_body(state: AppState, name: str, model: str,
                         lambda c, t: job.emit_progress(
                             0.01 + (c / max(t, 1)) * 0.04,
                             f'正在解压游戏文件... ({c}/{t})'))
-                game_dir_holder['dir'] = await loop.run_in_executor(None, _extract)
+                game_dir_holder['dir'] = await state.run_sync(_extract)
                 job.emit_progress(0.05, '解压完成')
 
             job.check_cancelled()
@@ -137,13 +136,8 @@ def _make_create_body(state: AppState, name: str, model: str,
             # （create_project 抛 ValueError），说明目录属于并发任务，不能删
             name_taken = isinstance(e, ValueError) and '已存在' in str(e)
             if not pre_existing and not name_taken:
-                await loop.run_in_executor(
-                    None, state.project_manager.delete_project, name)
-            # SDK 中止等下游取消表现为普通异常：统一转成 JobCancelled，
-            # 让任务状态正确落为 cancelled 而非 failed
-            from ..jobs import JobCancelled
-            if job.cancel_event.is_set() and not isinstance(e, JobCancelled):
-                raise JobCancelled() from e
+                await state.run_sync(state.project_manager.delete_project, name)
+            # 下游取消表现为普通异常时由 registry 统一归一化为 cancelled
             raise
         finally:
             for p in cleanup_paths:
@@ -216,7 +210,6 @@ async def import_project(file: UploadFile = File(...), name: str = Form(''),
     await _save_upload(file, zip_path)
 
     async def body(job):
-        loop = asyncio.get_event_loop()
         job.emit_progress(0.2, '正在解压项目包...')
 
         def _do_import():
@@ -227,7 +220,7 @@ async def import_project(file: UploadFile = File(...), name: str = Form(''),
                     temp_dir, name or None)
 
         try:
-            result = await loop.run_in_executor(None, _do_import)
+            result = await state.run_sync(_do_import)
         finally:
             zip_path.unlink(missing_ok=True)  # 异常也要清掉上传暂存
         if not result['success']:
@@ -273,7 +266,6 @@ def _make_update_body(state: AppState, name: str,
         from services.project_creation import extract_game_zip
         from services.project_update import ProjectUpdater
         from ..jobs import JobCancelled
-        loop = asyncio.get_event_loop()
 
         was_current = name == state.current_project
         try:
@@ -291,7 +283,7 @@ def _make_update_body(state: AppState, name: str,
                         lambda c, t: job.emit_progress(
                             0.005 + (c / max(t, 1)) * 0.035,
                             f'正在解压游戏文件... ({c}/{t})'))
-                game_dir_holder['dir'] = await loop.run_in_executor(None, _extract)
+                game_dir_holder['dir'] = await state.run_sync(_extract)
                 job.emit_progress(0.04, '解压完成')
 
             game_dir = game_dir_holder['dir']
@@ -329,12 +321,6 @@ def _make_update_body(state: AppState, name: str,
             if result.get('cancelled'):
                 raise JobCancelled()
             return result
-        except Exception as e:
-            # SDK 中止等下游取消表现为普通异常：统一转成 JobCancelled，
-            # 让任务状态正确落为 cancelled 而非 failed
-            if job.cancel_event.is_set() and not isinstance(e, JobCancelled):
-                raise JobCancelled() from e
-            raise
         finally:
             # 更新前是当前项目的，无论成败都重新打开（失败时回滚已恢复原状）
             if was_current and state.project_manager.project_exists(name):
@@ -389,7 +375,6 @@ async def update_report(name: str, state: AppState = Depends(get_state)):
     """最近一次版本更新的报告 + 失效译文 + 复核列表"""
     if not state.project_manager.project_exists(name):
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
-    loop = asyncio.get_event_loop()
 
     def _load():
         import json as _json
@@ -403,7 +388,7 @@ async def update_report(name: str, state: AppState = Depends(get_state)):
         db.close()
         return report, obsolete, review
 
-    loaded = await loop.run_in_executor(None, _load)
+    loaded = await state.run_sync(_load)
     if loaded is None:
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
     report, obsolete, review = loaded
@@ -422,7 +407,6 @@ async def update_review_action(name: str, row_id: int, req: ReviewActionRequest,
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
     if req.action not in ('apply', 'dismiss'):
         raise ApiError(400, 'BAD_ACTION', 'action 必须是 apply 或 dismiss')
-    loop = asyncio.get_event_loop()
 
     def _apply():
         db = state.project_manager.open_project(name)
@@ -444,7 +428,7 @@ async def update_review_action(name: str, row_id: int, req: ReviewActionRequest,
         db.close()
         return 'ok'
 
-    result = await loop.run_in_executor(None, _apply)
+    result = await state.run_sync(_apply)
     if result is None:
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
     if result == 'not_found':
@@ -459,13 +443,13 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
 
     async def body(job):
         from ..jobs import JobCancelled
-        loop = asyncio.get_event_loop()
-        project_dir = state.project_manager._get_project_dir(name)
+        project_dir = state.project_manager.project_dir(name)
         db_file = project_dir / 'project.db'
         if not db_file.exists():
             raise RuntimeError('项目数据库不存在')
 
         export_path = _exports_dir(state, name) / f'{name}-project.zip'
+        copy_task = None  # 后台复制任务句柄（except 分支要消费其异常）
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -474,8 +458,8 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
 
                 job.check_cancelled()
                 job.emit_progress(0.1, '正在复制数据库...')
-                await loop.run_in_executor(
-                    None, shutil.copy2, db_file, temp_project / 'project.db')
+                await state.run_sync(
+                    shutil.copy2, db_file, temp_project / 'project.db')
 
                 game_dir = project_dir / 'game'
                 if game_dir.exists():
@@ -496,7 +480,7 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
                         finally:
                             copy_progress['done'] = True
 
-                    copy_task = loop.run_in_executor(None, _copy_game)
+                    copy_task = asyncio.create_task(state.run_sync(_copy_game))
                     while not copy_progress['done']:
                         job.check_cancelled()
                         total, current = copy_progress['total'], copy_progress['current']
@@ -525,16 +509,24 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
                                     0.6 + (i / total) * 0.38,
                                     f'正在打包... ({i}/{total})')
 
-                await loop.run_in_executor(None, _create_zip)
+                await state.run_sync(_create_zip)
         except JobCancelled:
             # 删除半成品 zip，避免被当成完整项目包下载
             export_path.unlink(missing_ok=True)
+            # 后台复制任务可能因临时目录已清理而失败：消费其异常，
+            # 避免 'Task exception was never retrieved' 噪音
+            if copy_task is not None and not copy_task.cancelled():
+                try:
+                    await copy_task
+                except Exception:
+                    pass
             raise
 
         job.emit_progress(1.0, f'导出成功: {export_path.name}')
         return {'file': export_path.name, 'path': str(export_path)}
 
-    job = state.jobs.create('project.export-zip', f'导出项目包 {name}', {}, body)
+    job = state.jobs.create('project.export-zip', f'导出项目包 {name}', {}, body,
+                            exclusive=True)
     return {'job_id': job.id}
 
 
@@ -545,8 +537,7 @@ class EditRequest(BaseModel):
 
 @router.get('')
 async def list_projects(state: AppState = Depends(get_state)):
-    loop = asyncio.get_event_loop()
-    projects = await loop.run_in_executor(None, state.project_manager.list_projects)
+    projects = await state.run_sync(state.project_manager.list_projects)
     return [{
         **asdict(p),
         'progress_percent': p.progress_percent,
@@ -557,8 +548,6 @@ async def list_projects(state: AppState = Depends(get_state)):
 
 @router.get('/{name}/meta')
 async def project_meta(name: str, state: AppState = Depends(get_state)):
-    loop = asyncio.get_event_loop()
-
     def _load():
         db = state.project_manager.open_project(name)
         if not db:
@@ -567,7 +556,7 @@ async def project_meta(name: str, state: AppState = Depends(get_state)):
         db.close()
         return meta
 
-    meta = await loop.run_in_executor(None, _load)
+    meta = await state.run_sync(_load)
     if not meta:
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
     return {'name': meta.get('name', name),
@@ -581,24 +570,21 @@ async def edit_project(name: str, req: EditRequest,
     if not new_name:
         raise ApiError(400, 'BAD_NAME', '项目名称不能为空')
 
-    loop = asyncio.get_event_loop()
-
     # 重命名当前打开的项目：先关库（Windows 目录改名要求无占用）
     was_current = name == state.current_project
     if was_current:
         await state.close_project()
 
     if name != new_name:
-        if await loop.run_in_executor(
-                None, state.project_manager.project_exists, new_name):
+        if await state.run_sync(state.project_manager.project_exists, new_name):
             raise ApiError(409, 'NAME_EXISTS', f'项目名称已存在: {new_name}')
 
         def _rename():
-            old_dir = state.project_manager._get_project_dir(name)
-            new_dir = state.project_manager._get_project_dir(new_name)
+            old_dir = state.project_manager.project_dir(name)
+            new_dir = state.project_manager.project_dir(new_name)
             old_dir.rename(new_dir)
 
-        await loop.run_in_executor(None, _rename)
+        await state.run_sync(_rename)
 
     def _update_meta():
         db = state.project_manager.open_project(new_name)
@@ -608,8 +594,7 @@ async def edit_project(name: str, req: EditRequest,
             db.set_meta('updated_at', datetime.now().isoformat())
             db.close()
 
-    await loop.run_in_executor(None, _update_meta)
-
+    await state.run_sync(_update_meta)
     if was_current:
         await state.open_project(new_name)
 
@@ -624,12 +609,11 @@ async def delete_project(name: str, state: AppState = Depends(get_state)):
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
 
     async def body(job):
-        loop = asyncio.get_event_loop()
         # 若删除的是当前打开的项目，先关闭其数据库连接，避免文件被占用
         if name == state.current_project:
             await state.close_project()
 
-        project_dir = state.project_manager._get_project_dir(name)
+        project_dir = state.project_manager.project_dir(name)
 
         def _delete():
             all_files = [f for f in project_dir.rglob('*') if f.is_file()]
@@ -644,7 +628,7 @@ async def delete_project(name: str, state: AppState = Depends(get_state)):
                                       f'正在删除... ({i}/{total})')
             shutil.rmtree(project_dir, ignore_errors=True)
 
-        await loop.run_in_executor(None, _delete)
+        await state.run_sync(_delete)
         if project_dir.exists():
             raise RuntimeError(f'项目目录删除失败（文件可能被占用）: {project_dir}')
         state.logger.info(f'项目已删除: {name}', panel='projects')

@@ -1,5 +1,4 @@
 """配置 API：模型配置 CRUD、连接测试、SDK 路径/下载、数据目录迁移"""
-import asyncio
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -46,8 +45,7 @@ def _to_model_config(req: ConfigIn):
 
 @router.get('/configs')
 async def list_configs(state: AppState = Depends(get_state)):
-    loop = asyncio.get_event_loop()
-    configs = await loop.run_in_executor(None, state.config_manager.load_all_configs)
+    configs = await state.run_sync(state.config_manager.load_all_configs)
     return [_mask(c) for c in configs]
 
 
@@ -55,12 +53,10 @@ async def list_configs(state: AppState = Depends(get_state)):
 async def add_config(req: ConfigIn, state: AppState = Depends(get_state)):
     if not req.name.strip():
         raise ApiError(400, 'BAD_NAME', '配置名称不能为空')
-    loop = asyncio.get_event_loop()
-    if await loop.run_in_executor(
-            None, state.config_manager.get_config_by_name, req.name.strip()):
+    if await state.run_sync(
+            state.config_manager.get_config_by_name, req.name.strip()):
         raise ApiError(409, 'NAME_EXISTS', f'配置已存在: {req.name}')
-    ok = await loop.run_in_executor(
-        None, state.config_manager.add_config, _to_model_config(req))
+    ok = await state.run_sync(state.config_manager.add_config, _to_model_config(req))
     if not ok:
         raise ApiError(500, 'SAVE_FAILED', '配置保存失败')
     return {'ok': True}
@@ -69,15 +65,12 @@ async def add_config(req: ConfigIn, state: AppState = Depends(get_state)):
 @router.put('/configs/{name}')
 async def update_config(name: str, req: ConfigIn,
                         state: AppState = Depends(get_state)):
-    loop = asyncio.get_event_loop()
     cfg = _to_model_config(req)
     if req.api_key == '***':
         # 掩码原样提交 = 未修改，保留旧 key
-        old = await loop.run_in_executor(
-            None, state.config_manager.get_config_by_name, name)
+        old = await state.run_sync(state.config_manager.get_config_by_name, name)
         cfg.api_key = old.api_key if old else ''
-    ok = await loop.run_in_executor(
-        None, state.config_manager.update_config, name, cfg)
+    ok = await state.run_sync(state.config_manager.update_config, name, cfg)
     if not ok:
         raise ApiError(404, 'NOT_FOUND', f'配置不存在: {name}')
     return {'ok': True}
@@ -85,16 +78,14 @@ async def update_config(name: str, req: ConfigIn,
 
 @router.delete('/configs/{name}')
 async def delete_config(name: str, state: AppState = Depends(get_state)):
-    loop = asyncio.get_event_loop()
-    ok = await loop.run_in_executor(
-        None, state.config_manager.delete_config, name)
+    ok = await state.run_sync(state.config_manager.delete_config, name)
     if not ok:
         raise ApiError(404, 'NOT_FOUND', f'配置不存在: {name}')
     return {'ok': True}
 
 
 @router.post('/configs/test')
-async def test_config(req: ConfigIn):
+async def test_config(req: ConfigIn, state: AppState = Depends(get_state)):
     """测试连接（用表单里的配置临时建翻译器；api_key='***' 拒绝——无从测试）"""
     if req.api_key == '***':
         raise ApiError(400, 'MASKED_KEY', '请先重新输入 API Key 再测试（或保存后测试）')
@@ -104,8 +95,7 @@ async def test_config(req: ConfigIn):
         temperature=req.temperature, max_tokens=req.max_tokens,
         context_lines=req.context_lines, timeout=req.timeout,
     ))
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, translator.test_connection)
+    result = await state.run_sync(translator.test_connection)
     if not result.get('success'):
         raise ApiError(502, 'TEST_FAILED', result.get('error', '连接测试失败'))
     return result
@@ -115,9 +105,8 @@ async def test_config(req: ConfigIn):
 
 @router.get('/settings')
 async def get_settings(state: AppState = Depends(get_state)):
-    loop = asyncio.get_event_loop()
     # 只读展示：SDK 固定从默认目录 tools/ 扫描，不支持自定义路径
-    paths = await loop.run_in_executor(None, state.sdk_paths)
+    paths = await state.run_sync(state.sdk_paths)
     from rt_home import exe_dir, home
     return {'sdk_path_8': paths.get(8, ''), 'sdk_path_7': paths.get(7, ''),
             'data_dir': str(home()), 'exe_dir': str(exe_dir())}
@@ -159,5 +148,6 @@ async def download_sdk(req: SdkDownloadIn, state: AppState = Depends(get_state))
     from ..sdk_download import make_download_body
     job = state.jobs.create(
         'settings.sdk-download', f'下载 Ren\'Py SDK {req.version}',
-        {'version': req.version}, make_download_body(state, req.version))
+        {'version': req.version}, make_download_body(state, req.version),
+        exclusive=True)
     return {'job_id': job.id}

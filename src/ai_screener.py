@@ -15,10 +15,6 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-_EXCLUDE_DIRS = {'renpy', 'lib', 'saves', 'cache', 'tl', 'output',
-                 'audio', 'sound', 'images', 'image', 'fonts', 'font',
-                 'video', 'movies'}
-
 # agentic 精审工具 schema
 _TOOLS = [
     {"type": "function", "function": {
@@ -89,14 +85,18 @@ class AIScreener:
     COARSE_BATCH = 40
     REFINE_BATCH = 15
 
-    def __init__(self, translator, game_root: str, logger=None):
+    def __init__(self, translator, game_root: str, logger=None,
+                 source_tree=None):
+        from embedded_strings import resolve_source_root
+        from source_tree import SourceTree
         self.translator = translator
         self.game_root = Path(game_root)
         # 调用方传入的是 find_candidates 的 rel_file 基准（可能是 game/game），
         # 只有传入项目根时才需要再下一层
-        nested = self.game_root / 'game'
-        self.game_sub = nested if nested.is_dir() else self.game_root
+        self.game_sub = resolve_source_root(self.game_root)
         self.logger = logger
+        # 源码缓存：静态分流/粗筛片段/精审工具共用一棵树（一次实例即一次调用）
+        self._tree = source_tree or SourceTree(str(self.game_sub))
         self._pool = ThreadPoolExecutor(max_workers=self.REFINE_CONCURRENCY)
         self._cancel_event = None  # screen_all/_refine_screen 调用时设置
 
@@ -142,7 +142,9 @@ class AIScreener:
         """规则分流：确定 keep/drop 的直接写回，返回需交 AI 的候选"""
         from usage_rules import KEEP, DROP, RULE_REASON_PREFIX, UsageAnalyzer
         progress.update(phase='规则分流', done=0, total=len(candidates))
-        analyzer = UsageAnalyzer(str(self.game_root))
+        # 复用源码缓存，不再全树重读
+        analyzer = UsageAnalyzer(str(self.game_root),
+                                 files=self._tree.as_dict())
         analyzer.classify_all(candidates)
         progress['done'] = len(candidates)
 
@@ -167,10 +169,14 @@ class AIScreener:
 
     def _snippet(self, c, ctx: int = 6) -> str:
         """候选前后 ctx 行代码（带行号）"""
-        try:
-            lines = Path(c.file).read_text(encoding='utf-8', errors='ignore').split('\n')
-        except OSError:
-            return ''
+        lines = self._tree.lines(c.rel_file)
+        if not lines:
+            # rel_file 不在源码树内（如 game/ 之外的文件）：回退直读绝对路径
+            try:
+                lines = Path(c.file).read_text(
+                    encoding='utf-8', errors='ignore').split('\n')
+            except OSError:
+                return ''
         start = max(0, c.line - 1 - ctx)
         end = min(len(lines), c.line + ctx)
         return '\n'.join(f'{i + 1:>5}│{lines[i]}' for i in range(start, end))
@@ -284,7 +290,7 @@ class AIScreener:
             self._check_cancel()
             if progress is not None:
                 progress['phase'] = f'精审·第 {round_no} 轮'
-            message = self.translator._call_api(
+            message = self.translator.chat_completion(
                 messages=messages,
                 temperature=self.translator.config.temperature,
                 max_tokens=self.translator.config.max_tokens,
@@ -325,7 +331,7 @@ class AIScreener:
         messages.append({"role": "user", "content":
             '轮数已达上限。请立即基于已有信息输出最终判决 JSON 数组'
             '（[{"id":N,"keep":true/false,"reason":"..."}]），不要再调用工具。'})
-        message = self.translator._call_api(
+        message = self.translator.chat_completion(
             messages=messages,
             temperature=self.translator.config.temperature,
             max_tokens=max(self.translator.config.max_tokens, 8000),
@@ -408,10 +414,9 @@ class AIScreener:
         path = self._resolve(rel)
         if not path or not path.exists():
             return f'文件不存在: {rel}'
-        try:
-            lines = path.read_text(encoding='utf-8', errors='ignore').split('\n')
-        except OSError as e:
-            return f'读取失败: {e}'
+        # _resolve 已校验在 game_sub 内，可直接取缓存 key
+        key = path.relative_to(self.game_sub.resolve()).as_posix()
+        lines = self._tree.lines(key)
         start = max(1, start)
         end = min(end, len(lines))
         if start > end:
@@ -427,20 +432,11 @@ class AIScreener:
         matches = []
         total = 0
         hit_files = set()
-        for rpy in sorted(self.game_sub.rglob('*.rpy')):
-            if _EXCLUDE_DIRS & set(rpy.parts):
-                continue
-            try:
-                content = rpy.read_text(encoding='utf-8', errors='ignore')
-            except OSError:
-                continue
-            rel = rpy.relative_to(self.game_sub).as_posix()
-            for i, line in enumerate(content.split('\n'), 1):
-                if query in line:
-                    total += 1
-                    hit_files.add(rel)
-                    if len(matches) < MAX_SHOW:
-                        matches.append(f'{rel}:{i}: {line.strip()[:120]}')
+        for rel, i, line in self._tree.search(query):
+            total += 1
+            hit_files.add(rel)
+            if len(matches) < MAX_SHOW:
+                matches.append(f'{rel}:{i}: {line.strip()[:120]}')
         if not total:
             return '（无匹配）'
         header = f'共 {total} 处匹配（{len(hit_files)} 个文件）'

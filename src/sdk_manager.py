@@ -54,7 +54,7 @@ def find_installed_sdks() -> list:
     def _add(path):
         path = Path(path)
         key = str(path.resolve())
-        if key in seen or not mgr._is_valid_sdk(path):
+        if key in seen or not mgr.is_valid_sdk(path):
             return
         v = detect_engine_version(path)
         if v:
@@ -77,7 +77,7 @@ class SDKManager:
     def __init__(self, sdk_path: str = ""):
         self.sdk_path = Path(sdk_path) if sdk_path else None
 
-    def _is_valid_sdk(self, path: Path) -> bool:
+    def is_valid_sdk(self, path: Path) -> bool:
         """检查是否是有效的 Ren'Py SDK"""
         # 检查必要的文件是否存在
         renpy_exe = self.get_renpy_exe(path)
@@ -98,7 +98,7 @@ class SDKManager:
             p = sdk_path / rel
             if p.exists():
                 return p
-        # 都不存在时返回默认路径（_is_valid_sdk 判定失败，错误信息含路径）
+        # 都不存在时返回默认路径（is_valid_sdk 判定失败，错误信息含路径）
         return sdk_path / 'renpy.sh'
 
     def generate_translations(self, game_dir: str, language: str = "chinese",

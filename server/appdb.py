@@ -1,7 +1,8 @@
 """应用级 SQLite（data/app.db）：settings / jobs / job_events
 
 与项目库（projects/<name>/project.db）分离——任务可不属于任何项目（如建项目）。
-任务与事件持久化：服务重启后 running/waiting_input 标为 interrupted，可断点续跑。
+任务与事件持久化：服务重启后 running/waiting_input 标为 interrupted
+（终态，仅作历史记录；无断点续跑实现）。
 """
 import json
 import sqlite3
