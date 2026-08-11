@@ -1,4 +1,10 @@
+<div align="center">
+
+<img src="installer/icon.png" width="128" height="128" alt="Ren'Py 翻译工具图标">
+
 # Ren'Py 游戏翻译工具
+
+AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内嵌文本提取、一键导出成品游戏
 
 [![最新版本](https://img.shields.io/github/v/release/yschdxm/renpy-translator)](https://github.com/yschdxm/renpy-translator/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -13,8 +19,7 @@
 ![UI](https://img.shields.io/badge/UI-Naive_UI-63e2b7)
 ![Ren'Py](https://img.shields.io/badge/Ren%27Py-7.x_%7C_8.x-e9547b)
 
-Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、
-内嵌文本提取、一键导出成品游戏。
+</div>
 
 架构：FastAPI 后端 + Vue 3（Naive UI）前端，一份前端三种形态——系统托盘、
 桌面窗口（pywebview）、浏览器 WebUI。服务独立常驻后台，关窗/关浏览器不中断任务。
