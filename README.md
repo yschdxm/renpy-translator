@@ -10,6 +10,8 @@ Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、
 
 ### 项目管理
 - 游戏目录或 zip 包一键建项，自动解包 `.rpa`、反编译 `.rpyc`（仅 rpyc 游戏需要 unrpyc）
+- 支持 Ren'Py 8.x 与 7.x 双引擎：按游戏 `game/` 目录自动检测引擎大版本，
+  匹配对应 SDK（应用内可一键下载两个大版本的常备 SDK）
 - 游戏发布新版本后「更新版本」就地升级：已有译文按原文自动继承
   （微改句子模糊匹配预填 + 复核表，失效旧译文保留可查），更新前自动备份可回滚
 - 检测游戏自带中文翻译并提示处理（避免与 SDK 模板重复导入）
@@ -31,6 +33,7 @@ Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、
 ### 游戏导出
 - 一键导出成品：填充对话/字符串译文、写入角色名 `translate python` 覆盖块、
   注入中文字体（含 font_replacement_map 覆盖写死字体）、添加语言选择入口
+- 导出后自动用对应大版本 SDK 做编译校验，失败时 AI 自动修复（译文修复/内嵌拆除）
 - 自动处理 Ren'Py 的 `%` 格式化陷阱（裸 % 转义、strftime/%(name)s 保留）
 - 反编译产生的 .rpy 自动移除，游戏运行原始 .rpyc
 
@@ -38,6 +41,8 @@ Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、
 - 长任务（批量翻译/建项/导出）后台执行，进度条 + 实时日志（SSE）
 - 服务重启/页面刷新自动重连回放；中断任务如实标记，翻译类重发自动跳过已完成部分
 - 交互式任务可挂起等待确认（官中检测、内嵌复核），刷新后对话框自动重开
+- 同类任务互斥防重（重复点击不会并发跑两个导出/批量翻译）；任务全程可取消，
+  取消即时生效到 AI 调用与 SDK 子进程
 
 ## 快速开始（用户）
 
@@ -50,7 +55,8 @@ Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、
 | Linux | `.deb` / `.rpm` / `.AppImage` / `.tar.gz`（x86_64 与 ARM64 双架构） |
 
 启动后驻系统托盘，托盘菜单：打开界面 / 用浏览器打开 / 退出服务。
-首次使用在「模型配置」里：下载或指定 Ren'Py SDK → 添加 AI 模型（OpenAI 兼容接口）。
+首次使用在「模型配置」里：下载 Ren'Py SDK（8.x/7.x 应用内一键下载，或指定已有 SDK 目录）
+→ 添加 AI 模型（OpenAI 兼容接口）。
 
 ### 数据目录
 
@@ -89,6 +95,12 @@ uv run python run.py --mode stop  # 停止后台服务
 WebUI 地址 http://localhost:7861（环境变量 `PORT` 可改）。
 前端改动后需在 `web/` 重新 `npm run build`。
 
+运行测试：
+
+```bash
+uv run pytest          # tests/ 正式测试（导出愈合/批次重试/迁移预检等）
+```
+
 ## 使用流程
 
 1. **建项**：项目管理 → 新建项目 → 填名称/游戏目录（或上传 zip）→ 选 AI 模型。
@@ -96,7 +108,8 @@ WebUI 地址 http://localhost:7861（环境变量 `PORT` 可改）。
 2. **人名翻译**：全部翻译+分析（或逐条），人名译文与角色画像都会用于后续翻译
 3. **字符串翻译**：菜单/按钮等 UI 文字；「提取内嵌文本」处理源码里没包 `_()` 的文本
 4. **对话翻译**：建议先完成人名与风格指南；按角色筛选、看上下文、行内精修
-5. **导出游戏**：导出页一键导出，成品在 `projects/<项目名>/output/`
+5. **导出游戏**：导出页一键导出（含编译校验 + 自动修复），成品 zip 在
+   `exports/<项目名>/<项目名>-translated.zip`，导出页可直接下载/在文件管理器中打开
 
 ## 打包与发布
 
@@ -134,10 +147,13 @@ Linux GUI 窗口需系统 GTK/WebKit：`python3-gi gir1.2-webkit2-4.1 gir1.2-app
 
 ### 核心设计
 
-- **前后端分离**：FastAPI REST + SSE 推送；浏览器持有 UI 状态，刷新/关页不丢任务
+- **前后端分离**：FastAPI REST + SSE（服务端以 db 为事件唯一事实源轮询增量推送）；
+  浏览器持有 UI 状态，刷新/关页不丢任务
 - **托盘常驻**：服务、窗口、浏览器均为独立进程，界面全关任务照跑
-- **任务持久化**：任务与事件流落 `data/app.db`，刷新后进度对话框重连回放
-- **SQLite**：每项目独立 `project.db`，WAL 模式，翻译逐条落库
+- **任务持久化**：任务与事件流落 `data/app.db`，刷新后进度对话框重连回放；
+  同类任务互斥；取消统一归一化（cancelled 不误标 failed）
+- **SQLite**：每项目独立 `project.db`，WAL 模式，实例级可重入锁串行化并发读写，
+  翻译逐条落库
 - **响亮失败**：不做静默降级——错误带完整 traceback 直达界面
 - **数据根解析**：`rt_home`（指针文件 → 便携 exe 旁 → 平台数据目录）
 
@@ -146,22 +162,30 @@ Linux GUI 窗口需系统 GTK/WebKit：`python3-gi gir1.2-webkit2-4.1 gir1.2-app
 ```
 renpy-translator/
 ├── run.py                     # 统一入口（tray/gui/web/server/stop）
-├── renpy-translator.spec      # PyInstaller 打包配置
+├── renpy-translator.spec      # PyInstaller 打包配置（含惰性加载清单注释）
 ├── installer/                 # Inno 脚本 / RPM spec / desktop / 图标生成
-├── .github/workflows/         # 跨平台 CI 构建
+├── .github/workflows/         # 跨平台 CI 构建（冒烟含 health/deep 惰性依赖检查）
+├── tests/                     # pytest 测试（导出愈合/批次重试/迁移预检）
 ├── server/                    # FastAPI 后端
 │   ├── app.py / state.py / appdb.py / deps.py / errors.py
-│   ├── jobs/                  # 任务系统（db 持久化 + SSE + ask/answer + 取消）
+│   ├── jobs/                  # 任务系统（db 持久化 + 轮询 SSE + ask/answer + 取消/互斥）
 │   └── api/                   # REST 路由（session/projects/texts/names/embedded/export/configs/jobs/logs/system）
 ├── web/                       # Vue3 + Vite + TS + Naive UI 前端
-│   └── src/{api,stores,pages,components}/
+│   └── src/{api,stores,pages,components,composables}/
 ├── src/                       # 纯逻辑核心（与 UI 无关）
-│   ├── database.py / translation_service.py / translator.py
+│   ├── db/                    # 项目库（base/content/character/glossary/embedded/update 六模块组合）
+│   ├── database.py            # db 包门面（from db import ProjectDatabase）
+│   ├── translator.py          # AI 翻译门面（批次/单条/人名/分析）
+│   ├── llm_client.py          # OpenAI 兼容客户端（重试/错误分类）
+│   ├── prompts.py / prompt_data.py   # prompt 模板与静态参考数据
+│   ├── token_budget.py        # token 预算统一计算（批次/上下文/输出上限）
+│   ├── translation_service.py # 翻译编排（分批/上下文/落库）
 │   ├── renpy_parser.py / rpa_extractor.py / rpyc_decompiler.py / tl_parser.py
 │   ├── ai_screener.py         # 内嵌文本 AI 预筛（agentic tool 循环）
+│   ├── source_tree.py         # 源码树缓存（预筛/精判 IO 复用）
 │   ├── embedded_strings.py    # 内嵌文本提取/标记
 │   ├── rt_home.py             # 数据根解析
-│   ├── services/              # 业务服务层（建项/导出/人名/内嵌管线）
+│   ├── services/              # 业务服务层（建项/更新/导出/人名/内嵌管线 + game_pipeline 公共编排）
 │   └── project_manager.py / config_manager.py / logger.py / sdk_manager.py
 └── data/  projects/  config/  fonts/  logs/  exports/  tools/   # 用户数据（不提交）
 ```
