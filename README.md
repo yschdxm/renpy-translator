@@ -13,11 +13,11 @@ AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内�
 [![最近提交](https://img.shields.io/github/last-commit/yschdxm/renpy-translator)](https://github.com/yschdxm/renpy-translator/commits/master)
 [![Issues](https://img.shields.io/github/issues/yschdxm/renpy-translator)](https://github.com/yschdxm/renpy-translator/issues)
 
-![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
-![前端](https://img.shields.io/badge/%E5%89%8D%E7%AB%AF-Vue_3-4FC08D?logo=vuedotjs&logoColor=white)
-![后端](https://img.shields.io/badge/%E5%90%8E%E7%AB%AF-FastAPI-009688?logo=fastapi&logoColor=white)
-![UI](https://img.shields.io/badge/UI-Naive_UI-63e2b7)
-![Ren'Py](https://img.shields.io/badge/Ren%27Py-7.x_%7C_8.x-e9547b)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vuedotjs&logoColor=white)](https://vuejs.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Naive UI](https://img.shields.io/badge/Naive_UI-63e2b7)](https://www.naiveui.com/)
+[![Ren'Py](https://img.shields.io/badge/Ren%27Py-7.x_%7C_8.x-e9547b)](https://www.renpy.org/)
 
 </div>
 
