@@ -1,0 +1,109 @@
+name: 🐛 问题反馈
+description: 报告使用中遇到的错误或异常行为
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量填写完整，信息越全定位越快。
+        提 issue 前建议先翻阅 [使用说明](https://github.com/yschdxm/renpy-translator/blob/master/docs/使用说明.md) 与已有 issue。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 发生了什么？预期应该是什么？
+      placeholder: 例：导出游戏时进度卡在 80%，弹窗报错……
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 从打开软件开始，一步步怎么操作能重现
+      placeholder: |
+        1. 项目管理 → 新建项目
+        2. 选择游戏目录 …
+        3. 点击创建后出现 …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 软件版本
+      description: 界面右下角 / 关于中的版本号，或安装包文件名（如 v0.2.0）
+      placeholder: v0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - Windows 安装版（setup-*.exe）
+        - Windows 便携版（portable.zip）
+        - macOS（dmg）
+        - Linux（deb）
+        - Linux（rpm）
+        - Linux（AppImage）
+        - Linux（tar.gz）
+        - 源码运行（uv run）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 使用形态
+      description: 问题发生时你在用哪种界面
+      options:
+        - 系统托盘 + 桌面窗口
+        - 浏览器 WebUI
+        - 其他/不确定
+    validations:
+      required: false
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: 游戏引擎版本
+      description: 出问题的游戏是 Ren'Py 哪个大版本（项目管理页可见，不确定可跳过）
+      options:
+        - Ren'Py 8.x
+        - Ren'Py 7.x
+        - 不确定 / 与游戏无关
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误信息 / 日志
+      description: |
+        界面弹出的错误可点「复制」按钮粘贴到此处；也可附上数据目录 `logs/` 下的相关日志片段
+        （注意脱敏，日志可能含 API Key 或游戏路径）
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图
+      description: 如有界面截图请直接拖拽到输入框
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索已有 issue，没有重复
+          required: true
+        - label: 我使用的是最新版本，或该问题在最新版仍存在
+          required: false

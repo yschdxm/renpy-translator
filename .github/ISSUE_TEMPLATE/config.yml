@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 使用说明（带截图）
+    url: https://github.com/yschdxm/renpy-translator/blob/master/docs/使用说明.md
+    about: 界面介绍与完整操作流程，大部分使用问题可先在这里找到答案
+  - name: ❓ 使用疑问
+    url: https://github.com/yschdxm/renpy-translator/discussions
+    about: 不确定是不是 bug？先到 Discussions 提问讨论

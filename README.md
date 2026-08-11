@@ -1,5 +1,18 @@
 # Ren'Py 游戏翻译工具
 
+[![最新版本](https://img.shields.io/github/v/release/yschdxm/renpy-translator)](https://github.com/yschdxm/renpy-translator/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/yschdxm/renpy-translator/releases)
+[![下载量](https://img.shields.io/github/downloads/yschdxm/renpy-translator/total)](https://github.com/yschdxm/renpy-translator/releases)
+[![最近提交](https://img.shields.io/github/last-commit/yschdxm/renpy-translator)](https://github.com/yschdxm/renpy-translator/commits/master)
+[![Issues](https://img.shields.io/github/issues/yschdxm/renpy-translator)](https://github.com/yschdxm/renpy-translator/issues)
+
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
+![前端](https://img.shields.io/badge/%E5%89%8D%E7%AB%AF-Vue_3-4FC08D?logo=vuedotjs&logoColor=white)
+![后端](https://img.shields.io/badge/%E5%90%8E%E7%AB%AF-FastAPI-009688?logo=fastapi&logoColor=white)
+![UI](https://img.shields.io/badge/UI-Naive_UI-63e2b7)
+![Ren'Py](https://img.shields.io/badge/Ren%27Py-7.x_%7C_8.x-e9547b)
+
 Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、
 内嵌文本提取、一键导出成品游戏。
 

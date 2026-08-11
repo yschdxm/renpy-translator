@@ -1,0 +1,30 @@
+name: test
+
+# 轻量测试：master 每次 push 与 PR 跑 pytest（不打包），给 README 的
+# Tests 徽章提供 master 分支上的真实运行记录；发版打包走 build.yml。
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests
+        run: uv run pytest -q
