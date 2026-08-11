@@ -101,6 +101,11 @@ class SDKManager:
         # 都不存在时返回默认路径（is_valid_sdk 判定失败，错误信息含路径）
         return sdk_path / 'renpy.sh'
 
+    # renpy.exe 在 Windows 上偶发访问冲突崩溃（0xC0000005，与负载/杀软扫描
+    # 相关的间歇性崩溃）：无输出的纯崩溃值得自动重试，真实脚本错误不重试
+    _CRASH_RETRIES = 3
+    _ACCESS_VIOLATION = 0xC0000005  # 3221225477（有符号为 -1073741819）
+
     def generate_translations(self, game_dir: str, language: str = "chinese",
                               cancel_event=None) -> dict:
         """调用 Ren'Py 生成翻译文件
@@ -122,11 +127,31 @@ class SDKManager:
         if not renpy_exe.exists():
             return {'success': False, 'message': f'找不到 {renpy_exe}', 'output': ''}
 
+        # 构建命令 - 使用正确的 translate 命令
+        cmd = [str(renpy_exe), str(game_dir), "translate", language]
+
+        for attempt in range(1, self._CRASH_RETRIES + 1):
+            result = self._run_once(cmd, language, cancel_event)
+            rc = result.pop('returncode', 0)
+            if (result['success'] or result.get('cancelled')
+                    or rc & 0xFFFFFFFF != self._ACCESS_VIOLATION):
+                return result
+            if attempt < self._CRASH_RETRIES:
+                print(f'[SDK] renpy.exe 访问冲突崩溃（0xC0000005），'
+                      f'第 {attempt}/{self._CRASH_RETRIES} 次，2s 后重试')
+                # 重试间隔也可被取消
+                if cancel_event is not None and cancel_event.wait(2):
+                    return {'success': False, 'cancelled': True,
+                            'message': '已取消', 'output': ''}
+            else:
+                result['message'] += '（0xC0000005 间歇性崩溃，已重试仍失败，可再试一次）'
+                return result
+        return result  # 理论不可达
+
+    def _run_once(self, cmd: list, language: str, cancel_event=None) -> dict:
+        """执行一次 translate 命令（Popen + 轮询，支持取消/超时）"""
         proc = None
         try:
-            # 构建命令 - 使用正确的 translate 命令
-            cmd = [str(renpy_exe), str(game_dir), "translate", language]
-
             print(f'[SDK] 执行命令: {" ".join(cmd)}')
 
             # 执行命令
@@ -157,11 +182,12 @@ class SDKManager:
                         proc.kill()
                         proc.wait()
                     return {'success': False, 'cancelled': True,
-                            'message': '已取消', 'output': ''}
+                            'message': '已取消', 'output': '', 'returncode': -1}
                 if time.monotonic() > deadline:
                     proc.kill()
                     proc.wait()
-                    return {'success': False, 'message': '执行超时', 'output': ''}
+                    return {'success': False, 'message': '执行超时',
+                            'output': '', 'returncode': -1}
                 time.sleep(0.5)
 
             output = proc.stdout.read() if proc.stdout else ''
@@ -171,19 +197,20 @@ class SDKManager:
                 return {
                     'success': True,
                     'message': f'成功生成 {language} 翻译文件',
-                    'output': output
+                    'output': output, 'returncode': 0,
                 }
             else:
                 return {
                     'success': False,
                     'message': f'生成失败 (返回码: {proc.returncode})',
-                    'output': output
+                    'output': output, 'returncode': proc.returncode,
                 }
 
         except Exception as e:
             if proc is not None and proc.poll() is None:
                 proc.kill()
-            return {'success': False, 'message': str(e), 'output': ''}
+            return {'success': False, 'message': str(e), 'output': '',
+                    'returncode': -1}
         finally:
             if proc is not None and proc.stdout:
                 proc.stdout.close()

@@ -53,8 +53,10 @@ class ContentRepo:
     def get_dialogues_page(self, page: int = 0, page_size: int = 50,
                            filter_mode: str = 'all',
                            character: str = '',
-                           search: str = '') -> tuple[list[dict], int]:
-        """分页查询对话"""
+                           search: str = '',
+                           sort_by: str = '',
+                           sort_order: str = 'asc') -> tuple[list[dict], int]:
+        """分页查询对话（可选排序：sort_by 白名单外保持默认按 id）"""
         where_clauses = []
         params = []
 
@@ -78,9 +80,14 @@ class ContentRepo:
         ).fetchone()
         total = count_row["cnt"]
 
+        # ORDER BY 只拼白名单列名，防注入；空值/非法值回落默认 id 排序
+        sort_col = sort_by if sort_by in {'id', 'character', 'original_text',
+                                          'is_translated'} else 'id'
+        order = 'DESC' if sort_order.lower() == 'desc' else 'ASC'
+
         offset = page * page_size
         rows = self._conn.execute(
-            f"SELECT * FROM dialogues{where_sql} ORDER BY id LIMIT ? OFFSET ?",
+            f"SELECT * FROM dialogues{where_sql} ORDER BY {sort_col} {order}, id LIMIT ? OFFSET ?",
             params + [page_size, offset]
         ).fetchall()
 
@@ -325,7 +332,9 @@ class ContentRepo:
     @_auto_reconnect
     def get_ui_texts_page(self, page: int = 0, page_size: int = 50,
                           filter_mode: str = 'all',
-                          search: str = '') -> tuple[list[dict], int]:
+                          search: str = '',
+                          sort_by: str = '',
+                          sort_order: str = 'asc') -> tuple[list[dict], int]:
         where_clauses = []
         params = []
 
@@ -345,9 +354,14 @@ class ContentRepo:
         ).fetchone()
         total = count_row["cnt"]
 
+        # ORDER BY 只拼白名单列名，防注入；空值/非法值回落默认 id 排序
+        sort_col = sort_by if sort_by in {'id', 'original_text',
+                                          'is_translated'} else 'id'
+        order = 'DESC' if sort_order.lower() == 'desc' else 'ASC'
+
         offset = page * page_size
         rows = self._conn.execute(
-            f"SELECT * FROM ui_texts{where_sql} ORDER BY id LIMIT ? OFFSET ?",
+            f"SELECT * FROM ui_texts{where_sql} ORDER BY {sort_col} {order}, id LIMIT ? OFFSET ?",
             params + [page_size, offset]
         ).fetchall()
 

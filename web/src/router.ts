@@ -19,6 +19,10 @@ const router = createRouter({
       props: { contentType: 'dialogue' }, meta: { needsProject: true },
     },
     {
+      path: '/glossary', component: () => import('./pages/GlossaryPage.vue'),
+      meta: { needsProject: true },
+    },
+    {
       path: '/export', component: () => import('./pages/ExportPage.vue'),
       meta: { needsProject: true },
     },

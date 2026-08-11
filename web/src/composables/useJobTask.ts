@@ -2,7 +2,7 @@
  *  每个 jobId 独立 watch（触发后自动 stop），替代页面共用一个 watch 源的写法。 */
 import { computed, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
-import { errorText } from '../api/client'
+import { toastError } from '../api/client'
 import { useJobsStore, JOB_TERMINAL_STATUS } from '../stores/jobs'
 import { useSessionStore } from '../stores/session'
 
@@ -37,7 +37,7 @@ export function useJobTask() {
     try {
       data = await request()
     } catch (e) {
-      message.error(errorText(e), { duration: 10000, closable: true })
+      toastError(message, e)
       return
     }
     if (!data.job_id) {

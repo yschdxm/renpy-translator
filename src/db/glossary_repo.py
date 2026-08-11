@@ -65,6 +65,64 @@ class GlossaryRepo:
                      t.get("source", "auto"), now)
                 )
 
+    # 排序列白名单：SQL ORDER BY 只拼接白名单内的列名，防注入
+    _GLOSSARY_SORT_COLUMNS = {'en_term', 'cn_term', 'created_at', 'source'}
+
+    @_auto_reconnect
+    def get_glossary_page(self, page: int = 0, size: int = 50,
+                          search: str = '', source: str = '',
+                          sort_by: str = 'en_term',
+                          sort_order: str = 'asc') -> tuple[list[dict], int]:
+        """分页查询术语表（搜索/来源筛选/排序），返回 (行列表, 总数)"""
+        where_clauses = []
+        params = []
+
+        if search:
+            # LIKE 大小写不敏感（SQLite 对 ASCII 默认如此，显式 LOWER 保证一致）
+            where_clauses.append(
+                "(LOWER(en_term) LIKE LOWER(?) OR LOWER(cn_term) LIKE LOWER(?))")
+            params.extend([f"%{search}%", f"%{search}%"])
+
+        if source:
+            where_clauses.append("source=?")
+            params.append(source)
+
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        count_row = self._conn.execute(
+            f"SELECT COUNT(*) as cnt FROM glossary{where_sql}", params
+        ).fetchone()
+        total = count_row["cnt"]
+
+        # sort_by 不在白名单回落 en_term；sort_order 仅 asc/desc
+        sort_col = sort_by if sort_by in self._GLOSSARY_SORT_COLUMNS else 'en_term'
+        order = 'DESC' if sort_order.lower() == 'desc' else 'ASC'
+
+        offset = page * size
+        rows = self._conn.execute(
+            f"SELECT en_term, cn_term, term_type, source, created_at "
+            f"FROM glossary{where_sql} ORDER BY {sort_col} {order} LIMIT ? OFFSET ?",
+            params + [size, offset]
+        ).fetchall()
+        return [dict(r) for r in rows], total
+
+    @_auto_reconnect
+    def get_glossary_term(self, en_term: str) -> dict | None:
+        """按主键取单条术语（编辑时用于保留原 source）"""
+        row = self._conn.execute(
+            "SELECT en_term, cn_term, term_type, source, created_at "
+            "FROM glossary WHERE en_term=?",
+            (en_term,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_auto_reconnect
+    def delete_glossary_term(self, en_term: str):
+        """删除术语"""
+        self._conn.execute(
+            "DELETE FROM glossary WHERE en_term=?", (en_term,))
+        self._conn.commit()
+
     @_auto_reconnect
     def get_glossary_for_prompt(self) -> str:
         """获取术语表文本（用于提示词，供 AI 参考）"""

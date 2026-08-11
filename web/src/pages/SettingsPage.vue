@@ -5,7 +5,7 @@ import {
   NModal, NPopconfirm, NSpace, NSpin, NTag, NText, useMessage,
 } from 'naive-ui'
 import { AddOutline, CloudDownloadOutline, FolderOpenOutline } from '@vicons/ionicons5'
-import { api, errorText } from '../api/client'
+import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
 import { nativeReady, pickDirectory } from '../api/native'
 import { useJobTask } from '../composables/useJobTask'
@@ -58,7 +58,7 @@ async function migrateDataDir() {
     dataDir.value = result.home
     newDataDir.value = result.home
     await session.refresh()
-    message.success(`数据目录已迁移（${result.moved.length} 项）`)
+    toastOk(message, `数据目录已迁移（${result.moved.length} 项）`)
     if (result.leftover?.length) {
       message.info(
         `${result.leftover.length} 个被占用的日志文件已复制到新目录，`
@@ -66,7 +66,7 @@ async function migrateDataDir() {
         { duration: 12000, closable: true })
     }
   } catch (e) {
-    message.error(errorText(e), { duration: 12000, closable: true })
+    toastError(message, e)
   } finally {
     migrating.value = false
   }
@@ -114,20 +114,20 @@ async function saveForm() {
       await api.post('/api/configs', { ...form })
     }
     formVisible.value = false
-    message.success('配置已保存')
+    toastOk(message, '配置已保存')
     await refresh()
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
 async function removeConfig(c: ModelConfig) {
   try {
     await api.del(`/api/configs/${encodeURIComponent(c.name)}`)
-    message.success('配置已删除')
+    toastOk(message, '配置已删除')
     await refresh()
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
@@ -136,9 +136,9 @@ async function testConnection() {
   try {
     const result = await api.post<{ model: string; response: string }>(
       '/api/configs/test', { ...form })
-    message.success(`连接成功（${result.model}）`)
+    toastOk(message, `连接成功（${result.model}）`)
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     testing.value = false
   }
@@ -151,7 +151,7 @@ async function downloadSdk(version: string) {
     async (status) => {
       if (status === 'succeeded') {
         await refresh()
-        message.success('SDK 下载完成')
+        toastOk(message, 'SDK 下载完成')
       }
     })
 }

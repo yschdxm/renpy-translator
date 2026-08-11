@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
 import {
-  NButton, NCard, NEmpty, NInput, NInputGroup, NModal, NPopconfirm, NProgress,
+  NButton, NCard, NEmpty, NInput, NInputGroup, NModal, NPopconfirm,
   NRadioButton, NRadioGroup, NSelect, NSpace, NTag, NText, NUpload,
   useMessage,
 } from 'naive-ui'
@@ -10,9 +10,10 @@ import { useSessionStore } from '../stores/session'
 import { useProjectsStore, type ProjectItem } from '../stores/projects'
 import { useJobsStore } from '../stores/jobs'
 import { AddOutline, DownloadOutline, RefreshOutline } from '@vicons/ionicons5'
-import { api, errorText } from '../api/client'
+import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
 import { nativeReady, pickDirectory } from '../api/native'
+import ProgressLine from '../components/ProgressLine.vue'
 import UpdateReportDialog from '../components/UpdateReportDialog.vue'
 
 
@@ -97,7 +98,7 @@ async function submitCreate() {
     createVisible.value = false
     jobsStore.track(jobId)
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     creating.value = false
   }
@@ -170,7 +171,7 @@ async function submitUpdate() {
     updateVisible.value = false
     jobsStore.track(jobId)
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     updating.value = false
   }
@@ -192,7 +193,7 @@ async function submitImport() {
     importVisible.value = false
     jobsStore.track(data.job_id)
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     importing.value = false
   }
@@ -218,9 +219,9 @@ watch(
           try {
             await session.open(name)
             await store.refresh()
-            message.success(`项目 "${name}" 创建成功！`)
+            toastOk(message, `项目 "${name}" 创建成功！`)
           } catch (e) {
-            message.error(errorText(e), { duration: 8000 })
+            toastError(message, e)
           }
         }
       }
@@ -249,7 +250,7 @@ async function openEdit(p: ProjectItem) {
     editModel.value = meta.model_config_name
     editVisible.value = true
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
@@ -260,11 +261,11 @@ async function saveEdit() {
       model: editModel.value,
     })
     editVisible.value = false
-    message.success('项目已更新')
+    toastOk(message, '项目已更新')
     await session.refresh()
     await store.refresh()
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
@@ -273,9 +274,9 @@ async function openProject(p: ProjectItem) {
   try {
     await session.open(p.name)
     await store.refresh()
-    message.success(`已打开项目: ${p.name}`)
+    toastOk(message, `已打开项目: ${p.name}`)
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
@@ -285,7 +286,7 @@ async function deleteProject(p: ProjectItem) {
       `/api/projects/${encodeURIComponent(p.name)}`)
     jobsStore.track(data.job_id)  // 进度/失败走任务对话框（含 traceback）
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   }
 }
 
@@ -295,7 +296,7 @@ async function exportZip(p: ProjectItem) {
       `/api/projects/${encodeURIComponent(p.name)}/export-zip`)
     jobsStore.track(data.job_id)
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
@@ -308,7 +309,7 @@ async function revealPackages(name: string) {
   try {
     await api.post(`/api/projects/${encodeURIComponent(name)}/packages/reveal`)
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
@@ -328,7 +329,7 @@ onMounted(async () => {
       <h2 style="margin: 0">项目管理</h2>
       <n-button size="small" type="primary" :render-icon="renderIcon(AddOutline)" @click="openCreate">新建项目</n-button>
       <n-button size="small" :render-icon="renderIcon(DownloadOutline)" @click="importVisible = true">导入项目</n-button>
-      <n-button size="small" :render-icon="renderIcon(RefreshOutline)" @click="store.refresh()">刷新</n-button>
+      <n-button size="small" quaternary :render-icon="renderIcon(RefreshOutline)" @click="store.refresh()">刷新</n-button>
     </n-space>
 
     <n-empty v-if="!store.list.length" description="暂无项目" style="margin-top: 60px" />
@@ -357,20 +358,18 @@ onMounted(async () => {
       </n-space>
 
       <n-space align="center" style="margin-top: 8px">
-        <n-progress
-          type="line"
-          :percentage="p.progress_percent"
+        <progress-line
+          :value="p.progress_percent / 100"
           style="width: 280px"
-          :height="8"
         />
         <n-text depth="3" style="font-size: 12px">{{ p.progress_text }}</n-text>
       </n-space>
 
       <div style="margin-top: 8px">
-        <n-button v-if="packages[p.name]?.length" size="tiny" quaternary @click="revealPackages(p.name)">
+        <n-button v-if="packages[p.name]?.length" size="small" quaternary @click="revealPackages(p.name)">
           打开导出目录（{{ packages[p.name].length }} 个包）
         </n-button>
-        <n-button size="tiny" quaternary @click="openReport(p.name)">更新报告</n-button>
+        <n-button size="small" quaternary @click="openReport(p.name)">更新报告</n-button>
       </div>
     </n-card>
 
@@ -414,7 +413,7 @@ onMounted(async () => {
         <n-select v-model:value="createModel" :options="modelOptions" placeholder="AI模型" />
         <div v-if="creating && uploadPct >= 0">
           <n-text depth="3" style="font-size: 12px">正在上传 zip（本地传输，大文件需等待）...</n-text>
-          <n-progress type="line" :percentage="Math.round(uploadPct * 100)" :height="8" processing />
+          <progress-line :value="uploadPct" processing />
         </div>
       </n-space>
       <template #footer>
@@ -454,7 +453,7 @@ onMounted(async () => {
         </n-upload>
         <div v-if="updating && updatePct >= 0">
           <n-text depth="3" style="font-size: 12px">正在上传 zip（本地传输，大文件需等待）...</n-text>
-          <n-progress type="line" :percentage="Math.round(updatePct * 100)" :height="8" processing />
+          <progress-line :value="updatePct" processing />
         </div>
       </n-space>
       <template #footer>
@@ -480,7 +479,7 @@ onMounted(async () => {
         </n-upload>
         <div v-if="importing && importPct >= 0">
           <n-text depth="3" style="font-size: 12px">正在上传项目包...</n-text>
-          <n-progress type="line" :percentage="Math.round(importPct * 100)" :height="8" processing />
+          <progress-line :value="importPct" processing />
         </div>
       </n-space>
       <template #footer>

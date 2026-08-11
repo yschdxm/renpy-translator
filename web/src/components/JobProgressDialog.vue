@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /** 任务进度对话框：进度条 + 阶段 + 滚动日志 + 结果/traceback + 取消/继续 */
 import { computed, nextTick, ref, watch } from 'vue'
-import { NAlert, NButton, NModal, NProgress, NScrollbar, NSpace, NTag, useMessage } from 'naive-ui'
+import { NAlert, NButton, NModal, NScrollbar, NSpace, NTag, useMessage } from 'naive-ui'
 import { useJobsStore, type JobView } from '../stores/jobs'
-import { errorText } from '../api/client'
+import { toastError, copyWithFeedback } from '../api/client'
+import ProgressLine from './ProgressLine.vue'
 
 const props = defineProps<{ job: JobView }>()
 const jobsStore = useJobsStore()
@@ -33,7 +34,7 @@ async function onCancel() {
   try {
     await jobsStore.cancel(props.job.id)
   } catch (e) {
-    message.error(errorText(e))
+    toastError(message, e)
   }
 }
 
@@ -61,9 +62,8 @@ watch(isTerminal, (v) => { if (v) emit('finished', props.job) })
         <span style="font-size: 13px; color: #aaa">{{ job.stage }}</span>
       </n-space>
 
-      <n-progress
-        type="line"
-        :percentage="Math.round(job.progress * 100)"
+      <progress-line
+        :value="job.progress"
         :status="job.status === 'failed' ? 'error' : job.status === 'succeeded' ? 'success' : 'default'"
         :processing="job.status === 'running'"
       />
@@ -79,7 +79,8 @@ watch(isTerminal, (v) => { if (v) emit('finished', props.job) })
       </n-alert>
 
       <n-alert v-if="job.error" type="error" title="任务失败">
-        <pre style="white-space: pre-wrap; font-size: 12px; max-height: 200px; overflow: auto">{{ job.error }}</pre>
+        <pre style="white-space: pre-wrap; font-size: 12px; max-height: 200px; overflow: auto; margin: 0">{{ job.error }}</pre>
+        <n-button size="tiny" style="margin-top: 6px" @click="copyWithFeedback(message, job.error!)">复制错误信息</n-button>
       </n-alert>
 
       <n-alert v-if="job.status === 'interrupted'" type="warning" title="服务重启导致任务中断">

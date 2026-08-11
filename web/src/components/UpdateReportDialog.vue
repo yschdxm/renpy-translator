@@ -4,7 +4,7 @@ import {
   NButton, NCollapse, NCollapseItem, NEmpty, NModal, NSpace,
   NSpin, NStatistic, NTable, NTag, NText, useMessage,
 } from 'naive-ui'
-import { api, errorText } from '../api/client'
+import { api, toastError, toastOk } from '../api/client'
 
 interface UpdateReport {
   carried: number
@@ -59,7 +59,7 @@ async function load() {
     obsolete.value = data.obsolete
     review.value = data.review
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   } finally {
     loading.value = false
   }
@@ -74,9 +74,9 @@ async function reviewAction(row: ReviewRow, action: 'apply' | 'dismiss') {
       `/api/projects/${encodeURIComponent(props.projectName)}/update-review/${row.id}`,
       { action })
     row.status = action === 'apply' ? 'applied' : 'dismissed'
-    if (action === 'apply') message.success('已应用旧译文')
+    if (action === 'apply') toastOk(message, '已应用旧译文')
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   } finally {
     acting.value = 0
   }

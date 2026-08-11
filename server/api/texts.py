@@ -28,14 +28,17 @@ def _service(state: AppState):
 async def list_texts(content_type: str, page: int = 0, size: int = 50,
                      filter_mode: str = 'all', search: str = '',
                      character: str = '',
+                     sort_by: str = '', sort_order: str = 'asc',
                      state: AppState = Depends(require_project)):
     _check_ct(content_type)
     if content_type == 'dialogue':
         rows, total = await state.db_call(
-            state.db.get_dialogues_page, page, size, filter_mode, character, search)
+            state.db.get_dialogues_page, page, size, filter_mode, character,
+            search, sort_by, sort_order)
     else:
         rows, total = await state.db_call(
-            state.db.get_ui_texts_page, page, size, filter_mode, search)
+            state.db.get_ui_texts_page, page, size, filter_mode, search,
+            sort_by, sort_order)
     return {'rows': rows, 'total': total}
 
 

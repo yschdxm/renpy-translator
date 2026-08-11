@@ -1,13 +1,15 @@
 <script setup lang="ts">
 /** 人名翻译页：翻译+分析融合流程 */
-import { h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, ref } from 'vue'
 import {
-  NButton, NDataTable, NInput, NModal, NSpace, NTag, NText, useMessage,
+  NButton, NDataTable, NEmpty, NInput, NInputGroup, NModal, NSelect, NSpace,
+  NTag, NText, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import { LanguageOutline, RefreshOutline } from '@vicons/ionicons5'
-import { api, errorText } from '../api/client'
+import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
+import { useInlineEdit } from '../composables/useInlineEdit'
 import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
 
@@ -38,32 +40,55 @@ async function load() {
     rows.value = data.rows
     stats.value = { total: data.total, translated: data.translated, analyzed: data.analyzed }
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   } finally {
     loading.value = false
   }
 }
 
-// ---- 行内编辑 ----
-// Enter 保存后焦点仍在输入框，随后的 blur 会再发一次相同 PATCH；
-// 记录已保存值去重（与 TextsPage 的 editingId 守卫同思路）
-const savedNames = new Map<string, string>()
+// ---- 筛选（客户端：数据量小） ----
+const searchText = ref('')
+const statusFilter = ref('')
 
-async function saveName(row: NameRow, value: string) {
-  const key = row.original + row.variable
-  if (savedNames.get(key) === value) return
-  const old = row.translated
-  row.translated = value
+const filteredRows = computed(() => {
+  const kw = searchText.value.trim().toLowerCase()
+  return rows.value.filter((r) => {
+    if (kw) {
+      const hit = [r.original, r.translated, r.variable]
+        .some((s) => (s || '').toLowerCase().includes(kw))
+      if (!hit) return false
+    }
+    if (statusFilter.value === 'untranslated') return !r.translated.trim()
+    if (statusFilter.value === 'translated') return !!r.translated.trim()
+    if (statusFilter.value === 'unanalyzed') return !r.analyzed
+    return true
+  })
+})
+
+// ---- 行内编辑（中文名） ----
+const { editingText, isEditing, startEdit, commitEdit } = useInlineEdit<NameRow>(
+  (row) => row.original + row.variable,
+  (row) => row.translated || '',
+  async (row, value) => {
+    const old = row.translated
+    row.translated = value
+    try {
+      await api.patch(`/api/current/names/${encodeURIComponent(row.original)}`, {
+        cn_name: value, variable: row.variable,
+      })
+      row.name_done = !!value.trim()
+      await session.refresh()
+    } catch (e) {
+      row.translated = old
+      throw e
+    }
+  })
+
+async function onCommit(row: NameRow) {
   try {
-    await api.patch(`/api/current/names/${encodeURIComponent(row.original)}`, {
-      cn_name: value, variable: row.variable,
-    })
-    savedNames.set(key, value)
-    row.name_done = !!value.trim()
-    await session.refresh()
+    await commitEdit(row)
   } catch (e) {
-    row.translated = old
-    message.error(errorText(e), { duration: 8000, closable: true })
+    toastError(message, e)
   }
 }
 
@@ -77,9 +102,9 @@ async function translateOne(row: NameRow) {
     row.name_done = !!row.translated.trim()
     row.analyzed = !!data.profile
     await session.refresh()
-    message.success(`${row.original} → ${data.cn_name}`)
+    toastOk(message, `${row.original} → ${data.cn_name}`)
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     processing.value.delete(row.original)
   }
@@ -104,23 +129,35 @@ async function viewProfile(row: NameRow) {
     profileData.value = data.profile
     profileVisible.value = true
   } catch (e) {
-    message.error(errorText(e))
+    toastError(message, e)
   }
 }
 
 const columns: DataTableColumns<NameRow> = [
   { title: '#', key: 'index', width: 50, render: (_, i) => i + 1 },
   { title: '变量名', key: 'variable', width: 110 },
-  { title: '原文人名', key: 'original', width: 140 },
+  {
+    title: '原文人名', key: 'original', width: 140,
+    sorter: (a, b) => a.original.localeCompare(b.original),
+  },
   {
     title: '中文名（点击编辑）', key: 'translated', width: 160,
-    render: (r) => h(NInput, {
-      value: r.translated,
-      'onUpdate:value': (v: string) => { r.translated = v },
-      onBlur: () => saveName(r, r.translated),
-      onKeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') saveName(r, r.translated) },
-      size: 'small', placeholder: '（未翻译）',
-    }),
+    render: (r) => {
+      if (isEditing(r)) {
+        return h(NInput, {
+          value: editingText.value,
+          'onUpdate:value': (v: string) => { editingText.value = v },
+          onBlur: () => onCommit(r),
+          onKeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') onCommit(r) },
+          autofocus: true,
+          size: 'small',
+        })
+      }
+      return h('span', {
+        style: `cursor: text; display: block; min-height: 20px; ${r.translated ? '' : 'color: #666'}`,
+        onClick: () => startEdit(r),
+      }, r.translated || '（点击输入中文名）')
+    },
   },
   { title: '台词数', key: 'lines', width: 80, sorter: (a, b) => a.lines - b.lines },
   {
@@ -167,10 +204,29 @@ onMounted(load)
       </n-text>
     </n-space>
 
+    <n-space align="center" style="margin-bottom: 10px" wrap>
+      <n-input-group style="width: 280px">
+        <n-input
+          v-model:value="searchText" size="small" clearable
+          placeholder="搜索人名/变量名/中文名"
+        />
+      </n-input-group>
+      <n-select
+        v-model:value="statusFilter" size="small" style="width: 130px"
+        :options="[
+          { label: '全部', value: '' },
+          { label: '未翻译', value: 'untranslated' },
+          { label: '已翻译', value: 'translated' },
+          { label: '未分析', value: 'unanalyzed' },
+        ]"
+      />
+    </n-space>
+
     <n-data-table
-      :columns="columns" :data="rows" :loading="loading"
+      :columns="columns" :data="filteredRows" :loading="loading"
       :row-key="(r: NameRow) => r.original + r.variable" size="small"
       :pagination="{ pageSize: 50 }"
+      :render-empty="() => h(NEmpty, { description: '暂无人名' })"
     />
 
     <n-modal v-model:show="profileVisible" preset="card"

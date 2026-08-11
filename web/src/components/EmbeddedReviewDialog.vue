@@ -7,7 +7,7 @@
 import { computed, ref, watch } from 'vue'
 import { NButton, NCheckbox, NInput, NScrollbar, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
 import { CodeOutline, SparklesOutline } from '@vicons/ionicons5'
-import { api, errorText } from '../api/client'
+import { api, toastError } from '../api/client'
 import { useJobsStore, type JobView } from '../stores/jobs'
 import { renderIcon } from './icons'
 import CodeSnippet from './CodeSnippet.vue'
@@ -155,7 +155,7 @@ async function refineOne(row: EmbeddedRow) {
     row.source = 'ai'   // 单句精判是模型判定
     toggle(row.id, !!data.ai_keep)
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     releaseRefineSlot()
     refining.value.delete(row.id)
@@ -167,7 +167,7 @@ async function answer(payload: Record<string, unknown>) {
   try {
     await jobsStore.answer(props.job.id, props.question.question_id, payload)
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   } finally {
     answering.value = false
   }

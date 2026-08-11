@@ -1,4 +1,7 @@
 /** API 客户端：统一错误形状（响亮失败——含 detail/traceback 直达 UI） */
+import { h } from 'vue'
+import { NButton } from 'naive-ui'
+import type { MessageApi } from 'naive-ui'
 
 export class ApiError extends Error {
   code: string
@@ -86,8 +89,55 @@ export const api = {
   },
 }
 
+/** 复制到剪贴板（clipboard API 不可用时回退 execCommand，兼容 pywebview 环境） */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch { /* 继续回退 */ }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.cssText = 'position:fixed;opacity:0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
+/** 带复制按钮的复制操作 + 结果提示（alert 内复制按钮共用） */
+export async function copyWithFeedback(message: MessageApi, text: string): Promise<void> {
+  if (await copyText(text)) message.success('已复制')
+  else message.warning('复制失败，请手动选择文本复制')
+}
+
 /** 在 message.error 中展示错误（含可折叠 detail） */
 export function errorText(e: unknown): string {
   if (e instanceof ApiError) return e.detail ? `${e.message}\n${e.detail}` : e.message
   return String(e)
+}
+
+/** 统一错误提示：10000ms + closable + 复制按钮（全项目规范，不再逐页写 duration） */
+export function toastError(message: MessageApi, e: unknown): void {
+  const text = errorText(e)
+  message.error(() => h('div', {
+    style: 'display: flex; align-items: flex-start; gap: 8px; max-width: 560px',
+  }, [
+    h('span', {
+      style: 'white-space: pre-wrap; word-break: break-all; user-select: text',
+    }, text),
+    h(NButton, {
+      size: 'tiny', quaternary: true, style: 'flex-shrink: 0',
+      onClick: () => copyWithFeedback(message, text),
+    }, () => '复制'),
+  ]), { duration: 10000, closable: true })
+}
+
+/** 统一成功提示：默认时长 */
+export function toastOk(message: MessageApi, text: string): void {
+  message.success(text)
 }

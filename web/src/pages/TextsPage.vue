@@ -2,13 +2,14 @@
 /** 文本翻译页（UI 字符串 / 对话共用，contentType 区分） */
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import {
-  NButton, NDataTable, NInput, NModal, NPagination, NSelect, NSpace,
+  NButton, NDataTable, NEmpty, NInput, NModal, NPagination, NSelect, NSpace,
   NText, NInputGroup, useMessage,
 } from 'naive-ui'
-import type { DataTableColumns } from 'naive-ui'
+import type { DataTableColumns, DataTableSortState } from 'naive-ui'
 import { BookOutline, CodeSlashOutline, LanguageOutline, LocateOutline, RefreshOutline, SparklesOutline } from '@vicons/ionicons5'
-import { api, errorText } from '../api/client'
+import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
+import { useInlineEdit } from '../composables/useInlineEdit'
 import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
 
@@ -33,6 +34,7 @@ const total = ref(0)
 const loading = ref(false)
 const query = reactive({
   page: 0, size: 50, filter_mode: 'all', search: '', character: '',
+  sort_by: '', sort_order: 'asc' as 'asc' | 'desc',
 })
 const characters = ref<Array<{ label: string; value: string }>>([])
 const translatingIds = ref<Set<number>>(new Set())
@@ -47,13 +49,14 @@ async function load() {
       page: String(query.page), size: String(query.size),
       filter_mode: query.filter_mode, search: query.search,
       character: query.character,
+      sort_by: query.sort_by, sort_order: query.sort_order,
     })
     const data = await api.get<{ rows: Row[]; total: number }>(
       `/api/current/texts/${props.contentType}?${params}`)
     rows.value = data.rows
     total.value = data.total
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   } finally {
     loading.value = false
   }
@@ -73,28 +76,50 @@ async function loadCharacters() {
 }
 
 // ---- 行内编辑 ----
-const editingId = ref<number | null>(null)
-const editingText = ref('')
+const { editingText, isEditing, startEdit, commitEdit } = useInlineEdit<Row>(
+  (row) => row.id,
+  (row) => row.translated_text || '',
+  async (row, value) => {
+    const old = row.translated_text
+    row.translated_text = value
+    try {
+      await api.patch(`/api/current/texts/${props.contentType}/${row.id}`, {
+        translated_text: value,
+      })
+    } catch (e) {
+      row.translated_text = old  // 响亮回滚
+      throw e
+    }
+  })
 
-function startEdit(row: Row) {
-  editingId.value = row.id
-  editingText.value = row.translated_text || ''
+async function onCommit(row: Row) {
+  try {
+    await commitEdit(row)
+  } catch (e) {
+    toastError(message, e)
+  }
 }
 
-async function commitEdit(row: Row) {
-  if (editingId.value !== row.id) return
-  editingId.value = null
-  if (editingText.value === (row.translated_text || '')) return
-  const old = row.translated_text
-  row.translated_text = editingText.value
-  try {
-    await api.patch(`/api/current/texts/${props.contentType}/${row.id}`, {
-      translated_text: editingText.value,
-    })
-  } catch (e) {
-    row.translated_text = old  // 响亮回滚
-    message.error(errorText(e), { duration: 8000, closable: true })
+// ---- 服务端排序（单列受控） ----
+const sortableKeys = computed(() =>
+  isDialogue.value ? ['original_text', 'character'] : ['original_text'])
+
+function onSorterChange(sorter: DataTableSortState | null) {
+  if (sorter && sorter.order && sortableKeys.value.includes(String(sorter.columnKey))) {
+    query.sort_by = String(sorter.columnKey)
+    query.sort_order = sorter.order === 'descend' ? 'desc' : 'asc'
+  } else {
+    query.sort_by = ''
+    query.sort_order = 'asc'
   }
+  query.page = 0
+  load()
+}
+
+/** 列的受控排序态 */
+function sortOrderOf(key: string): 'ascend' | 'descend' | false {
+  if (query.sort_by !== key) return false
+  return query.sort_order === 'desc' ? 'descend' : 'ascend'
 }
 
 // ---- 单条翻译 ----
@@ -106,7 +131,7 @@ async function translateOne(row: Row) {
     row.translated_text = data.translated_text
     await session.refresh()
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     translatingIds.value.delete(row.id)
   }
@@ -139,7 +164,7 @@ async function showContext(row: Row) {
     contextTarget.value = row
     contextVisible.value = true
   } catch (e) {
-    message.error(errorText(e))
+    toastError(message, e)
   }
 }
 
@@ -174,9 +199,9 @@ async function generateGuide() {
     const data = await api.post<{ style_guide: string }>(
       '/api/current/style-guide/generate')
     guideText.value = data.style_guide
-    message.success('风格指南已生成，可编辑后保存')
+    toastOk(message, '风格指南已生成，可编辑后保存')
   } catch (e) {
-    message.error(errorText(e), { duration: 10000, closable: true })
+    toastError(message, e)
   } finally {
     guideGenerating.value = false
   }
@@ -184,7 +209,7 @@ async function generateGuide() {
 
 async function saveGuide() {
   await api.put('/api/current/style-guide', { style_guide: guideText.value })
-  message.success('风格指南已保存，后续翻译将按此风格执行')
+  toastOk(message, '风格指南已保存，后续翻译将按此风格执行')
   guideVisible.value = false
 }
 
@@ -195,21 +220,23 @@ const columns = computed<DataTableColumns<Row>>(() => {
   ]
   if (isDialogue.value) {
     cols.push({ title: '角色', key: 'character', width: 90,
+                sorter: true, sortOrder: sortOrderOf('character'),
                 render: (r) => r.character || '旁白' })
   }
   cols.push({
     title: '原文', key: 'original_text', ellipsis: { tooltip: true },
+    sorter: true, sortOrder: sortOrderOf('original_text'),
     render: (r) => h('span', { style: 'white-space: pre-wrap' }, r.original_text),
   })
   cols.push({
     title: '译文（点击编辑）', key: 'translated_text', ellipsis: { tooltip: true },
     render: (r) => {
-      if (editingId.value === r.id) {
+      if (isEditing(r)) {
         return h(NInput, {
           value: editingText.value,
           'onUpdate:value': (v: string) => { editingText.value = v },
-          onBlur: () => commitEdit(r),
-          onKeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') commitEdit(r) },
+          onBlur: () => onCommit(r),
+          onKeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') onCommit(r) },
           autofocus: true,
           size: 'small',
         })
@@ -283,6 +310,8 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
     <n-data-table
       :columns="columns" :data="rows" :loading="loading"
       :row-key="(r: Row) => r.id" size="small" :scroll-x="900"
+      :render-empty="() => h(NEmpty, { description: '暂无文本' })"
+      @update:sorter="onSorterChange"
     />
 
     <n-space justify="end" style="margin-top: 10px">

@@ -12,7 +12,7 @@ import { useProjectsStore } from './stores/projects'
 import { useJobsStore, type JobView } from './stores/jobs'
 import JobProgressDialog from './components/JobProgressDialog.vue'
 import EmbeddedReviewDialog from './components/EmbeddedReviewDialog.vue'
-import { errorText } from './api/client'
+import { toastError } from './api/client'
 
 const message = useMessage()
 const session = useSessionStore()
@@ -26,6 +26,7 @@ const menuOptions: MenuOption[] = [
   { label: '人名翻译', key: '/names' },
   { label: '字符串翻译', key: '/strings' },
   { label: '对话翻译', key: '/dialogue' },
+  { label: '术语表', key: '/glossary' },
   { label: '导出游戏', key: '/export' },
   { label: '模型配置', key: '/settings' },
 ]
@@ -63,7 +64,7 @@ async function onProjectChange(name: string | null) {
   } catch (e) {
     // 打开失败（项目被删/db 损坏）：提示并刷新会话与列表，
     // 选择器绑定 session.currentProject，刷新后自动回退到实际当前项目
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
     await session.refresh()
     await projectsStore.refresh()
   }
@@ -80,7 +81,7 @@ async function answerConfirm(job: JobView, ok: boolean) {
   try {
     await jobsStore.answer(job.id, q.question_id, { ok })
   } catch (e) {
-    message.error(errorText(e), { duration: 8000 })
+    toastError(message, e)
   }
 }
 
