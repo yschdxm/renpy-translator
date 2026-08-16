@@ -1,6 +1,6 @@
 [project]
 name = "renpy-translator"
-version = "0.2.0"
+version = "0.2.1"
 description = "Ren'Py 游戏汉化工具：AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内嵌文本提取、一键导出成品游戏"
 readme = "README.md"
 requires-python = ">=3.12"
