@@ -191,10 +191,12 @@ async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
 
     # 只有 common.rpy = 游戏脚本一条都没进模板（典型原因：
     # 游戏引擎与 SDK 大版本不匹配，SDK 读不了游戏的 .rpyc），
-    # 继续走只会得到一个没有任何对话的空项目
+    # 继续走只会得到一个没有任何对话的空项目。
+    # 注意模板目录镜像游戏脚本的子目录结构（脚本在 game/scripts/ 下时
+    # 模板落在 tl/chinese/scripts/），必须递归查找。
     tl_out = game_work_dir / 'game' / 'tl' / 'chinese'
     has_templates = tl_out.exists() and any(
-        p.name != 'common.rpy' for p in tl_out.glob('*.rpy'))
+        p.name != 'common.rpy' for p in tl_out.rglob('*.rpy'))
     if not has_templates:
         raise Exception(
             "SDK 未为游戏脚本生成任何翻译模板（只有 common.rpy）。\n"

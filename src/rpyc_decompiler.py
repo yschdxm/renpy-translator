@@ -13,6 +13,18 @@ UNRPYC = _find_resource('tools/unrpyc/unrpyc.py')
 
 UNRPYC_RELEASE_URL = 'https://github.com/CensoredUsername/unrpyc/releases/tag/v2.0.4'
 
+# tools/python-embed 的 ._pth 隔离模式下 sys.path 不含脚本所在目录
+# （PYTHONPATH 等环境变量也被忽略），直接 `python unrpyc.py` 会因顶层
+# `import decompiler` 找不到同目录的包而崩溃。改用 -c 引导：手动把
+# unrpyc 目录插入 sys.path 后以 __main__ 运行。对普通解释器无害
+# （脚本目录本来就在 sys.path[0]，重复插入等价）。
+_BOOTSTRAP = (
+    "import os, sys, runpy; "
+    "sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1]))); "
+    "sys.argv = sys.argv[1:]; "
+    "runpy.run_path(sys.argv[0], run_name='__main__')"
+)
+
 
 class UnrpycMissingError(RuntimeError):
     """检测到 rpyc-only 脚本但未安装 unrpyc，中断项目创建"""
@@ -62,7 +74,7 @@ def decompile_game_rpyc(game_subdir, python_exe: str, log=print, chunk_size: int
 
     for i in range(0, len(candidates), chunk_size):
         chunk = candidates[i:i + chunk_size]
-        cmd = [python_exe, str(UNRPYC)] + [str(p) for p in chunk]
+        cmd = [python_exe, '-c', _BOOTSTRAP, str(UNRPYC)] + [str(p) for p in chunk]
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
