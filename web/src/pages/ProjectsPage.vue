@@ -2,7 +2,7 @@
 import { onMounted, ref, watch } from 'vue'
 import {
   NButton, NCard, NEmpty, NInput, NInputGroup, NModal, NPopconfirm,
-  NRadioButton, NRadioGroup, NSelect, NSpace, NTag, NText, NUpload,
+  NRadioButton, NRadioGroup, NSpace, NTag, NText, NUpload,
   useMessage,
 } from 'naive-ui'
 import type { UploadFileInfo } from 'naive-ui'
@@ -35,7 +35,6 @@ interface PackageInfo {
 }
 
 const packages = ref<Record<string, PackageInfo[]>>({})
-const modelOptions = ref<Array<{ label: string; value: string }>>([])
 
 // ---- 新建项目 ----
 const createVisible = ref(false)
@@ -43,7 +42,6 @@ const createName = ref('')
 const createMethod = ref<'path' | 'zip'>('path')
 const createDir = ref('')
 const createZip = ref<File | null>(null)
-const createModel = ref('')
 const creating = ref(false)
 const uploadPct = ref(0)   // zip 上传进度（-1 = 未开始）
 
@@ -75,7 +73,7 @@ async function submitCreate() {
         return
       }
       const data = await api.post<{ job_id: string }>('/api/projects/create', {
-        name: createName.value, game_dir: createDir.value, model: createModel.value,
+        name: createName.value, game_dir: createDir.value,
       })
       jobId = data.job_id
     } else {
@@ -88,7 +86,6 @@ async function submitCreate() {
       uploadPct.value = 0
       const form = new FormData()
       form.append('name', createName.value)
-      form.append('model', createModel.value)
       form.append('file', createZip.value)
       const data = await api.postFormProgress<{ job_id: string }>(
         '/api/projects/create-zip', form,
@@ -235,19 +232,17 @@ watch(
     }
   })
 
-// ---- 编辑对话框 ----
+// ---- 重命名对话框 ----
 const editVisible = ref(false)
 const editOldName = ref('')
 const editName = ref('')
-const editModel = ref('')
 
 async function openEdit(p: ProjectItem) {
   try {
-    const meta = await api.get<{ name: string; model_config_name: string }>(
+    const meta = await api.get<{ name: string }>(
       `/api/projects/${encodeURIComponent(p.name)}/meta`)
     editOldName.value = p.name
     editName.value = meta.name
-    editModel.value = meta.model_config_name
     editVisible.value = true
   } catch (e) {
     toastError(message, e)
@@ -258,10 +253,9 @@ async function saveEdit() {
   try {
     await api.patch(`/api/projects/${encodeURIComponent(editOldName.value)}`, {
       new_name: editName.value,
-      model: editModel.value,
     })
     editVisible.value = false
-    toastOk(message, '项目已更新')
+    toastOk(message, '项目已重命名')
     await session.refresh()
     await store.refresh()
   } catch (e) {
@@ -316,9 +310,6 @@ async function revealPackages(name: string) {
 onMounted(async () => {
   guiMode.value = await nativeReady()
   await store.refresh()
-  const configs = await api.get<Array<{ name: string }>>('/api/configs')
-  modelOptions.value = configs.map((c) => ({ label: c.name, value: c.name }))
-  if (configs.length && !createModel.value) createModel.value = configs[0].name
   for (const p of store.list) await loadPackages(p.name)
 })
 </script>
@@ -339,13 +330,12 @@ onMounted(async () => {
         <n-space align="center">
           <n-text strong style="font-size: 15px">{{ p.name }}</n-text>
           <n-tag v-if="p.is_current" size="small" type="success">当前项目</n-tag>
-          <n-tag size="small" :bordered="false">{{ p.model_config_name || '未配置模型' }}</n-tag>
         </n-space>
         <n-space>
           <n-button size="small" type="primary" :disabled="p.is_current" @click="openProject(p)">
             打开
           </n-button>
-          <n-button size="small" @click="openEdit(p)">编辑</n-button>
+          <n-button size="small" @click="openEdit(p)">重命名</n-button>
           <n-button size="small" @click="openUpdate(p)">更新版本</n-button>
           <n-button size="small" @click="exportZip(p)">导出</n-button>
           <n-popconfirm @positive-click="deleteProject(p)">
@@ -373,11 +363,8 @@ onMounted(async () => {
       </div>
     </n-card>
 
-    <n-modal v-model:show="editVisible" preset="card" title="编辑项目" style="width: 420px">
-      <n-space vertical>
-        <n-input v-model:value="editName" placeholder="项目名称" />
-        <n-select v-model:value="editModel" :options="modelOptions" placeholder="AI模型" clearable />
-      </n-space>
+    <n-modal v-model:show="editVisible" preset="card" title="重命名项目" style="width: 420px">
+      <n-input v-model:value="editName" placeholder="项目名称" />
       <template #footer>
         <n-space justify="end">
           <n-button @click="editVisible = false">取消</n-button>
@@ -410,7 +397,6 @@ onMounted(async () => {
           <n-button size="small">选择游戏 zip</n-button>
           <span v-if="createZip" style="margin-left: 8px; font-size: 12px">{{ createZip.name }}</span>
         </n-upload>
-        <n-select v-model:value="createModel" :options="modelOptions" placeholder="AI模型" />
         <div v-if="creating && uploadPct >= 0">
           <n-text depth="3" style="font-size: 12px">正在上传 zip（本地传输，大文件需等待）...</n-text>
           <progress-line :value="uploadPct" processing />

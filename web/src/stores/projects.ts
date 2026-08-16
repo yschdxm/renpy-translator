@@ -5,7 +5,6 @@ import { api } from '../api/client'
 export interface ProjectItem {
   name: string
   game_dir: string
-  model_config_name: string
   total_dialogues: number
   translated_dialogues: number
   total_strings: number

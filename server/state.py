@@ -281,26 +281,23 @@ class AppState:
 
         db = await loop.run_in_executor(
             None, self.project_manager.open_project, name)
-        model_name = await loop.run_in_executor(
-            None, db.get_meta, 'model_config_name')
 
         from translator import AITranslator, TranslationConfig
         from translation_service import TranslationService
         translator = None
         max_context_k, max_tokens, batch_lines = 8, 1000, 100
-        if model_name:
-            cfg = self.config_manager.get_config_by_name(model_name)
-            if cfg:
-                translator = AITranslator(TranslationConfig(
-                    api_base=cfg.api_base, api_key=cfg.api_key,
-                    model=cfg.model, temperature=cfg.temperature,
-                    max_tokens=cfg.max_tokens,
-                    context_lines=cfg.context_lines, timeout=cfg.timeout,
-                ))
-                translator.api_log_callback = self._on_api_log
-                max_context_k = getattr(cfg, 'max_context', 8)
-                max_tokens = getattr(cfg, 'max_tokens', 1000)
-                batch_lines = getattr(cfg, 'batch_lines', 100)
+        cfg = await loop.run_in_executor(None, self._current_model_config, db)
+        if cfg:
+            translator = AITranslator(TranslationConfig(
+                api_base=cfg.api_base, api_key=cfg.api_key,
+                model=cfg.model, temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                context_lines=cfg.context_lines, timeout=cfg.timeout,
+            ))
+            translator.api_log_callback = self._on_api_log
+            max_context_k = getattr(cfg, 'max_context', 8)
+            max_tokens = getattr(cfg, 'max_tokens', 1000)
+            batch_lines = getattr(cfg, 'batch_lines', 100)
 
         service = None
         if translator:
@@ -309,19 +306,7 @@ class AppState:
                 max_context_k=max_context_k, max_tokens=max_tokens,
                 batch_lines=batch_lines,
             )
-
-            # 每次批量翻译前重读模型配置，配置保存后立即生效
-            def config_provider():
-                if not self.db:
-                    return None
-                name = self.db.get_meta('model_config_name')
-                mc = self.config_manager.get_config_by_name(name) if name else None
-                if not mc:
-                    return None
-                return (getattr(mc, 'max_context', 8),
-                        getattr(mc, 'max_tokens', 1000),
-                        getattr(mc, 'batch_lines', 100))
-            service.config_provider = config_provider
+            service.config_provider = self._make_config_provider()
 
         self.db = db
         self.translator = translator
@@ -330,6 +315,74 @@ class AppState:
         await loop.run_in_executor(
             None, self.app_db.set_setting, 'current_project', name)
         self.logger.info(f'已打开项目: {name}')
+
+    def _current_model_config(self, db=None):
+        """当前生效的模型配置：全局激活的配置优先；
+        未激活过时回退项目内保存的选择（旧版项目兼容）"""
+        db = db if db is not None else self.db
+        cfg = self.config_manager.get_active_config()
+        if cfg or not db:
+            return cfg
+        legacy = db.get_meta('model_config_name')
+        return (self.config_manager.get_config_by_name(legacy)
+                if legacy else None)
+
+    def _make_config_provider(self):
+        """每次批量翻译前重读模型配置，配置保存后立即生效"""
+        def config_provider():
+            mc = self._current_model_config()
+            if not mc:
+                return None
+            return (getattr(mc, 'max_context', 8),
+                    getattr(mc, 'max_tokens', 1000),
+                    getattr(mc, 'batch_lines', 100))
+        return config_provider
+
+    def refresh_translator(self):
+        """模型配置保存后刷新当前会话的翻译器（同步方法，经 run_sync 调用）
+
+        翻译器只在打开项目时构建一次；api_key/api_base/model 变更后若不刷新，
+        运行中的会话仍持旧 key 调用 LLM（表现为配置已保存但调用失败）。
+        已有翻译器时原地更新（不打断进行中的批量任务），没有时现建。
+        """
+        if not self.db:
+            return
+        cfg = self._current_model_config()
+        if not cfg:
+            return  # 未激活模型配置：保留现状，翻译时会有明确报错
+
+        from translator import AITranslator, TranslationConfig
+        tconf = TranslationConfig(
+            api_base=cfg.api_base, api_key=cfg.api_key,
+            model=cfg.model, temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            context_lines=cfg.context_lines, timeout=cfg.timeout,
+        )
+        max_context_k = getattr(cfg, 'max_context', 8)
+        max_tokens = getattr(cfg, 'max_tokens', 1000)
+        batch_lines = getattr(cfg, 'batch_lines', 100)
+
+        if self.translator is not None:
+            self.translator.update_config(tconf)
+            if self.translation_service is not None:
+                self.translation_service.max_context_k = max_context_k
+                self.translation_service.max_tokens = max_tokens
+                self.translation_service.batch_lines = batch_lines
+            return
+
+        # 打开项目时未配置模型（或配置当时无效）：现在补齐翻译器与服务
+        from translation_service import TranslationService
+        translator = AITranslator(tconf)
+        translator.api_log_callback = self._on_api_log
+        service = TranslationService(
+            translator=translator, db=self.db, logger=self.logger,
+            max_context_k=max_context_k, max_tokens=max_tokens,
+            batch_lines=batch_lines,
+        )
+        service.config_provider = self._make_config_provider()
+        self.translator = translator
+        self.translation_service = service
+        self.logger.info('模型配置已生效，翻译器已就绪')
 
     async def close_project(self):
         loop = asyncio.get_event_loop()

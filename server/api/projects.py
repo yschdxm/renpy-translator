@@ -64,10 +64,9 @@ def _sdk_path_getter(state: AppState):
 class CreateRequest(BaseModel):
     name: str
     game_dir: str
-    model: str = ''
 
 
-def _make_create_body(state: AppState, name: str, model: str,
+def _make_create_body(state: AppState, name: str,
                       game_dir_holder: dict, cleanup_paths: list):
     """建项目任务体：game_dir_holder['dir'] 在任务内解析（可能先解压 zip）"""
     async def body(job):
@@ -121,7 +120,7 @@ def _make_create_body(state: AppState, name: str, model: str,
 
             job.check_cancelled()
             result = await creator.create(
-                name, game_dir, model,
+                name, game_dir,
                 progress=_progress,
                 confirm_official_chinese=_confirm,
                 cancel_event=job.cancel_event,
@@ -164,9 +163,8 @@ async def create_project(req: CreateRequest,
 
     job = state.jobs.create(
         'project.create', f'创建项目 {name}',
-        {'name': name, 'game_dir': req.game_dir, 'model': req.model},
-        _make_create_body(state, name, req.model,
-                          {'dir': req.game_dir}, []))
+        {'name': name, 'game_dir': req.game_dir},
+        _make_create_body(state, name, {'dir': req.game_dir}, []))
     return {'job_id': job.id}
 
 
@@ -180,7 +178,6 @@ async def _save_upload(file: UploadFile, dest: Path):
 @router.post('/create-zip')
 async def create_project_zip(file: UploadFile = File(...),
                              name: str = Form(...),
-                             model: str = Form(''),
                              state: AppState = Depends(get_state)):
     name = name.strip()
     if not name:
@@ -193,8 +190,8 @@ async def create_project_zip(file: UploadFile = File(...),
 
     job = state.jobs.create(
         'project.create', f'创建项目 {name}',
-        {'name': name, 'zip': file.filename, 'model': model},
-        _make_create_body(state, name, model,
+        {'name': name, 'zip': file.filename},
+        _make_create_body(state, name,
                           {'zip_path': str(zip_path)},
                           [zip_path]))  # 解压目录由任务体生成（带 uuid）并自行登记清理
     return {'job_id': job.id}
@@ -532,7 +529,6 @@ async def export_zip(name: str, state: AppState = Depends(get_state)):
 
 class EditRequest(BaseModel):
     new_name: str = ''
-    model: str = ''
 
 
 @router.get('')
@@ -559,8 +555,7 @@ async def project_meta(name: str, state: AppState = Depends(get_state)):
     meta = await state.run_sync(_load)
     if not meta:
         raise ApiError(404, 'PROJECT_NOT_FOUND', f'项目不存在: {name}')
-    return {'name': meta.get('name', name),
-            'model_config_name': meta.get('model_config_name', '')}
+    return {'name': meta.get('name', name)}
 
 
 @router.patch('/{name}')
@@ -590,7 +585,6 @@ async def edit_project(name: str, req: EditRequest,
         db = state.project_manager.open_project(new_name)
         if db:
             db.set_meta('name', new_name)
-            db.set_meta('model_config_name', req.model or '')
             db.set_meta('updated_at', datetime.now().isoformat())
             db.close()
 

@@ -26,6 +26,7 @@ interface ModelConfig {
   timeout: number
   max_context: number
   batch_lines: number
+  is_active?: boolean
 }
 
 const configs = ref<ModelConfig[]>([])
@@ -100,10 +101,18 @@ function openCreate() {
   formVisible.value = true
 }
 
-function openEdit(c: ModelConfig) {
+async function openEdit(c: ModelConfig) {
   Object.assign(form, c)
   formEditing.value = c.name
   formVisible.value = true
+  try {
+    // 列表里的是掩码，编辑时回显真实 key
+    const { api_key } = await api.get<{ api_key: string }>(
+      `/api/configs/${encodeURIComponent(c.name)}/key`)
+    form.api_key = api_key
+  } catch (e) {
+    toastError(message, e)
+  }
 }
 
 async function saveForm() {
@@ -125,6 +134,16 @@ async function removeConfig(c: ModelConfig) {
   try {
     await api.del(`/api/configs/${encodeURIComponent(c.name)}`)
     toastOk(message, '配置已删除')
+    await refresh()
+  } catch (e) {
+    toastError(message, e)
+  }
+}
+
+async function activateConfig(c: ModelConfig) {
+  try {
+    await api.post(`/api/configs/${encodeURIComponent(c.name)}/activate`)
+    toastOk(message, `已激活: ${c.name}`)
     await refresh()
   } catch (e) {
     toastError(message, e)
@@ -222,6 +241,7 @@ onMounted(async () => {
     <n-space align="center" style="margin-bottom: 10px">
       <h3 style="margin: 0">AI 模型</h3>
       <n-button size="small" type="primary" :render-icon="renderIcon(AddOutline)" @click="openCreate">新建配置</n-button>
+      <n-text depth="3" style="font-size: 12px">已激活的配置对所有项目全局生效，保存后立即应用</n-text>
     </n-space>
 
     <n-empty v-if="!configs.length" description="暂无模型配置" style="margin: 40px 0" />
@@ -230,10 +250,13 @@ onMounted(async () => {
       <n-space align="center" justify="space-between">
         <n-space align="center">
           <n-text strong>{{ c.name }}</n-text>
+          <n-tag v-if="c.is_active" size="small" type="success">已激活</n-tag>
           <n-tag size="small" :bordered="false">{{ c.model }}</n-tag>
           <n-text depth="3" style="font-size: 12px">{{ c.api_base }}</n-text>
         </n-space>
         <n-space>
+          <n-button v-if="!c.is_active" size="small" type="primary" secondary
+                    @click="activateConfig(c)">激活</n-button>
           <n-button size="small" @click="openEdit(c)">编辑</n-button>
           <n-popconfirm @positive-click="removeConfig(c)">
             <template #trigger>
@@ -265,7 +288,8 @@ onMounted(async () => {
           <n-input-number v-model:value="form.temperature" :step="0.05" />
         </n-form-item>
         <n-form-item label="max_tokens">
-          <n-input-number v-model:value="form.max_tokens" />
+          <n-input-number v-model:value="form.max_tokens"
+                          placeholder="单次回复的输出上限（非上下文窗口）" style="width: 100%" />
         </n-form-item>
         <n-form-item label="上下文行数">
           <n-input-number v-model:value="form.context_lines" />

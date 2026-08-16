@@ -20,7 +20,6 @@ class ProjectInfo:
     """项目摘要信息（用于列表显示）"""
     name: str
     game_dir: str
-    model_config_name: str
     total_dialogues: int = 0
     translated_dialogues: int = 0
     total_strings: int = 0
@@ -95,7 +94,6 @@ class ProjectManager:
                 projects.append(ProjectInfo(
                     name=meta.get("name", item.name),
                     game_dir=meta.get("game_dir", ""),
-                    model_config_name=meta.get("model_config_name", ""),
                     total_dialogues=dialogue_stats["total"],
                     translated_dialogues=dialogue_stats["translated"],
                     total_strings=ui_stats["total"],
@@ -111,8 +109,7 @@ class ProjectManager:
         projects.sort(key=lambda p: p.updated_at, reverse=True)
         return projects
 
-    def create_project(self, name: str, game_dir: str,
-                       model_config_name: str = "") -> ProjectDatabase:
+    def create_project(self, name: str, game_dir: str) -> ProjectDatabase:
         """创建新项目
 
         Returns:
@@ -131,7 +128,6 @@ class ProjectManager:
         # 写入元数据
         db.set_meta("name", name)
         db.set_meta("game_dir", game_dir)
-        db.set_meta("model_config_name", model_config_name)
         db.set_meta("created_at", now)
         db.set_meta("updated_at", now)
         db.set_meta("last_position", json.dumps({"index": 0, "file": "", "line": 0}))

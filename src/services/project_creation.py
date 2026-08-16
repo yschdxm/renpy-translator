@@ -7,7 +7,7 @@
 用法:
     creator = ProjectCreator(project_manager, logger, get_sdk_path)
     result = await creator.create(
-        name, game_dir, model,
+        name, game_dir,
         progress=lambda pct, text: ...,                    # 同步回调
         confirm_official_chinese=async def (file_count) -> bool,
     )
@@ -220,7 +220,7 @@ class ProjectCreator:
         # get_sdk_path(game_dir)：按游戏引擎大版本解析匹配的 SDK 路径
         self.get_sdk_path = get_sdk_path
 
-    async def create(self, name: str, game_dir: str, model: str,
+    async def create(self, name: str, game_dir: str,
                      progress, confirm_official_chinese=None,
                      cancel_event=None) -> dict:
         """执行创建。progress(pct, text) 同步回调；confirm_official_chinese
@@ -237,7 +237,7 @@ class ProjectCreator:
             progress(0.05, '正在初始化项目...')
 
             db = await _rie(
-                self.project_manager.create_project, name, game_dir, model or ''
+                self.project_manager.create_project, name, game_dir
             )
             project_dir = self.project_manager.project_dir(name)
             game_work_dir = project_dir / 'game'

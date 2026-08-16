@@ -99,6 +99,7 @@ class ConfigManager:
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
 
+            self.active_config_name = data["active"]
             return True
 
         except Exception as e:
@@ -106,7 +107,7 @@ class ConfigManager:
             return False
 
     def add_config(self, config: ModelConfig) -> bool:
-        """添加新配置"""
+        """添加新配置（尚无激活配置时自动激活新配置）"""
         configs = self.load_all_configs()
 
         # 检查是否重名
@@ -115,7 +116,8 @@ class ConfigManager:
                 return False
 
         configs.append(config)
-        return self.save_all_configs(configs)
+        active = self.active_config_name or config.name
+        return self.save_all_configs(configs, active_name=active)
 
     def update_config(self, name: str, config: ModelConfig) -> bool:
         """更新指定配置"""
@@ -150,4 +152,14 @@ class ConfigManager:
     def set_active(self, name: str) -> bool:
         """设置当前活跃的配置"""
         configs = self.load_all_configs()
+        if name and not any(c.name == name for c in configs):
+            return False
         return self.save_all_configs(configs, active_name=name)
+
+    def get_active_config(self) -> Optional[ModelConfig]:
+        """获取全局激活的模型配置（未设置/配置已删时返回 None）"""
+        configs = self.load_all_configs()  # 同时载入 active_config_name
+        for c in configs:
+            if c.name == self.active_config_name:
+                return c
+        return None
