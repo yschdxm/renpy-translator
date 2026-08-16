@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.2.2] - 2026-08-17
+
+### 修复
+
+- 安装版（Windows 打包）rpyc 反编译全失败：python-embed 的 ._pth 隔离模式下 sys.path 不含脚本目录，unrpyc 启动即崩溃（ModuleNotFoundError: decompiler），纯 rpyc 游戏无法创建项目。改为 -c 引导方式调用，手动将 unrpyc 目录插入 sys.path（42bff37）
+- 脚本位于 game/scripts/ 等子目录的游戏误报"SDK 未生成翻译模板（只有 common.rpy）"：SDK 模板镜像脚本目录结构（tl/chinese/scripts/），存在性检查由非递归 glob 改为 rglob（42bff37）
+
 ## [v0.2.1] - 2026-08-16
 
 ### 新增
