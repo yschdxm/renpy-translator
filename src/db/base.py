@@ -122,6 +122,16 @@ CREATE TABLE IF NOT EXISTS obsolete_translations (
     created_at TEXT DEFAULT ''
 );
 
+-- 批次解析失败（句数不匹配）的暂存批次，供翻译页分批人工核验
+CREATE TABLE IF NOT EXISTS failed_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_type TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    error TEXT DEFAULT '',
+    created_at TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_failed_batches_type ON failed_batches(content_type);
+
 -- 版本更新时的模糊匹配复核（微改句子的旧译文待人工确认/审计）
 CREATE TABLE IF NOT EXISTS update_review (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

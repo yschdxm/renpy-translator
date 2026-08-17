@@ -5,6 +5,7 @@ LLM 调用封装（client 生命周期、重试、错误分类）见 llm_client.
 """
 
 import json
+import difflib
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Callable
 
@@ -257,53 +258,91 @@ class AITranslator:
         translated, terms = self._parse_translation_response(raw)
         return translated, terms
 
+    # ---- 内容级校验阈值 ----
+    _MISALIGN_SIM = 0.85    # 译文与其他条目原文相似度达到该值才怀疑贴错行
+    _MISALIGN_MARGIN = 0.1  # 且需明显高于与本条原文的相似度（两条原文本身相似时不误报）
+    _SHORT_ORIG = 15        # 原文达到该长度才做长度悬殊检查（短句伸缩空间大）
+    _MIN_LEN_RATIO = 0.12   # 译文长度 < 原文 × 0.12 视为悬殊（英译中通常 0.5~0.8）
+    _MAX_LEN_RATIO = 4.0    # 译文长度 > 原文 × 4 且绝对超出 40 字符视为悬殊
+
     @staticmethod
-    def _parse_tool_response(message, expected: int) -> tuple[Optional[List[str]], List[dict]]:
+    def _parse_tool_response(message, items: List[dict]
+                             ) -> tuple[Dict[int, str], List[dict], Dict[int, str]]:
         """解析 tool calls 响应
 
         translations 是 [{id, translation}, ...]，按 id 放回位置（id 从 1 开始）。
-        数量不足/id 越界/重复 → 返回 (None, [])。
+        返回 (已放置译文 {0基索引: 译文}, 术语, 存疑原因 {0基索引: reason})。
+
+        不再整批判废：结构非法（无 tool_calls / JSON 损坏 / translations 非数组）
+        时返回 ({}, [], {})；id 越界/重复/译文为空的条目单独跳过（成为未匹配）。
+        已放置译文再做内容级校验，存疑的移出结果并记入原因，由上层暂存核验。
         """
+        expected = len(items)
         calls = getattr(message, 'tool_calls', None)
         if not calls:
-            return None, []
+            return {}, [], {}
         try:
             args = json.loads(calls[0].function.arguments)
         except (json.JSONDecodeError, TypeError, AttributeError):
-            return None, []
+            return {}, [], {}
 
         raw = args.get('translations')
         if not isinstance(raw, list):
-            return None, []
+            return {}, [], {}
 
-        # 按 id 对齐（兼容模型乱序返回）
-        result = [None] * expected
-        seen = set()
+        # 按 id 对齐（兼容模型乱序返回）；无法落位的条目跳过而非整批判废
+        placed: Dict[int, str] = {}
         for entry in raw:
             if not isinstance(entry, dict):
-                return None, []
+                continue
             idx = entry.get('id')
             text = entry.get('translation')
-            if not isinstance(idx, int) or not (1 <= idx <= expected) or idx in seen:
-                return None, []
-            seen.add(idx)
-            # 译文必须是非空字符串：模型返回 null/数字/空串时若静默填 ''，
-            # 能通过下面的全覆盖检查而不触发重试，下游 if not text: continue
-            # 又会跳过，导致该条永远漏译；故与其他校验失败一样返回 (None, []) 触发重试
+            if not isinstance(idx, int) or not (1 <= idx <= expected) \
+                    or (idx - 1) in placed:
+                continue
+            # 译文必须是非空字符串，否则该条静默漏译
             if not isinstance(text, str) or not text:
-                return None, []
-            result[idx - 1] = text
+                continue
+            placed[idx - 1] = text
 
-        # 必须覆盖全部 id
-        if len(seen) != expected or any(r is None for r in result):
-            return None, []
+        suspicious = AITranslator._content_sanity_check(items, placed)
+        for idx in suspicious:
+            placed.pop(idx, None)
 
         terms = []
         for t in args.get('terms') or []:
             if isinstance(t, dict) and t.get('en_term') and t.get('cn_term'):
                 terms.append({'en_term': str(t['en_term']), 'cn_term': str(t['cn_term'])})
 
-        return result, terms
+        return placed, terms, suspicious
+
+    @classmethod
+    def _content_sanity_check(cls, items: List[dict],
+                              placed: Dict[int, str]) -> Dict[int, str]:
+        """内容级校验：贴错行与长度悬殊，返回 {0基索引: 原因}"""
+        suspicious: Dict[int, str] = {}
+        originals = [it.get('original_text', '') for it in items]
+        for idx, text in placed.items():
+            own = originals[idx]
+            # 贴错行：译文与另一条原文高度相似，且明显高于与本条原文的相似度
+            # （若两条原文本身相似，本条相似度同样高，不会误报）
+            own_sim = difflib.SequenceMatcher(None, text, own).ratio()
+            for j, other in enumerate(originals):
+                if j == idx or not other:
+                    continue
+                sim = difflib.SequenceMatcher(None, text, other).ratio()
+                if sim >= cls._MISALIGN_SIM and sim > own_sim + cls._MISALIGN_MARGIN:
+                    suspicious[idx] = f'疑似贴错行：与第 {j + 1} 条原文高度相似'
+                    break
+            if idx in suspicious:
+                continue
+            # 长度悬殊：漏译大半或多句合并进一条的典型信号
+            lo, lt = len(own), len(text)
+            if lo >= cls._SHORT_ORIG and (
+                    lt < lo * cls._MIN_LEN_RATIO
+                    or (lt > lo * cls._MAX_LEN_RATIO and lt - lo > 40)):
+                suspicious[idx] = f'译文长度与原文悬殊（{lt} vs {lo} 字符）'
+        return suspicious
 
     def translate_batch(self, items: List[dict], content_type: str = 'dialogue',
                         glossary_text: str = "", character_profiles: str = "",
@@ -311,10 +350,12 @@ class AITranslator:
                         style_guide: str = "",
                         context_window_tokens: Optional[int] = None,
                         debug: bool = False) -> tuple[Optional[List[str]], List[dict]]:
-        """批次翻译多句文本，返回 (译文列表, 术语列表)
+        """批次翻译多句文本
 
-        items: [{'original_text': ..., 'character': ...}]，译文列表与之按顺序一一对应。
-        解析失败（句数不匹配）会自动重试，重试耗尽仍失败时返回 (None, [])。
+        items: [{'original_text': ..., 'character': ...}]
+        返回 (已匹配译文 {0基索引: 译文}, 术语列表, 未译出原因 {0基索引: reason})。
+        解析不完整（句数不匹配）会自动重试并按 id 合并多次尝试的结果；
+        重试耗尽仍缺失或内容校验存疑的条目不进 merged，原因进 fail_reasons。
         """
         if not self.client:
             raise ValueError("请先配置API Key")
@@ -389,8 +430,13 @@ class AITranslator:
             },
         }]
 
-        # 解析失败（句数不匹配）也重试：模型偶发漏译/多译，重新请求通常能恢复
-        translated_list, terms = None, []
+        # 解析失败（句数不匹配）也重试：模型偶发漏译/多译，重新请求通常能恢复；
+        # 多次尝试按 id 合并（同一句以最近一次返回为准，与旧版"成功的整批结果生效"
+        # 语义一致），最后仍缺/存疑的条目随原因一并返回
+        merged: Dict[int, str] = {}
+        terms_all: List[dict] = []
+        seen_terms: set = set()
+        suspicious_all: Dict[int, str] = {}
         for attempt in range(1, self.MAX_RETRIES + 1):
             message = self._call_api(
                 messages=[
@@ -406,28 +452,38 @@ class AITranslator:
                 return_message=True,
                 task_type=content_type,
             )
-            translated_list, terms = self._parse_tool_response(message, n)
-            if translated_list is not None:
+            placed, terms, suspicious = self._parse_tool_response(message, items)
+            merged.update(placed)
+            for idx in placed:
+                suspicious_all.pop(idx, None)  # 后续尝试正常译出的不再算存疑
+            suspicious_all.update(suspicious)
+            for t in terms:
+                if t['en_term'] not in seen_terms:
+                    seen_terms.add(t['en_term'])
+                    terms_all.append(t)
+            if len(merged) == n:
                 break
             if attempt < self.MAX_RETRIES:
-                print(f'[批次翻译] 解析失败（句数不匹配），进行第 {attempt + 1}/{self.MAX_RETRIES} 次尝试...')
+                print(f'[批次翻译] {n - len(merged)}/{n} 句未匹配，'
+                      f'进行第 {attempt + 1}/{self.MAX_RETRIES} 次尝试...')
 
-        if translated_list is not None:
-            # 兜底：剥掉模型误抄进译文开头的说话人标记（[角色]/【角色】/角色:）
-            translated_list = [
-                _strip_speaker_prefix(text, it.get('character', ''))
-                for it, text in zip(items, translated_list)
-            ]
+        # 兜底：剥掉模型误抄进译文开头的说话人标记（[角色]/【角色】/角色:）
+        for idx, text in merged.items():
+            merged[idx] = _strip_speaker_prefix(text, items[idx].get('character', ''))
+
+        fail_reasons = {i: suspicious_all.get(i, '模型未返回该句译文')
+                        for i in range(n) if i not in merged}
 
         if debug:
-            if translated_list is None:
-                print(f'[批次翻译] 解析失败（句数不匹配），已重试 {self.MAX_RETRIES} 次仍失败')
+            if fail_reasons:
+                print(f'[批次翻译] {len(merged)}/{n} 句成功，'
+                      f'{len(fail_reasons)} 句未译出（已重试 {self.MAX_RETRIES} 次）')
             else:
-                print(f'[批次翻译] 成功解析 {len(translated_list)} 句')
-            if terms:
-                print(f'[批次翻译] 术语: {terms}')
+                print(f'[批次翻译] 成功解析 {n} 句')
+            if terms_all:
+                print(f'[批次翻译] 术语: {terms_all}')
 
-        return translated_list, terms
+        return merged, terms_all, fail_reasons
 
     def analyze_text(self, prompt: str, max_tokens: int = None) -> str:
         """分析文本（不使用翻译系统提示词）"""

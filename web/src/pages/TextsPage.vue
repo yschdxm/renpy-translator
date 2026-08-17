@@ -6,9 +6,10 @@ import {
   NText, NInputGroup, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, DataTableSortState } from 'naive-ui'
-import { BookOutline, CodeSlashOutline, LanguageOutline, LocateOutline, RefreshOutline, SparklesOutline } from '@vicons/ionicons5'
+import { BookOutline, CodeSlashOutline, LanguageOutline, LocateOutline, RefreshOutline, SparklesOutline, WarningOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
+import FailedBatchesDialog from '../components/FailedBatchesDialog.vue'
 import { useInlineEdit } from '../composables/useInlineEdit'
 import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
@@ -38,6 +39,8 @@ const query = reactive({
 })
 const characters = ref<Array<{ label: string; value: string }>>([])
 const translatingIds = ref<Set<number>>(new Set())
+const failedBatchCount = ref(0)
+const failedDialogVisible = ref(false)
 
 const isDialogue = computed(() => props.contentType === 'dialogue')
 const title = computed(() => (isDialogue.value ? '对话翻译' : '字符串翻译'))
@@ -55,11 +58,20 @@ async function load() {
       `/api/current/texts/${props.contentType}?${params}`)
     rows.value = data.rows
     total.value = data.total
+    await loadFailedCount()
   } catch (e) {
     toastError(message, e)
   } finally {
     loading.value = false
   }
+}
+
+async function loadFailedCount() {
+  try {
+    const data = await api.get<{ count: number }>(
+      `/api/current/texts/${props.contentType}/failed-batches`)
+    failedBatchCount.value = data.count
+  } catch { /* 计数失败不挡主流程 */ }
 }
 
 async function loadCharacters() {
@@ -137,18 +149,23 @@ async function translateOne(row: Row) {
   }
 }
 
-// ---- 批量翻译（任务）：终态后刷新表格与统计 ----
+// ---- 批量翻译（任务）：终态后刷新表格与统计；有失败条目时自动打开核验对话框 ----
+async function onTranslateJobDone() {
+  await load()
+  if (failedBatchCount.value > 0) failedDialogVisible.value = true
+}
+
 async function translateAll() {
   await runJob(
     () => api.post(`/api/current/texts/${props.contentType}/translate-all`),
-    () => load(),
+    onTranslateJobDone,
     { emptyMessage: '没有待翻译的内容' })
 }
 
 async function translatePage() {
   await runJob(
     () => api.post(`/api/current/texts/${props.contentType}/translate-page`, { ...query }),
-    () => load(),
+    onTranslateJobDone,
     { emptyMessage: '本页没有待翻译的内容' })
 }
 
@@ -277,6 +294,10 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
       <h2 style="margin: 0">{{ title }}</h2>
       <n-button size="small" type="primary" :render-icon="renderIcon(LanguageOutline)" @click="translateAll">全部翻译</n-button>
       <n-button size="small" @click="translatePage">翻译本页</n-button>
+      <n-button
+        v-if="failedBatchCount > 0" size="small" type="warning"
+        :render-icon="renderIcon(WarningOutline)" @click="failedDialogVisible = true"
+      >失败条目 ({{ failedBatchCount }})</n-button>
       <n-button v-if="!isDialogue" size="small" :render-icon="renderIcon(LocateOutline)" @click="rebuildHints">重建上下文</n-button>
       <n-button v-if="!isDialogue" size="small" type="warning" :render-icon="renderIcon(CodeSlashOutline)" @click="extractEmbedded">提取内嵌文本</n-button>
       <n-button v-if="isDialogue" size="small" :render-icon="renderIcon(BookOutline)" @click="openStyleGuide">风格指南</n-button>
@@ -339,6 +360,12 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
         </div>
       </div>
     </n-modal>
+
+    <!-- 失败批次核验对话框 -->
+    <failed-batches-dialog
+      v-model:show="failedDialogVisible" :content-type="contentType"
+      @changed="load"
+    />
 
     <!-- 风格指南对话框 -->
     <n-modal v-model:show="guideVisible" preset="card" title="翻译风格指南" style="width: 720px">

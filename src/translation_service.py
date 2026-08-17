@@ -169,11 +169,14 @@ class TranslationService:
 
         return self.group_into_batches(items, glossary_tokens, profile_tokens)
 
-    async def translate_batch(self, items: list, content_type: str) -> dict:
+    async def translate_batch(self, items: list, content_type: str,
+                              stash_on_failure: bool = True) -> dict:
         """批次翻译一组条目（一次 API 调用），返回 {item_id: translated}
 
-        解析失败（句数不匹配）或重试耗尽时整批记失败返回空 dict，
-        由调用方继续下一批；FatalAPIError 原样上抛。
+        能匹配的译文直接入库；未匹配/存疑的条目在 stash_on_failure=True 时
+        逐条暂存到 failed_batches 表（翻译页可重试/单翻/手动），False 时仅
+        从返回 dict 中缺席（失败条目重试任务自己管理暂存，避免重复入库）。
+        FatalAPIError 原样上抛。
         """
         if not items:
             return {}
@@ -203,7 +206,7 @@ class TranslationService:
 
         async with self._semaphore:
             try:
-                translated_list, terms = await loop.run_in_executor(
+                translated_map, terms, fail_reasons = await loop.run_in_executor(
                     self._executor,
                     lambda: self.translator.translate_batch(
                         items,
@@ -222,14 +225,11 @@ class TranslationService:
                 # 重试耗尽：向上抛出，由面板中断整个批量任务（不做单句回退）
                 raise RuntimeError(f"批次翻译失败（{len(items)} 条，已重试 {self.translator.MAX_RETRIES} 次）: {e}") from e
 
-        if translated_list is None:
-            # 解析失败（句数不匹配）：向上抛出，由面板中断整个批量任务（不做单句回退）
-            raise RuntimeError(f"批次解析失败（句数不匹配），{len(items)} 条")
-
-        # 逐句写库 + 术语入库
+        # 逐句写库 + 术语入库 + 未译出条目暂存
         def _save_all():
             saved = {}
-            for it, text in zip(items, translated_list):
+            for i, it in enumerate(items):
+                text = translated_map.get(i)
                 if not text:
                     continue
                 if content_type == 'ui':
@@ -242,9 +242,25 @@ class TranslationService:
                     t['term_type'] = 'other'
                     t['source'] = 'ai'
                 self.db.add_glossary_batch(terms)
-            return saved
+            failed_items = [
+                {'id': it['id'],
+                 'original_text': it.get('original_text', ''),
+                 'character': it.get('character', ''),
+                 'reason': fail_reasons.get(i, '模型未返回该句译文')}
+                for i, it in enumerate(items) if not translated_map.get(i)
+            ]
+            if failed_items and stash_on_failure:
+                self.db.add_failed_batch(
+                    content_type, failed_items,
+                    f'批次内 {len(failed_items)}/{len(items)} 条未译出')
+            return saved, len(failed_items)
 
-        results = await loop.run_in_executor(None, _save_all)
+        results, n_failed = await loop.run_in_executor(None, _save_all)
+        if n_failed:
+            self.logger.warning(
+                f'{n_failed} 条未译出已暂存，'
+                '可在翻译页「失败条目」中重试/单翻/手动',
+                panel=content_type)
         self.logger.info(f"批次翻译完成: {len(results)}/{len(items)} 条", panel=content_type)
         return results
 

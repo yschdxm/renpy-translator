@@ -6,6 +6,7 @@
 - glossary_repo.py glossary 表
 - embedded_repo.py embedded_candidates 表
 - update_repo.py   obsolete/update_review 表 + JSON 导出
+- failed_repo.py   failed_batches 表（批次解析失败暂存）
 
 公共 API 与拆分前 src/database.py 的 ProjectDatabase 完全一致；
 __init__ 只定义在 Base（MRO 首位），各 mixin 直接使用 self._conn/_lock。
@@ -17,10 +18,11 @@ from .character_repo import CharacterRepo
 from .glossary_repo import GlossaryRepo
 from .embedded_repo import EmbeddedRepo
 from .update_repo import UpdateRepo
+from .failed_repo import FailedRepo
 
 
 class ProjectDatabase(Base, ContentRepo, CharacterRepo, GlossaryRepo,
-                      EmbeddedRepo, UpdateRepo):
+                      EmbeddedRepo, UpdateRepo, FailedRepo):
     """项目 SQLite 数据库（多继承组合，公共 API 不变）"""
 
 
