@@ -72,7 +72,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p staging/tools
-          curl -sL "https://github.com/CensoredUsername/unrpyc/archive/refs/tags/v${UNRPYC_VERSION}.zip" -o /tmp/unrpyc.zip
+          # -f 让 4xx/5xx 直接失败；--retry-all-errors 覆盖 codeload 偶发的 429 限流
+          curl -fsL --retry 5 --retry-delay 10 --retry-all-errors \
+            "https://github.com/CensoredUsername/unrpyc/archive/refs/tags/v${UNRPYC_VERSION}.zip" -o /tmp/unrpyc.zip
           python -m zipfile -e /tmp/unrpyc.zip staging/tools/
           mv "staging/tools/unrpyc-${UNRPYC_VERSION}" staging/tools/unrpyc
 
@@ -80,7 +82,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          curl -sL "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip" -o /tmp/pyembed.zip
+          curl -fsL --retry 5 --retry-delay 10 --retry-all-errors \
+            "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip" -o /tmp/pyembed.zip
           mkdir -p staging/tools/python-embed
           python -m zipfile -e /tmp/pyembed.zip staging/tools/python-embed/
 
@@ -199,7 +202,8 @@ jobs:
           printf '#!/bin/sh\nDIR="$(dirname "$(readlink -f "$0")")"\nexec "$DIR/usr/bin/renpy-translator" "$@"\n' > AppDir/AppRun
           chmod +x AppDir/AppRun
           TOOL_ARCH=$(uname -m)  # x86_64 或 aarch64
-          curl -sL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${TOOL_ARCH}.AppImage" -o /tmp/appimagetool
+          curl -fsL --retry 5 --retry-delay 10 --retry-all-errors \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${TOOL_ARCH}.AppImage" -o /tmp/appimagetool
           chmod +x /tmp/appimagetool
           /tmp/appimagetool --appimage-extract-and-run AppDir \
             "dist/renpy-translator-${VERSION}-linux-${TOOL_ARCH}.AppImage"
