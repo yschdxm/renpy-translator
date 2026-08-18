@@ -27,9 +27,13 @@ async def export_info(state: AppState = Depends(require_project)):
 
 @router.post('/game')
 async def export_game(state: AppState = Depends(require_project)):
-    d = await state.db_call(state.db.get_dialogue_count)
-    if d['translated'] == 0:
-        raise ApiError(409, 'NOTHING_TO_EXPORT', '没有已翻译的内容可导出')
+    # 未翻译/翻译不完全也允许导出（未译条目保持原文），由任务日志与前端提醒
+    counts = {
+        'dialogue': await state.db_call(state.db.get_dialogue_count),
+        'ui': await state.db_call(state.db.get_ui_text_count),
+        'names': await state.db_call(state.db.get_char_dict_count),
+    }
+    untranslated = {k: v['total'] - v['translated'] for k, v in counts.items()}
 
     project_dir = state.project_manager.project_dir(state.current_project)
     # 引擎目录在项目根的 game/ 子目录下，版本探测必须基于它
@@ -53,6 +57,13 @@ async def export_game(state: AppState = Depends(require_project)):
         from .projects import _exports_dir
         from ..jobs import JobCancelled
         exporter = GameExporter(state.project_manager, state.db, state.logger)
+
+        n_left = sum(untranslated.values())
+        if n_left:
+            job.emit_log(
+                f'提醒：还有 {n_left} 条未翻译'
+                f'（对话 {untranslated["dialogue"]} / 字符串 {untranslated["ui"]}'
+                f' / 人名 {untranslated["names"]}），导出包中这些内容将保持原文')
 
         # 导出组装在临时目录完成（与导入/导出项目包一致），
         # 不再在项目下留 output/ 目录；最终产物只有 zip 包

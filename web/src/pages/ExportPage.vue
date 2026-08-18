@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /** 导出游戏页：统计 + 一键导出（任务进度走全局对话框） */
-import { onMounted, ref } from 'vue'
-import { NButton, NCard, NSpace, NText, useMessage } from 'naive-ui'
+import { computed, onMounted, ref } from 'vue'
+import { NButton, NCard, NPopconfirm, NSpace, NText, useMessage } from 'naive-ui'
 import { FolderOpenOutline, PlayOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, toastError } from '../api/client'
 import { renderIcon } from '../components/icons'
@@ -24,6 +24,10 @@ interface ExportInfo {
 }
 
 const info = ref<ExportInfo | null>(null)
+
+/** 未翻译条数（>0 时导出前弹确认提醒） */
+const untranslated = computed(() =>
+  info.value ? info.value.total - info.value.translated : 0)
 
 async function load() {
   try {
@@ -58,7 +62,16 @@ onMounted(load)
   <div>
     <n-space align="center" style="margin-bottom: 12px">
       <h2 style="margin: 0">导出游戏</h2>
-      <n-button size="small" type="primary" :render-icon="renderIcon(PlayOutline)" @click="startExport">开始导出</n-button>
+      <n-popconfirm v-if="untranslated > 0" @positive-click="startExport">
+        <template #trigger>
+          <n-button size="small" type="primary" :render-icon="renderIcon(PlayOutline)">开始导出</n-button>
+        </template>
+        还有 {{ untranslated }} 条未翻译，导出包中这些内容将保持原文。确定导出？
+      </n-popconfirm>
+      <n-button
+        v-else size="small" type="primary"
+        :render-icon="renderIcon(PlayOutline)" @click="startExport"
+      >开始导出</n-button>
       <n-button size="small" quaternary :render-icon="renderIcon(RefreshOutline)" @click="load">刷新</n-button>
       <n-button v-if="info" size="small" :render-icon="renderIcon(FolderOpenOutline)" @click="revealExports">
         打开导出目录
