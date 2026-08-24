@@ -175,6 +175,26 @@ class ExportHealer:
                 log(f"  无法修复的报错（非翻译文件）: {e['file']}:{e['line']} {e['msg']}")
             return 'fail'
 
+        # 保留的反编译文件（语言按钮/内嵌译文载体）编译报错：不是内嵌
+        # 标记问题——按文件放弃（记入 dropped_decompiled_files）并重新导出，
+        # 该文件回退原始 rpyc，只丢它承载的切换按钮/内嵌译文
+        kept_meta = await loop.run_in_executor(
+            None, self.db.get_meta, 'kept_decompiled_files')
+        kept = set(json.loads(kept_meta or '[]'))
+        broken = sorted({e['file'] for e in game_errors} & kept)
+        if broken:
+            dropped_meta = await loop.run_in_executor(
+                None, self.db.get_meta, 'dropped_decompiled_files')
+            dropped = sorted(set(json.loads(dropped_meta or '[]'))
+                             | set(broken))
+            await loop.run_in_executor(
+                None, self.db.set_meta, 'dropped_decompiled_files',
+                json.dumps(dropped))
+            for f in broken:
+                log(f'  保留的反编译文件 {f} 编译报错，放弃该文件'
+                    '（回退原始 rpyc）并重新导出')
+            return 'reexport'
+
         # tl 报错不等于译文问题：内嵌标记的字符串导出后也会在 tl 中生成
         # old/new 条目，需对照内嵌标记库区分根因
         embedded_rows = []

@@ -149,16 +149,34 @@ class GameExporter:
             decompiled_meta = self.db.get_meta('decompiled_rpy_files')
             if decompiled_meta:
                 try:
+                    decompiled_rels = _json.loads(decompiled_meta)
+                    # 例外保留（其余反编译产物照删）：
+                    # 1. 可注入语言按钮的反编译 screens.rpy（C2）
+                    # 2. 含内嵌标记 _() 的反编译文件——删掉它们游戏就跑原始
+                    #    rpyc，_() 查找不存在，内嵌译文永远不生效
+                    # 保留的文件由导出后编译校验兜底：报错则按文件放弃并重导出
+                    keep = self._pick_kept_decompiled(export_dir, decompiled_rels)
+                    self.db.set_meta('kept_decompiled_files',
+                                     _json.dumps(keep))
+
                     removed = 0
-                    for rel in _json.loads(decompiled_meta):
+                    for rel in decompiled_rels:
+                        if rel in keep:
+                            continue
                         target = export_dir / rel
                         if target.exists():
                             target.unlink()
                             removed += 1
                     if removed:
                         log(f'已移除 {removed} 个反编译产生的 .rpy（游戏将运行原始 .rpyc）')
+                    if keep:
+                        log(f'保留 {len(keep)} 个反编译文件'
+                            f'（语言切换/内嵌译文载体，编译校验兜底）: '
+                            f'{", ".join(keep)}')
                 except Exception as e:
                     log(f'清理反编译文件失败: {e}')
+            else:
+                self.db.set_meta('kept_decompiled_files', '[]')
 
             # 构建翻译字典
             progress(0.55, '正在构建翻译字典...')
@@ -187,6 +205,9 @@ class GameExporter:
             progress(0.9, '正在添加语言选择界面...')
             log('添加语言选择界面...')
             self._add_language_selector(export_dir, log)
+
+            # 默认以中文启动（rpyc-only 游戏没有切换按钮也无需手动切换）
+            self._set_default_language(export_dir, log)
 
             # 添加中文字体
             progress(0.95, '正在添加中文字体支持...')
@@ -396,47 +417,174 @@ class GameExporter:
         out.write_text('\n'.join(lines), encoding='utf-8')
         return len(assigns)
 
+    _ANCHOR_NULL_HEIGHT_RE = re.compile(r'^\s*null height\b')
+    _ANCHOR_HBOX_RE = re.compile(r'^\s*hbox:\s*(?:#.*)?$')
+    _SCREEN_PREFERENCES_RE = re.compile(r'^screen\s+preferences\s*\(')
+
+    def _screens_candidates(self, export_dir: Path) -> list:
+        """screens.rpy 候选路径：常见位置优先，game/** 下其余同名文件兜底
+        （排除 tl/ 翻译目录）"""
+        game = export_dir / 'game'
+        candidates = [game / 'screens.rpy', game / 'scripts' / 'screens.rpy']
+        if game.exists():
+            candidates += sorted(
+                p for p in game.rglob('screens.rpy')
+                if 'tl' not in p.relative_to(game).parts
+                and p not in candidates)
+        return [p for p in candidates if p.is_file()]
+
+    def _find_injectable_screens(self, export_dir: Path):
+        """找可注入语言按钮的 screens.rpy。
+
+        返回 (path, lines, insert_index)：lines 为 None 表示该文件已注入过；
+        所有候选都不可注入（无 screen preferences 块或无锚点）返回 None。
+        """
+        for path in self._screens_candidates(export_dir):
+            try:
+                lines = path.read_text(encoding='utf-8').split('\n')
+            except OSError:
+                continue
+            if any('Language("chinese")' in l for l in lines):
+                return path, None, None
+
+            # 定位 screen preferences 块：顶级语句到下一个顶级语句之间
+            start = next((i for i, l in enumerate(lines)
+                          if self._SCREEN_PREFERENCES_RE.match(l)), None)
+            if start is None:
+                continue
+            end = next(
+                (i for i in range(start + 1, len(lines))
+                 if lines[i] and not lines[i].startswith((' ', '\t', '#'))),
+                len(lines))
+            block = lines[start:end]
+
+            # 语义锚点：模板里 radio/check 与 slider 两组设置之间的间隔
+            anchor = next((i for i, l in enumerate(block)
+                           if self._ANCHOR_NULL_HEIGHT_RE.match(l)
+                           and 'pref_spacing' in l), None)
+            if anchor is None:
+                anchor = next(
+                    (i for i, l in enumerate(block)
+                     if self._ANCHOR_HBOX_RE.match(l)
+                     and any('slider' in b and 'style_prefix' in b
+                             for b in block[i + 1:i + 4])), None)
+            if anchor is None:
+                continue
+            return path, lines, start + anchor
+        return None
+
+    def _pick_kept_decompiled(self, export_dir: Path,
+                              decompiled_rels: list) -> list:
+        """从反编译产物中挑出必须随导出保留的文件，返回相对路径列表。
+
+        保留两类：
+        - 可注入语言按钮的 screens.rpy（rpyc-only 游戏的切换入口，C2）
+        - 含内嵌标记 _() 的文件——删除后游戏跑原始 rpyc，_() 查找不存在，
+          内嵌译文全部失效
+
+        dropped_decompiled_files 记录被自愈判定编译失败而放弃的文件，
+        永久排除。保留的文件由导出后编译校验兜底。
+        """
+        rels_set = set(decompiled_rels)
+        dropped = set(_json.loads(
+            self.db.get_meta('dropped_decompiled_files') or '[]'))
+
+        keep = set()
+
+        found = self._find_injectable_screens(export_dir)
+        if found and found[1] is not None:
+            rel = found[0].relative_to(export_dir).as_posix()
+            if rel in rels_set:
+                keep.add(rel)
+
+        # 内嵌候选的 rel_file 以 game/game/ 为基准（resolve_source_root），
+        # 反编译清单以项目 game/ 为基准，差一层 'game/' 前缀
+        for row in self.db.get_marked_embedded():
+            rel = row['rel_file']
+            if not rel.startswith('game/'):
+                rel = 'game/' + rel
+            if rel in rels_set:
+                keep.add(rel)
+
+        return sorted(keep - dropped)
+
     def _add_language_selector(self, export_dir: Path, log):
-        """添加语言选择界面"""
-        possible = [
-            export_dir / 'game' / 'scripts' / 'screens.rpy',
-            export_dir / 'game' / 'screens.rpy',
-        ]
+        """添加语言选择界面。
 
-        source = None
-        for p in possible:
-            if p.exists():
-                source = p
-                break
-
-        if not source:
-            log('未找到 screens.rpy，跳过语言选择')
+        结构化注入：定位 screen preferences 块，在块内找语义锚点
+        （radio/check 与 slider 两组设置之间的 null height 间隔，
+        或 slider hbox 本身），继承锚点缩进插入。比整行精确匹配
+        耐模板改动；找不到可注入目标时响亮告警。
+        """
+        found = self._find_injectable_screens(export_dir)
+        if found is None:
+            log('警告：未找到可注入的 screen preferences，'
+                '跳过语言切换按钮（游戏将以默认语言启动）')
             return
 
-        with open(source, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        if 'Language("chinese")' in content:
+        source, lines, insert_at = found
+        if lines is None:
             log('语言选择已存在')
             return
 
-        target = '            null height (4 * gui.pref_spacing)'
-        if target not in content:
-            log('未找到插入位置')
-            return
-
-        block = '''            vbox:
-                label _("Language")
-                textbutton "English" action Language(None)
-                textbutton "中文" action Language("chinese")
-
-'''
-        content = content.replace(target, block + target)
+        anchor_line = lines[insert_at]
+        indent = anchor_line[:len(anchor_line) - len(anchor_line.lstrip())]
+        insert = [
+            f'{indent}vbox:',
+            f'{indent}    label _("Language")',
+            f'{indent}    textbutton "English" action Language(None)',
+            f'{indent}    textbutton "中文" action Language("chinese")',
+            '',
+        ]
+        lines[insert_at:insert_at] = insert
 
         with open(source, 'w', encoding='utf-8') as f:
-            f.write(content)
+            f.write('\n'.join(lines))
 
-        log('已添加语言选择')
+        log(f'已添加语言选择（{source.relative_to(export_dir)}）')
+
+    def _set_default_language(self, export_dir: Path, log):
+        """默认以中文启动（追加到已有的 tl/chinese 骨架文件，不新增文件）。
+
+        仅首次生效：玩家之后用 Language 按钮切换的选择会被保留
+        （persistent 标记记录是否已应用过默认值；Language(None) 会把
+        _preferences.language 重置为 None，不能仅靠它判断是否首次）。
+        """
+        tl_dir = export_dir / 'game' / 'tl' / 'chinese'
+        if not tl_dir.exists():
+            log('警告：没有 tl/chinese 目录，跳过默认语言设置')
+            return
+
+        files = list(tl_dir.rglob('*.rpy'))
+        if not files:
+            log('警告：tl/chinese 下没有骨架文件，跳过默认语言设置')
+            return
+
+        marker = '_rt_default_lang'
+        for p in files:
+            try:
+                if marker in p.read_text(encoding='utf-8', errors='ignore'):
+                    log('默认语言已设置')
+                    return
+            except OSError:
+                pass
+
+        target = next(
+            (p for p in files if p.name == 'common.rpy'),
+            next((p for p in files if p.name == 'screens.rpy'), files[0]))
+        block = (
+            '\n\n# 默认以中文启动（导出工具自动生成）。仅首次生效，\n'
+            '# 玩家之后在设置界面切换的语言选择会被保留。\n'
+            'init -10 python:\n'
+            f'    if not getattr(persistent, "{marker}", False):\n'
+            f'        persistent.{marker} = True\n'
+            '        if _preferences.language is None:\n'
+            '            _preferences.language = "chinese"\n'
+        )
+        with open(target, 'a', encoding='utf-8') as f:
+            f.write(block)
+
+        log(f'已设置默认中文启动（追加到 {target.name}）')
 
     def _add_chinese_font(self, export_dir: Path, log):
         """添加中文字体支持"""
@@ -496,24 +644,40 @@ class GameExporter:
 
         # 写入字体映射：游戏里写死的字体引用（如 font "DejaVuSans.ttf"）不走
         # gui.text_font，中文会渲染成方块。font_replacement_map 在字体加载层
-        # 全局替换 Ren'Py 内置 DejaVuSans 系列，覆盖所有写死的引用。
+        # 全局替换，覆盖所有写死的引用。游戏自带字体（通常不含 CJK 字形，
+        # 不映射中文直接不显示）按 相对路径+文件名 两种写法一起映射。
         tl_chinese_dir = export_dir / 'game' / 'tl' / 'chinese'
         if tl_chinese_dir.exists():
+            font_keys = {
+                'DejaVuSans.ttf', 'DejaVuSans-Bold.ttf',
+                'DejaVuSans-Oblique.ttf', 'DejaVuSans-BoldOblique.ttf',
+            }
+            game_dir = export_dir / 'game'
+            own_fonts = {f'fonts/{f.name}' for f in font_files}
+            for f in sorted(game_dir.rglob('*')):
+                if f.suffix.lower() not in ('.ttf', '.ttc', '.otf'):
+                    continue
+                rel = f.relative_to(game_dir).as_posix()
+                if rel in own_fonts or rel.startswith('tl/'):
+                    continue
+                font_keys.add(rel)    # 代码里写相对路径的引用
+                font_keys.add(f.name)  # 只写文件名的引用
+
             override_file = tl_chinese_dir / 'font_override.rpy'
             lines = [
                 '# 中文字体映射（导出工具自动生成）',
-                "# 将 Ren'Py 内置 DejaVuSans 系列映射到中文字体，",
-                '# 覆盖游戏中写死 font "DejaVuSans.ttf" 等引用的样式。',
+                "# 将 Ren'Py 内置 DejaVuSans 系列与游戏自带字体映射到中文字体，",
+                '# 游戏自带字体通常不含 CJK 字形，不映射中文会渲染成空白。',
                 'init python:',
             ]
-            for base in ('DejaVuSans.ttf', 'DejaVuSans-Bold.ttf',
-                         'DejaVuSans-Oblique.ttf', 'DejaVuSans-BoldOblique.ttf'):
+            for key in sorted(font_keys):
                 for bold in (False, True):
                     for italic in (False, True):
                         lines.append(
-                            f'    config.font_replacement_map["{base}", {bold}, {italic}] = '
+                            f'    config.font_replacement_map["{key}", {bold}, {italic}] = '
                             f'("{font_path}", False, False)'
                         )
             with open(override_file, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines) + '\n')
-            log(f'已写入字体映射: tl/chinese/{override_file.name}')
+            log(f'已写入字体映射: tl/chinese/{override_file.name}'
+                f'（{len(font_keys)} 个字体引用）')

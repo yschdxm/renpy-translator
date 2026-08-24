@@ -286,6 +286,7 @@ class AIScreener:
                 '本批候选（JSON 数组）：\n' + json.dumps(items, ensure_ascii=False)},
         ]
 
+        accepted = {}  # 累计已受理的判决 {候选索引: (keep, reason)}
         for round_no in range(1, self.MAX_ROUNDS + 1):
             self._check_cancel()
             if progress is not None:
@@ -299,11 +300,43 @@ class AIScreener:
             )
 
             if message.tool_calls:
-                # submit_verdicts 优先：提取判决直接返回
-                for tc in message.tool_calls:
-                    if tc.function.name == 'submit_verdicts':
-                        return self._parse_verdict_args(
-                            tc.function.arguments, id_map)
+                # submit_verdicts 优先：提取判决
+                submit = next((tc for tc in message.tool_calls
+                               if tc.function.name == 'submit_verdicts'), None)
+                if submit is not None:
+                    err = None
+                    try:
+                        accepted.update(self._parse_verdict_args(
+                            submit.function.arguments, id_map))
+                    except ValueError as e:
+                        err = str(e)
+                    missing = [n for n, idx in id_map.items()
+                               if idx not in accepted]
+                    if not missing:
+                        return accepted
+                    # 判决不全/参数损坏：不抛错，回喂受理情况并追问补齐
+                    self._log(f'精审第 {round_no} 轮判决不全'
+                              + (f'（{err}）' if err else '')
+                              + f'，缺 {len(missing)} 条，追问补齐')
+                    messages.append(message)
+                    for tc in message.tool_calls:
+                        if tc is submit:
+                            content = (
+                                f'已受理 {len(accepted)}/{len(id_map)} 条判决。'
+                                + (f'注意：上次提交参数有误（{err}）。'
+                                   if err else '')
+                                + f'还缺 id {missing} 的判决，请再次调用 '
+                                  'submit_verdicts 补齐（只需提交缺失的 id）。')
+                        else:
+                            # 同一条 message 的其他工具调用必须有响应，
+                            # 否则下一轮请求会被 API 拒绝
+                            content = self._execute_tool(tc.function.name,
+                                                         tc.function.arguments)
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc.id,
+                            "content": content,
+                        })
+                    continue
 
                 self._log(f'精审第 {round_no} 轮: ' +
                           ', '.join(tc.function.name for tc in message.tool_calls))
@@ -317,20 +350,27 @@ class AIScreener:
                     })
                 continue
 
-            # 无 tool call：兜底从文本解析，否则提示其提交
+            # 无 tool call：兜底从文本解析（允许部分覆盖，累计后追问缺失）
             if message.content:
-                verdicts = self._parse_verdicts_text(message.content, id_map)
-                if verdicts:
-                    return verdicts
+                got = self._parse_verdicts_text(message.content, id_map)
+                if got:
+                    accepted.update(got)
+                missing = [n for n, idx in id_map.items()
+                           if idx not in accepted]
+                if not missing:
+                    return accepted
                 messages.append(message)
                 messages.append({"role": "user", "content":
-                                 '请调用 submit_verdicts 工具提交判定结果。'})
+                    f'判决不完整，还缺 id {missing}。'
+                    '请调用 submit_verdicts 工具提交这些候选的判定。'})
 
         # 达到轮数上限：强制要求用纯文本输出判决，再做最后一轮解析
+        missing = [n for n, idx in id_map.items() if idx not in accepted]
         self._log(f'精审批次达到 {self.MAX_ROUNDS} 轮上限，要求立即提交')
         messages.append({"role": "user", "content":
             '轮数已达上限。请立即基于已有信息输出最终判决 JSON 数组'
-            '（[{"id":N,"keep":true/false,"reason":"..."}]），不要再调用工具。'})
+            '（[{"id":N,"keep":true/false,"reason":"..."}]），不要再调用工具。'
+            + (f'只需输出还缺判决的 id: {missing}。' if accepted else '')})
         message = self.translator.chat_completion(
             messages=messages,
             temperature=self.translator.config.temperature,
@@ -338,13 +378,21 @@ class AIScreener:
             return_message=True, task_type='analysis',
         )
         if message.content:
-            verdicts = self._parse_verdicts_text(message.content, id_map)
-            if verdicts:
-                return verdicts
-        raise RuntimeError(f'精审批次 {self.MAX_ROUNDS} 轮后仍未能获得判决')
+            got = self._parse_verdicts_text(message.content, id_map)
+            if got:
+                accepted.update(got)
+        missing = [n for n, idx in id_map.items() if idx not in accepted]
+        if not missing:
+            return accepted
+        raise RuntimeError(
+            f'精审批次 {self.MAX_ROUNDS} 轮追问后仍有 {len(missing)} 条'
+            f'候选未获判决（id: {missing}）')
 
     def _parse_verdict_args(self, arguments: str, id_map: dict) -> dict:
-        """解析 submit_verdicts 工具参数（必须覆盖整批，否则报错）"""
+        """解析 submit_verdicts 工具参数，返回 {候选索引: (keep, reason)}。
+
+        允许部分覆盖：缺漏由调用方追问补齐；仅参数 JSON 损坏时报错
+        （调用方同样转为追问）。"""
         try:
             args = json.loads(arguments)
         except json.JSONDecodeError as e:
@@ -355,13 +403,11 @@ class AIScreener:
                 idx = id_map[entry['id']]
                 verdicts[idx] = (bool(entry.get('keep', True)),
                                  str(entry.get('reason', '')))
-        missing = set(id_map.values()) - set(verdicts)
-        if missing:
-            raise ValueError(f'精审判决未覆盖全部候选（缺 {len(missing)} 条）')
         return verdicts
 
     def _parse_verdicts_text(self, content: str, id_map: dict) -> dict:
-        """兜底：从文本内容解析判决 JSON（必须覆盖整批）"""
+        """兜底：从文本内容解析判决 JSON。允许部分覆盖（缺漏由调用方
+        追问补齐）；找不到可解析的 JSON 才返回 None"""
         m = re.search(r'\[.*\]|\{.*\}', content, re.S)
         if not m:
             return None
@@ -376,8 +422,6 @@ class AIScreener:
                 idx = id_map[entry['id']]
                 verdicts[idx] = (bool(entry.get('keep', True)),
                                  str(entry.get('reason', '')))
-        if set(id_map.values()) - set(verdicts):
-            return None
         return verdicts or None
 
     # ========== 工具执行（只读） ==========

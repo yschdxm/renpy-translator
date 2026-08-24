@@ -101,7 +101,7 @@ async def export_game(state: AppState = Depends(require_project)):
                     if status == 'ok':
                         break
                     if status == 'reexport' and attempt < 2:
-                        job.emit_log('内嵌标记已拆除，重新导出...')
+                        job.emit_log('自愈要求重新导出，正在重新组装...')
                         result = await state.run_sync(_export)
                         job.check_cancelled()
                         if not result['success']:
