@@ -245,32 +245,56 @@ class TestHealerDropsBrokenKeptFiles:
 class TestChineseFontMapping:
     """游戏自带字体（无 CJK 字形）必须进入 font_replacement_map"""
 
+    def _patch_fonts(self, monkeypatch, tmp_path):
+        """伪造数据根字体目录（软件不携带字体，用户手动放置）"""
+        user_fonts = tmp_path / 'user_fonts'
+        user_fonts.mkdir(exist_ok=True)
+        (user_fonts / 'SomeCJK.ttf').write_bytes(b'y')
+        import rt_home
+        monkeypatch.setattr(rt_home, 'find_resource',
+                            lambda name: user_fonts if name == 'fonts'
+                            else None)
+        monkeypatch.setattr(rt_home, 'home', lambda: tmp_path)
+        return user_fonts
+
     def test_game_fonts_mapped(self, exporter, tmp_path, monkeypatch):
         game = tmp_path / 'game'
         (game / 'gui' / 'fonts').mkdir(parents=True)
         (game / 'gui' / 'fonts' / 'Closeness.ttf').write_bytes(b'x')
         (game / 'tl' / 'chinese').mkdir(parents=True)
-        # 假装工具字体目录里有一个中文字体
-        tool_fonts = tmp_path / 'tool_fonts'
-        tool_fonts.mkdir()
-        (tool_fonts / 'MiSans-Regular.ttf').write_bytes(b'y')
+        self._patch_fonts(monkeypatch, tmp_path)
 
-        import rt_home
-        monkeypatch.setattr(rt_home, 'find_resource',
-                            lambda name: tool_fonts if name == 'fonts'
-                            else None)
-
+        font_files = exporter._require_user_fonts()
         logs = []
-        exporter._add_chinese_font(tmp_path, logs.append)
+        exporter._add_chinese_font(tmp_path, logs.append, font_files)
         override = (game / 'tl' / 'chinese' / 'font_override.rpy')
         content = override.read_text(encoding='utf-8')
         assert 'config.font_replacement_map["gui/fonts/Closeness.ttf", False, False]' in content
         assert 'config.font_replacement_map["Closeness.ttf", False, False]' in content
         assert 'config.font_replacement_map["DejaVuSans.ttf", False, False]' in content
         # 中文字体自身不能被映射（否则自我替换）
-        assert 'MiSans-Regular.ttf", False, False] = ("fonts/MiSans' not in content
+        assert 'SomeCJK.ttf", False, False] = ("fonts/SomeCJK' not in content
         # 字体文件已复制
-        assert (game / 'fonts' / 'MiSans-Regular.ttf').exists()
+        assert (game / 'fonts' / 'SomeCJK.ttf').exists()
+
+    def test_missing_font_aborts(self, exporter, tmp_path, monkeypatch):
+        """用户未放置字体：导出预检直接失败（不允许无字体导出）"""
+        import rt_home
+        monkeypatch.setattr(rt_home, 'find_resource', lambda name: None)
+        monkeypatch.setattr(rt_home, 'home', lambda: tmp_path)
+        with pytest.raises(RuntimeError, match='未找到中文字体'):
+            exporter._require_user_fonts()
+
+    def test_empty_fonts_dir_aborts(self, exporter, tmp_path, monkeypatch):
+        """fonts 目录存在但没有字体文件同样失败"""
+        empty = tmp_path / 'fonts'
+        empty.mkdir()
+        import rt_home
+        monkeypatch.setattr(rt_home, 'find_resource',
+                            lambda name: empty if name == 'fonts' else None)
+        monkeypatch.setattr(rt_home, 'home', lambda: tmp_path)
+        with pytest.raises(RuntimeError, match='未找到中文字体'):
+            exporter._require_user_fonts()
 
 
 

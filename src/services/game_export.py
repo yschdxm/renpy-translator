@@ -115,6 +115,11 @@ class GameExporter:
         self._cancel_event = cancel_event
         try:
             self._check_cancel()
+            # 预检：中文字体由用户自行放置（软件不携带字体，版权原因），
+            # 缺失时尽早终止，不要等复制/填充完才失败
+            font_files = self._require_user_fonts()
+            log(f'中文字体: {font_files[0].name}')
+
             project_dir = self.project_manager.project_dir(project_name)
             game_work_dir = project_dir / 'game'
             export_dir = Path(export_dir) if export_dir else project_dir / 'output'
@@ -212,7 +217,7 @@ class GameExporter:
             # 添加中文字体
             progress(0.95, '正在添加中文字体支持...')
             log('添加中文字体支持...')
-            self._add_chinese_font(export_dir, log)
+            self._add_chinese_font(export_dir, log, font_files)
 
             # 生成角色名翻译（Character("Name") 未包 _()，不在翻译系统内）
             progress(0.97, '正在生成角色名翻译...')
@@ -586,20 +591,30 @@ class GameExporter:
 
         log(f'已设置默认中文启动（追加到 {target.name}）')
 
-    def _add_chinese_font(self, export_dir: Path, log):
-        """添加中文字体支持"""
-        from rt_home import find_resource
+    @staticmethod
+    def _require_user_fonts() -> list:
+        """用户放置的中文字体列表；未放置时抛错终止导出。
+
+        软件不携带字体（版权原因）：用户在 数据根/fonts/ 自行放置
+        .ttf/.otf/.ttc（find_resource 搜索序：数据根优先，可覆盖 exe 旁）。
+        """
+        from rt_home import find_resource, home
         fonts_dir = find_resource('fonts')
-        if fonts_dir is None:
-            log('未找到字体目录')
-            return
-
-        font_files = [f for f in fonts_dir.iterdir()
-                      if f.suffix.lower() in ['.ttf', '.ttc', '.otf']]
+        font_files = []
+        if fonts_dir is not None:
+            font_files = sorted(
+                f for f in fonts_dir.iterdir()
+                if f.suffix.lower() in ('.ttf', '.ttc', '.otf'))
         if not font_files:
-            log('字体目录为空')
-            return
+            raise RuntimeError(
+                '未找到中文字体，导出已终止。软件不自带字体：请将一个'
+                '中文字体文件（.ttf/.otf/.ttc）放入 '
+                f'{home() / "fonts"}/ 后重新导出'
+                '（没有字体的导出包中文将无法显示）')
+        return font_files
 
+    def _add_chinese_font(self, export_dir: Path, log, font_files: list):
+        """添加中文字体支持（字体清单由 _require_user_fonts 预检提供）"""
         dest = export_dir / 'game' / 'fonts'
         dest.mkdir(exist_ok=True)
 
