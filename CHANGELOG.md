@@ -5,6 +5,22 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.3.2] - 2026-08-24
+
+### 修复
+
+- 导出游戏中文渲染为空白：字体映射此前只覆盖 Ren'Py 内置 DejaVuSans 家族，游戏自带字体（通常无 CJK 字形）完全漏网，且 gui.rpy 为反编译产物时字体补丁落空——现枚举 game/ 下全部自带字体，按相对路径+文件名两种写法进入 font_replacement_map（bcc4a39）
+- 内嵌标记的译文导出后不生效：_() 包裹写在反编译文件里，导出时被删除，游戏跑原始 rpyc 永不查翻译表——现按"保留清单"导出含内嵌标记的反编译文件，编译校验报错时自愈按文件记入 dropped_decompiled_files 并重新导出回退原始 rpyc（bcc4a39）
+- AI 精审 submit_verdicts 判决未覆盖整批（如缺 1 条）或参数损坏时整批抛错中断：改为受理部分判决、回喂缺失 id 追问补齐，轮数上限仍缺才失败（bcc4a39）
+
+### 新增
+
+- 导出游戏默认以中文启动：向已有 tl/chinese 骨架追加 init 块，persistent 标记保证仅首次强制，玩家之后在设置里切换的语言选择被保留（bcc4a39）
+
+### 优化
+
+- 语言切换按钮注入从单行精确匹配改为结构化定位：定位 screen preferences 块 + 语义锚点（null height pref_spacing / slider hbox），候选路径扩到 game/**/*.rpy（排除 tl/），耐模板改动；rpyc-only 游戏保留可注入的反编译 screens.rpy 作为按钮载体，找不到时响亮告警（bcc4a39）
+
 ## [v0.3.1] - 2026-08-18
 
 ### 修复
