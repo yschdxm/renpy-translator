@@ -23,6 +23,16 @@ const router = createRouter({
       meta: { needsProject: true },
     },
     {
+      path: '/story-graph',
+      component: () => import('./pages/StoryGraphPage.vue'),
+      meta: { needsProject: true },
+    },
+    {
+      path: '/relations',
+      component: () => import('./pages/RelationGraphPage.vue'),
+      meta: { needsProject: true },
+    },
+    {
       path: '/export', component: () => import('./pages/ExportPage.vue'),
       meta: { needsProject: true },
     },

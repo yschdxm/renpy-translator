@@ -222,6 +222,7 @@ class CharacterRepo:
 
     @staticmethod
     def _row_to_character_dict(row: sqlite3.Row) -> dict:
+        keys = row.keys()
         return {
             "id": row["id"],
             "variable": row["variable"],
@@ -231,4 +232,6 @@ class CharacterRepo:
             "profile_json": row["profile_json"],
             "is_placeholder": bool(row["is_placeholder"]),
             "created_at": row["created_at"],
+            # faction 是后迁移列，老库升级前 select 可能无此列
+            "faction": row["faction"] if "faction" in keys else "",
         }

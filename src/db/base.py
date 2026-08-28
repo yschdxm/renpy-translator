@@ -144,6 +144,90 @@ CREATE TABLE IF NOT EXISTS update_review (
     status TEXT DEFAULT 'pending'
 );
 CREATE INDEX IF NOT EXISTS idx_update_review_status ON update_review(status);
+
+-- 剧情图节点（派生数据，构建时全量重算）
+CREATE TABLE IF NOT EXISTS story_nodes (
+    label TEXT PRIMARY KEY,
+    file_path TEXT DEFAULT '',
+    line_start INTEGER DEFAULT 0,
+    line_end INTEGER DEFAULT 0,
+    speakers_json TEXT DEFAULT '[]',
+    dialogue_count INTEGER DEFAULT 0,
+    first_text TEXT DEFAULT '',
+    first_text_cn TEXT DEFAULT '',
+    is_entry INTEGER DEFAULT 0,
+    has_return INTEGER DEFAULT 0,
+    is_terminal INTEGER DEFAULT 0,
+    thumb_file TEXT DEFAULT ''
+);
+
+-- 剧情图边（target 为 NULL 表示动态跳转未决）
+CREATE TABLE IF NOT EXISTS story_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT DEFAULT '',
+    target TEXT,
+    kind TEXT DEFAULT 'jump',
+    branch TEXT DEFAULT '',
+    text TEXT DEFAULT '',
+    text_cn TEXT DEFAULT '',
+    expr TEXT DEFAULT '',
+    line INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_story_edges_source ON story_edges(source);
+CREATE INDEX IF NOT EXISTS idx_story_edges_target ON story_edges(target);
+
+-- 人物关系（source=ai 随重算替换；source=manual 人工编辑保留）
+CREATE TABLE IF NOT EXISTS char_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_var TEXT DEFAULT '',
+    target_var TEXT DEFAULT '',
+    relation TEXT DEFAULT '',
+    category TEXT DEFAULT 'other',
+    polarity TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    cooccurrence INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'ai',
+    updated_at TEXT DEFAULT ''
+);
+
+-- 角色立绘（派生数据，随剧情图构建重算）
+CREATE TABLE IF NOT EXISTS char_avatars (
+    variable TEXT PRIMARY KEY,
+    image_path TEXT DEFAULT '',
+    source TEXT DEFAULT 'auto'
+);
+
+-- 剧情场景（label 链聚合的故事段落，派生数据，构建时全量重算）
+CREATE TABLE IF NOT EXISTS story_scenes (
+    scene_id TEXT PRIMARY KEY,
+    title TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    labels_json TEXT DEFAULT '[]',
+    speakers_json TEXT DEFAULT '[]',
+    first_text TEXT DEFAULT '',
+    first_text_cn TEXT DEFAULT '',
+    dialogue_count INTEGER DEFAULT 0,
+    translated_count INTEGER DEFAULT 0,
+    thumb_file TEXT DEFAULT '',
+    is_entry INTEGER DEFAULT 0,
+    is_ending INTEGER DEFAULT 0,
+    is_return INTEGER DEFAULT 0,
+    file_path TEXT DEFAULT '',
+    line_start INTEGER DEFAULT 0
+);
+
+-- 剧情场景间边（texts_json/texts_cn_json 为选项文本列表）
+CREATE TABLE IF NOT EXISTS story_scene_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT DEFAULT '',
+    target TEXT DEFAULT '',
+    texts_json TEXT DEFAULT '[]',
+    texts_cn_json TEXT DEFAULT '[]',
+    branch TEXT DEFAULT '',
+    has_call INTEGER DEFAULT 0,
+    unresolved INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_scene_edges_source ON story_scene_edges(source);
 """
 
 
@@ -180,6 +264,11 @@ class Base:
             ('ui_texts', 'label', "TEXT DEFAULT ''"),
             ('ui_texts', 'context_hint', "TEXT DEFAULT ''"),
             ('embedded_candidates', 'ai_danger', "INTEGER DEFAULT 0"),
+            ('story_nodes', 'first_text_cn', "TEXT DEFAULT ''"),
+            ('story_edges', 'text_cn', "TEXT DEFAULT ''"),
+            ('char_relations', 'category', "TEXT DEFAULT 'other'"),
+            ('char_relations', 'polarity', "TEXT DEFAULT ''"),
+            ('characters', 'faction', "TEXT DEFAULT ''"),
         ]:
             existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in existing:

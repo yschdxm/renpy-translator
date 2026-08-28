@@ -19,10 +19,11 @@ from .glossary_repo import GlossaryRepo
 from .embedded_repo import EmbeddedRepo
 from .update_repo import UpdateRepo
 from .failed_repo import FailedRepo
+from .graph_repo import GraphRepo
 
 
 class ProjectDatabase(Base, ContentRepo, CharacterRepo, GlossaryRepo,
-                      EmbeddedRepo, UpdateRepo, FailedRepo):
+                      EmbeddedRepo, UpdateRepo, FailedRepo, GraphRepo):
     """项目 SQLite 数据库（多继承组合，公共 API 不变）"""
 
 

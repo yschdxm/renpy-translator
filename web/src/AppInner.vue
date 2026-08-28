@@ -27,6 +27,8 @@ const menuOptions: MenuOption[] = [
   { label: '字符串翻译', key: '/strings' },
   { label: '对话翻译', key: '/dialogue' },
   { label: '术语表', key: '/glossary' },
+  { label: '剧情分支图', key: '/story-graph' },
+  { label: '人物关系图谱', key: '/relations' },
   { label: '导出游戏', key: '/export' },
   { label: '模型配置', key: '/settings' },
 ]

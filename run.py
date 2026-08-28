@@ -195,6 +195,9 @@ def run_gui(port: int):
         "Ren'Py 翻译工具", url,
         width=1440, height=900, min_size=(1100, 700),
         js_api=JsApi(),
+        # 125% DPI 下 WebView2 内容与窗口边框可能有 1-2px 取整缝隙，
+        # 露出窗口底色（默认白）形成"白边"；用应用底色让其不可见
+        background_color='#101014',
     )
 
     # 看门狗：服务异常死掉（崩溃/被杀）时向前端发提示事件——只提示，不关窗

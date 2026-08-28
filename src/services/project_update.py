@@ -534,6 +534,8 @@ class ProjectUpdater:
                 db.set_meta('updated_at', report['updated_at'])
                 db.set_meta('last_update_report', _json.dumps(
                     report, ensure_ascii=False))
+                # 剧情图/共现关系是旧版源码的派生数据，随版本更新失效
+                db.clear_story_graph()
                 db.close()
             await _rie(_finalize)
             db = None
