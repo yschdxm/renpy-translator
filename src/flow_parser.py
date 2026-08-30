@@ -82,8 +82,19 @@ _SCENE_RE = re.compile(r'^scene\s+(.+)$')
 _SHOW_RE = re.compile(r'^show\s+(.+)$')
 _HIDE_RE = re.compile(r'^hide\s+(.+)$')
 _RENPY_PY_RE = re.compile(r'^\$\s*renpy\.(jump|call)\s*\(\s*(.+?)\s*\)')
-# 对话：角色 "..."（旁白 "..." 对 speaker 无贡献，但计入台词数）
-_CHAR_DLG_RE = re.compile(r'^(\w+)\s+"((?:[^"\\]|\\.)*?)"')
+# 对话：角色 "..."（旁白 "..." 对 speaker 无贡献，但计入台词数）。
+# who 允许带点表达式（mc.name，Lab Rats 2 主角台词全用这种形式）与
+# 图像属性（say 变体：e happy / e @ vhappy / e -concerned，Wartribe、
+# HPMF 大量使用）；台词串到第一个未转义引号截止，行尾参数
+# （如 (what_color="#8c8")）不影响截取
+_CHAR_DLG_RE = re.compile(
+    r'^([\w.]+)((?:\s+(?:-?\w+|@\s*\w+))*)\s+"((?:[^"\\]|\\.)*)"')
+_NARR_DLG_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"')
+# monologue 三引号台词：e """..."""；跨行块整体计 1 条（7.4+ 默认
+# monologue 模式的写法）。who 后必须紧跟引号，python 多行字符串
+# （x = """、foo("""）因此天然不匹配
+_MONO_RE = re.compile(
+    r'^([\w.]+)((?:\s+(?:-?\w+|@\s*\w+))*)\s+("""|\'\'\')')
 _NARR_DLG_RE = re.compile(r'^"((?:[^"\\]|\\.)*?)"')
 
 # 顶层非 label 语句：label 体结束的标志
@@ -172,6 +183,7 @@ class FlowParser:
         menu_seq = 0          # menu 序号（label 内唯一）
         last_base_menu = 0    # 最后一条基准 menu 的序号
         opt_records: dict = {}  # id(option ctx entry) -> {'menu_seq','last'}
+        mono_q = None         # 跨行 monologue 三引号块的闭合 token（None=不在块内）
 
         def close_node(end_line: int):
             nonlocal body_indent, last_base_stmt, last_base_menu
@@ -202,6 +214,14 @@ class FlowParser:
             if not stripped or stripped.startswith('#'):
                 continue
             indent = len(raw) - len(raw.lstrip())
+
+            # 跨行 monologue 块内：文本行不参与结构解析（缩进任意，
+            # 不能让它触发上下文弹栈），仅把定位推进到闭合行
+            if mono_q is not None:
+                if mono_q in stripped:
+                    mono_q = None
+                    node.last_dlg_line = idx
+                continue
 
             # 弹出缩进不小于当前行的上下文
             while ctx and indent <= ctx[-1][0]:
@@ -304,13 +324,34 @@ class FlowParser:
                     last_base_stmt = 'other'
                 continue
 
+            m3 = _MONO_RE.match(stripped)
+            if m3 and m3.group(1).lower() not in _CODE_KEYWORDS:
+                q = m3.group(3)
+                rest = stripped[m3.end():]
+                if q in rest:
+                    # 同行闭合：e """text"""
+                    self._count_dialogue(node, rest[:rest.index(q)], idx)
+                else:
+                    # 跨行块开始：整体计 1 条，定位到闭合行
+                    mono_q = q
+                    node.dialogue_count += 1
+                    if not node.first_dlg_line:
+                        node.first_dlg_line = idx
+                    if rest.strip() and not node.first_text:
+                        node.first_text = _unescape(rest.strip())
+                    node.last_dlg_line = idx
+                touch_option('other')
+                if indent <= body_indent:
+                    last_base_stmt = 'other'
+                continue
+
             # ---- 对话（speaker 与台词数）----
             m = _CHAR_DLG_RE.match(stripped)
             if m and m.group(1).lower() not in _CODE_KEYWORDS:
                 var = m.group(1)
                 if var not in node.speakers:
                     node.speakers.append(var)
-                self._count_dialogue(node, m.group(2), idx)
+                self._count_dialogue(node, m.group(3), idx)
                 touch_option('other')
                 if indent <= body_indent:
                     last_base_stmt = 'other'

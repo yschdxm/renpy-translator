@@ -83,7 +83,72 @@ def test_entry_and_dialogue(parsed):
     assert start.speakers == ['e']
     assert start.first_text == 'Hello!'
     assert start.first_dlg_line > 0
+# ---- say 变体台词解析 ----
 
+SAY_VARIANTS = '''
+label start:
+    e happy "Hello."
+    e @ vhappy "Wow!"
+    e -annoyed "Hmm."
+    mc.name "It's me."
+    the_person.title "Fancy."
+    style "some_style"
+    text "Not a say"
+    e """Inline monologue."""
+    e """
+Multi
+line
+    """
+    x = """
+python string
+    """
+'''
+
+
+@pytest.fixture
+def say_parsed(tmp_path):
+    (tmp_path / 's.rpy').write_text(SAY_VARIANTS, encoding='utf-8')
+    return FlowParser(str(tmp_path)).parse()
+
+
+def test_say_with_image_attributes(say_parsed):
+    """e happy "..." / e @ vhappy / e -annoyed 都计入说话人台词"""
+    n = say_parsed['nodes'][0]
+    assert 'e' in n.speakers
+    # 3 条属性 say + 带点说话人 2 条 + monologue 2 条
+    assert n.dialogue_count == 7
+    assert n.first_text == 'Hello.'
+
+
+def test_dotted_speaker(say_parsed):
+    """mc.name 等带点说话人计入 speakers"""
+    n = say_parsed['nodes'][0]
+    assert 'mc.name' in n.speakers
+    assert 'the_person.title' in n.speakers
+
+
+def test_keywords_not_speakers(say_parsed):
+    """screen 属性关键字（style/text）不会被当成说话人"""
+    n = say_parsed['nodes'][0]
+    assert 'style' not in n.speakers
+    assert 'text' not in n.speakers
+
+
+def test_inline_monologue(say_parsed):
+    n = say_parsed['nodes'][0]
+    assert n.first_dlg_line > 0
+    assert 'Inline monologue.' not in n.first_text or n.first_text == 'Hello.'
+
+
+def test_multiline_monologue_span(say_parsed):
+    """跨行三引号块整体计 1 条，定位到闭合行；python 三引号串不计"""
+    n = say_parsed['nodes'][0]
+    assert n.dialogue_count == 7
+    # 闭合行（含结尾 """ 的行）应被记为末条台词行
+    lines = SAY_VARIANTS.split('\n')
+    close_line = next(i for i, l in enumerate(lines, 1)
+                      if l.strip() == '"""')
+    assert n.last_dlg_line == close_line
 
 def test_plain_jump(parsed):
     edges = _edges(parsed, 'start')

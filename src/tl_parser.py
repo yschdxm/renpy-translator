@@ -46,12 +46,16 @@ def parse_translation_files(tl_dir, game_dir: str, logger=None) -> dict:
 
 def _parse_dialogue_blocks(lines, tl_file, game_path, dialogues, ui_texts):
     """解析对话格式的翻译块，提取 label 归属"""
-    # Windows 上 relative_to 产生反斜杠路径，先统一为正斜杠再做前缀判断
-    current_file = str(tl_file.relative_to(tl_file.parent.parent.parent)).replace('\\', '/')
-    # tl 目录结构为 tl/<语言>/<源脚本相对路径>，通用剥掉前两段（语言名不写死）
-    parts = current_file.split('/')
-    if len(parts) >= 3 and parts[0] == 'tl':
-        current_file = '/'.join(parts[2:])
+    # tl 目录镜像源脚本结构：tl/<语言>/<源脚本相对路径>。从路径里的
+    # 'tl' 段起剥两段还原源脚本相对路径（语言名不写死）。不能按固定
+    # 三级父 relative_to：根级文件（tl/chinese/x.rpy）三级父是 game，
+    # 而子目录文件（tl/chinese/scripts/x.rpy）三级父是 tl 目录本身，
+    # 会漏剥语言段——file_path 就多一层 <语言>/ 指向不存在的文件。
+    parts = tl_file.parts
+    if 'tl' in parts:
+        current_file = '/'.join(parts[parts.index('tl') + 2:])
+    else:
+        current_file = str(tl_file).replace('\\', '/')
 
     current_label = ""
     current_line_no = 0
@@ -86,8 +90,12 @@ def _parse_dialogue_blocks(lines, tl_file, game_path, dialogues, ui_texts):
             comment_text = comment_match.group(1).strip()
             if not comment_text:
                 continue
-            char_match = re.match(r'^(\w+)\s+"(.*)"', comment_text)
-            narration_match = re.match(r'^"(.*)"', comment_text)
+            # 说话人可以是带点表达式（如 mc.name "..."，Lab Rats 2 主角
+            # 台词全用这种形式，占其台词量两成），不能只认 \w+；台词串
+            # 到第一个未转义引号截止——行尾参数（say 变体如
+            # "..." (what_color="#8c8")）里的引号不能混进译文原文
+            char_match = re.match(r'^([\w.]+)\s+"((?:[^"\\]|\\.)*)"', comment_text)
+            narration_match = re.match(r'^"((?:[^"\\]|\\.)*)"', comment_text)
             if char_match:
                 character = char_match.group(1)
                 text = char_match.group(2).replace('\\"', '"')
