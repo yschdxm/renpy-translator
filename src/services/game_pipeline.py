@@ -151,8 +151,24 @@ def refresh_characters(game_work_dir: Path, db, dialogues: list,
     from renpy_parser import RenpyParser
     char_result = RenpyParser().parse_directory(
         str(game_work_dir), extract_rpa=False)
-    characters = [{"variable": c.variable, "display_name": c.name}
-                  for c in char_result['characters']]
+    # 具名角色：源码构造证据（Character/工厂函数），display_name 取
+    # 名字字面量；动态名占位（[mc] 之类，玩家命名主角）标 is_placeholder
+    characters = []
+    for c in char_result['characters']:
+        row = {"variable": c.variable, "display_name": c.name}
+        if c.name.startswith('[') and c.name.endswith(']'):
+            row["is_placeholder"] = True
+        characters.append(row)
+    # 泛指说话人也全部入表（动态游戏的 the_person、路人临时变量等
+    # 运行时才绑定到具体人物，它们确实说话了）：没有静态显示名，
+    # display_name 留空（显示层兜底变量名）。is_placeholder 是
+    # [动态名] 角色的专用标记，此处不用
+    named = {c['variable'] for c in characters}
+    for d in dialogues:
+        var = d.get('character', '')
+        if var and var not in named:
+            named.add(var)
+            characters.append({"variable": var, "display_name": ""})
     if reset_counts:
         db.reset_character_lines_count()
     db.insert_characters(characters)

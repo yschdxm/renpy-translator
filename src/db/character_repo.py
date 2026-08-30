@@ -29,7 +29,7 @@ class CharacterRepo:
             for c in characters:
                 display_name = c.get("display_name", c.get("name", ""))
                 variable = c.get("variable", "")
-                if not display_name:
+                if not display_name and not variable:
                     continue
                 if variable:
                     existing = self._conn.execute(
@@ -42,7 +42,7 @@ class CharacterRepo:
                         (display_name,)
                     ).fetchone()
                 if existing:
-                    # 更新显示名（源码可能改名），译名/档案保留
+                    # 更新显示名（源码可能改名），译名/档案/占位标记保留
                     self._conn.execute(
                         "UPDATE characters SET display_name=? WHERE id=?",
                         (display_name, existing["id"])
@@ -160,9 +160,11 @@ class CharacterRepo:
 
     @_auto_reconnect
     def get_variable_map(self) -> dict[str, str]:
-        """获取变量名 -> 显示名映射"""
+        """获取变量名 -> 显示名映射（无显示名的角色不含——调用方
+        兜底显示变量名）"""
         rows = self._conn.execute(
-            "SELECT variable, display_name FROM characters WHERE variable != ''"
+            "SELECT variable, display_name FROM characters "
+            "WHERE variable != '' AND display_name != ''"
         ).fetchall()
         return {r["variable"]: r["display_name"] for r in rows}
 

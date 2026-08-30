@@ -63,13 +63,28 @@ class RenpyParser:
     ]
 
     # 角色定义模式
+    # 组约定：1=变量名 2=Dynamic 标志（或工厂名） 3=引号 4=名字，
+    # 引号用反向引用配对，名字里可含另一种引号（如 "Myrielle's thoughts"）
     CHARACTER_PATTERNS = [
-        # define e = Character("Eileen") / Character ("Eileen")（允许空格）
-        # Character(_("Eileen"))（_() 包装）/ DynamicCharacter("persistent.x")（动态名）
-        # 引号用反向引用配对，名字里可含另一种引号（如 "Myrielle's thoughts"）
-        r'^define\s+(\w+)\s*=\s*(Dynamic)?Character\s*\(\s*(?:_\(\s*)?(["\'])(.*?)\3',
-        # e = Character("Eileen")（无 define 前缀，同上）
-        r'^(\w+)\s*=\s*(Dynamic)?Character\s*\(\s*(?:_\(\s*)?(["\'])(.*?)\3',
+        # define/default e = Character("Eileen")（renpy. 全限定、store. 命名
+        # 空间、DynamicCharacter（legacy，等价 dynamic=True）、_() 包装均容错）
+        r'^(?:define|default)\s+(?:store\.)?(\w+)\s*=\s*(Dynamic)?(?:renpy\.)?Character\s*\(\s*(?:_\(\s*)?(["\'])(.*?)\3',
+        # 裸赋值（顶层 / init python 块内 / $ 语句）：e = Character("Eileen")
+        r'^(?:\$|store\.)?\s*(?:store\.)?(\w+)\s*=\s*(Dynamic)?(?:renpy\.)?Character\s*\(\s*(?:_\(\s*)?(["\'])(.*?)\3',
+        # 动态构造游戏（Lab Rats 2 等，角色全在运行时由工厂函数创建，
+        # 无静态 Character 定义）：lily = create_random_person(name = "Lily", ...)
+        # / x = Person("Lily", ...) —— 显示名在构造调用的字面量里。
+        # 函数名以 person 紧贴 ( 收尾（Personality、xx_person 之类不是工厂）
+        r'^(\w+)\s*=\s*(\w*[Pp]erson)\(\s*(?:name\s*=\s*)?(["\'])(.*?)\3',
+    ]
+
+    # 无名字面量的角色构造（主角名由玩家在游戏开头输入）：
+    # mc = MainCharacter(bedroom, character_name, ...) —— 仍是真角色，
+    # display_name 以变量名占位（静态无值）。只认大写驼峰的类构造，
+    # get_premade_character(...) 之类的函数调用不认。台词里的泛指
+    # 变量（the_person 等任意 NPC 形参）没有构造证据，不入角色表
+    CHARACTER_NAMELESS_PATTERNS = [
+        r'^(\w+)\s*=\s*[A-Z]\w*[Cc]haracter\w*\(',
     ]
 
     # 界面文字模式（screens.rpy中的字符串）
@@ -91,6 +106,11 @@ class RenpyParser:
 
     def extract_characters(self, content: str, file_path: str) -> List[CharacterInfo]:
         """从脚本中提取角色定义"""
+        # 单元/集成测试文件里的构造（new_main_character = MainCharacter 等）
+        # 是测试代码，不是游戏角色
+        norm_path = file_path.replace('\\', '/').lower()
+        if 'unit_test' in norm_path or 'integration_test' in norm_path:
+            return []
         characters = []
         for line_num, line in enumerate(content.split('\n'), 1):
             line = line.strip()
@@ -98,7 +118,9 @@ class RenpyParser:
                 match = re.match(pattern, line)
                 if match:
                     var_name = match.group(1)
-                    is_dynamic = bool(match.group(2))
+                    # 组2 只认 Dynamic 字面量：工厂函数模式（组2=函数名，
+                    # 如 create_random_person）不是动态名
+                    is_dynamic = match.group(2) == 'Dynamic'
                     char_name = match.group(4)
                     # DynamicCharacter 的名字是 store 表达式（如 persistent.xxx），
                     # 归一为 [表达式] 形式，与 Character("[name]", dynamic=True) 一致，
@@ -114,6 +136,18 @@ class RenpyParser:
                         )
                         characters.append(char_info)
                         self.characters[var_name] = char_info
+        # 无名字面量的构造（玩家命名主角）：名字运行时才有，静态无值，
+        # display_name 留空——AI 人名翻译跳过空名角色（不译人名只分析），
+        # 显示层兜底显示变量名
+        for pattern in self.CHARACTER_NAMELESS_PATTERNS:
+            for line in content.split('\n'):
+                match = re.match(pattern, line.strip())
+                if match and match.group(1) not in self.characters:
+                    var_name = match.group(1)
+                    char_info = CharacterInfo(
+                        variable=var_name, name="", chinese_name="")
+                    characters.append(char_info)
+                    self.characters[var_name] = char_info
         return characters
 
     def extract_dialogue(self, content: str, file_path: str) -> List[DialogueLine]:
@@ -353,6 +387,33 @@ class RenpyParser:
                 rpy_files.append(rpy_file)
 
         print(f"找到 {len(rpy_files)} 个.rpy文件")
+
+        # Ren'Py 8 的 _ren.py 纯 Python 模块（Lab Rats 2 Reformulate 等变体
+        # 把角色定义全部搬进这类文件）。只做角色提取、不进对话解析：
+        # python 字符串字面量会被旁白模式误提取成假台词
+        ren_py_files = []
+        for base, from_work in ((work_path, True), (game_path, False)):
+            game_sub = base / 'game'
+            if not game_sub.exists():
+                continue
+            for py_file in game_sub.rglob('*_ren.py'):
+                if not from_work and work_path != game_path:
+                    try:
+                        if (work_path / py_file.relative_to(base)).exists():
+                            continue
+                    except ValueError:
+                        pass
+                parts = py_file.relative_to(base).parts
+                if any(part in exclude_dirs for part in parts):
+                    continue
+                ren_py_files.append(py_file)
+        for py_file in ren_py_files:
+            try:
+                content = py_file.read_text(encoding='utf-8', errors='ignore')
+                all_characters.extend(
+                    self.extract_characters(content, str(py_file)))
+            except OSError as e:
+                print(f"读取 _ren.py 失败 {py_file}: {e}")
 
         for rpy_file in rpy_files:
             file_str = str(rpy_file)

@@ -129,13 +129,26 @@ class NameTranslationService:
         """
         loop = asyncio.get_event_loop()
 
-        # 占位符（如 [mc_name]、[hero]）不需要翻译人名，但仍需分析角色
-        is_placeholder = en_name.startswith('[') and en_name.endswith(']')
+        # 无显示名角色（泛指形参/玩家命名主角，display_name 留空）：
+        # 前端以变量名兜底显示/回传，这里按库中真实显示名核实
+        if en_name and variable:
+            row = next((c for c in self.db.get_characters()
+                        if c.get('variable') == variable), None)
+            if row is not None and not (row.get('display_name') or '').strip():
+                en_name = ''
+
+        # 占位符（如 [mc_name]、[hero]）或无显示名角色不翻译人名，
+        # 仅分析角色
+        is_placeholder = (
+            not en_name.strip()
+            or (en_name.startswith('[') and en_name.endswith(']')))
+        label = en_name or (variable or '')
         if is_placeholder:
-            self.logger.info(f'占位符 {en_name}，跳过人名翻译，仅分析角色', panel='names')
-            await loop.run_in_executor(
-                None, lambda: self.db.update_character_cn_name(en_name, en_name, variable=variable)
-            )
+            self.logger.info(f'占位符 {label}，跳过人名翻译，仅分析角色', panel='names')
+            if en_name:
+                await loop.run_in_executor(
+                    None, lambda: self.db.update_character_cn_name(en_name, en_name, variable=variable)
+                )
 
         await self._emit_busy(en_name)
 
@@ -157,15 +170,16 @@ class NameTranslationService:
             char_lines = await loop.run_in_executor(None, _load_lines)
 
             if not char_lines:
-                self.logger.info(f'{en_name} 没有台词，仅翻译人名', panel='names')
-                await self.translation_service.translate_single(
-                    item_id=0, content_type='name', original_text=en_name
-                )
+                self.logger.info(f'{label} 没有台词，仅翻译人名', panel='names')
+                if en_name:
+                    await self.translation_service.translate_single(
+                        item_id=0, content_type='name', original_text=en_name
+                    )
                 empty_profile = {'性格特征': '该角色没有台词', '说话风格': '无', '背景': '无'}
                 await loop.run_in_executor(
                     None, lambda: self.db.save_profile(en_name, empty_profile, variable=variable)
                 )
-                await self._emit_done(en_name)
+                await self._emit_done(label)
                 return
 
             # 获取人名词典用于参考
@@ -196,14 +210,14 @@ class NameTranslationService:
 
                 if batch_idx == 0:
                     self.logger.info(
-                        f'[{batch_idx+1}/{total_batches}] {"分析" if is_placeholder else "翻译+分析"} {en_name}'
+                        f'[{batch_idx+1}/{total_batches}] {"分析" if is_placeholder else "翻译+分析"} {label}'
                         f'（{len(char_lines)}条台词，每段{batch_size}条，上下文{self.max_context_k}K）',
                         panel='names'
                     )
 
                     if is_placeholder:
                         prompt = self._build_analyze_only_prompt(
-                            en_name, lines_text, batch_idx, total_batches)
+                            label, lines_text, batch_idx, total_batches)
                     else:
                         prompt = self._build_translate_analyze_prompt(
                             en_name, lines_text, batch_idx, total_batches, dict_text)
@@ -233,22 +247,22 @@ class NameTranslationService:
                 if len(summaries) == 1:
                     profile = parse_profile(summaries[0])
                 else:
-                    profile = await self._merge_summaries(en_name, summaries)
+                    profile = await self._merge_summaries(label, summaries)
 
                 if profile:
                     await loop.run_in_executor(
                         None, lambda: self.db.save_profile(en_name, profile, variable=variable)
                     )
-                    self.logger.info(f'{en_name} 分析完成', panel='names')
+                    self.logger.info(f'{label} 分析完成', panel='names')
 
-            await self._emit_done(en_name)
+            await self._emit_done(label)
 
         except FatalAPIError:
-            await self._emit_done(en_name)
+            await self._emit_done(label)
             raise
         except Exception as e:
-            self.logger.error(f'{en_name} 翻译+分析失败: {e}', panel='names')
-            await self._emit_done(en_name)
+            self.logger.error(f'{label} 翻译+分析失败: {e}', panel='names')
+            await self._emit_done(label)
 
     async def translate_all(self) -> dict:
         """翻译全部未翻译人名 + 补充分析全部未分析角色（顺序处理）

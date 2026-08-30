@@ -95,7 +95,6 @@ _NARR_DLG_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"')
 # （x = """、foo("""）因此天然不匹配
 _MONO_RE = re.compile(
     r'^([\w.]+)((?:\s+(?:-?\w+|@\s*\w+))*)\s+("""|\'\'\')')
-_NARR_DLG_RE = re.compile(r'^"((?:[^"\\]|\\.)*?)"')
 
 # 顶层非 label 语句：label 体结束的标志
 _TOPLEVEL_RE = re.compile(
@@ -348,7 +347,9 @@ class FlowParser:
             # ---- 对话（speaker 与台词数）----
             m = _CHAR_DLG_RE.match(stripped)
             if m and m.group(1).lower() not in _CODE_KEYWORDS:
-                var = m.group(1)
+                # 归一为根标识符：mc.name "..." 的说话人本体是 mc，
+                # 属性后缀（.name/.title）不是变量，角色映射按根匹配
+                var = m.group(1).split('.')[0]
                 if var not in node.speakers:
                     node.speakers.append(var)
                 self._count_dialogue(node, m.group(3), idx)

@@ -83,6 +83,8 @@ def test_entry_and_dialogue(parsed):
     assert start.speakers == ['e']
     assert start.first_text == 'Hello!'
     assert start.first_dlg_line > 0
+
+
 # ---- say 变体台词解析 ----
 
 SAY_VARIANTS = '''
@@ -121,10 +123,11 @@ def test_say_with_image_attributes(say_parsed):
 
 
 def test_dotted_speaker(say_parsed):
-    """mc.name 等带点说话人计入 speakers"""
+    """mc.name 等带点说话人归一为根变量计入 speakers"""
     n = say_parsed['nodes'][0]
-    assert 'mc.name' in n.speakers
-    assert 'the_person.title' in n.speakers
+    assert 'mc' in n.speakers
+    assert 'the_person' in n.speakers
+    assert 'mc.name' not in n.speakers
 
 
 def test_keywords_not_speakers(say_parsed):
@@ -149,6 +152,7 @@ def test_multiline_monologue_span(say_parsed):
     close_line = next(i for i, l in enumerate(lines, 1)
                       if l.strip() == '"""')
     assert n.last_dlg_line == close_line
+
 
 def test_plain_jump(parsed):
     edges = _edges(parsed, 'start')

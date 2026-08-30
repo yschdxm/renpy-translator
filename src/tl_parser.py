@@ -97,7 +97,10 @@ def _parse_dialogue_blocks(lines, tl_file, game_path, dialogues, ui_texts):
             char_match = re.match(r'^([\w.]+)\s+"((?:[^"\\]|\\.)*)"', comment_text)
             narration_match = re.match(r'^"((?:[^"\\]|\\.)*)"', comment_text)
             if char_match:
-                character = char_match.group(1)
+                # 归一为根标识符：mc.name / the_person.title（属性求值为
+                # 说话名）的说话人本体都是根变量，角色表与头像、中文名
+                # 映射都按纯标识符匹配
+                character = char_match.group(1).split('.')[0]
                 text = char_match.group(2).replace('\\"', '"')
             elif narration_match:
                 character = ''

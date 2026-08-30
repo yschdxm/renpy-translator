@@ -73,7 +73,7 @@ const { editingText, isEditing, startEdit, commitEdit } = useInlineEdit<NameRow>
     const old = row.translated
     row.translated = value
     try {
-      await api.patch(`/api/current/names/${encodeURIComponent(row.original)}`, {
+      await api.patch(`/api/current/names/${encodeURIComponent(row.original || row.variable)}`, {
         cn_name: value, variable: row.variable,
       })
       row.name_done = !!value.trim()
@@ -96,7 +96,7 @@ async function translateOne(row: NameRow) {
   processing.value.add(row.original)
   try {
     const data = await api.post<{ cn_name: string; profile: object }>(
-      `/api/current/names/${encodeURIComponent(row.original)}/translate`,
+      `/api/current/names/${encodeURIComponent(row.original || row.variable)}/translate`,
       { variable: row.variable })
     row.translated = data.cn_name || row.translated
     row.name_done = !!row.translated.trim()
@@ -124,7 +124,7 @@ const profileData = ref<Record<string, string>>({})
 async function viewProfile(row: NameRow) {
   try {
     const data = await api.get<{ profile: Record<string, string> }>(
-      `/api/current/names/${encodeURIComponent(row.original)}/profile`)
+      `/api/current/names/${encodeURIComponent(row.original || row.variable)}/profile`)
     profileName.value = row.original
     profileData.value = data.profile
     profileVisible.value = true

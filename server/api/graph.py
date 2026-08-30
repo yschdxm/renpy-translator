@@ -44,8 +44,8 @@ async def get_story(state: AppState = Depends(require_project)):
     avatars = await state.db_call(state.db.get_char_avatars)
     char_map = {
         c['variable']: {
-            'name': c['cn_name'] or c['display_name'],
-            'original': c['display_name'],
+            'name': c['cn_name'] or c['display_name'] or c['variable'],
+            'original': c['display_name'] or c['variable'],
             'avatar': bool(avatars.get(c['variable'] or '')),
         }
         for c in characters if c['variable']
@@ -87,8 +87,8 @@ async def get_scenes(state: AppState = Depends(require_project)):
     avatars = await state.db_call(state.db.get_char_avatars)
     char_map = {
         c['variable']: {
-            'name': c['cn_name'] or c['display_name'],
-            'original': c['display_name'],
+            'name': c['cn_name'] or c['display_name'] or c['variable'],
+            'original': c['display_name'] or c['variable'],
             'avatar': bool(avatars.get(c['variable'] or '')),
         }
         for c in characters if c['variable']

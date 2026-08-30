@@ -31,7 +31,9 @@ async def list_names(state: AppState = Depends(require_project)):
         cn = c['cn_name'] or ''
         rows.append({
             'variable': c['variable'] or '',
-            'original': c['display_name'],
+            # 无显示名角色（泛指形参/玩家命名主角）original 留空——
+            # UI 已有变量名列；翻译时前端以 variable 回传
+            'original': c['display_name'] or '',
             'translated': cn,
             'lines': c['lines_count'],
             'name_done': bool(cn.strip()),
