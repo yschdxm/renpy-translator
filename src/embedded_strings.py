@@ -327,13 +327,16 @@ def apply_wrapping(candidates: list) -> tuple:
     替换前校验目标位置确实是期望的字面量（源码被改动过时跳过）。
 
     Returns:
-        (成功数, 跳过数)
+        (成功数, 跳过数, 成功位置集合)——成功位置为 (file, line, col_start)，
+        调用方据此只把真正包裹成功的候选标 marked（跳过的留在待复核，
+        否则源码未变却标了 marked，下轮扫描会重现且永远失去处理机会）
     """
     by_file = {}
     for c in candidates:
         by_file.setdefault(c.file, []).append(c)
 
     wrapped = skipped = 0
+    ok_positions = set()
     for file_path, cands in by_file.items():
         path = Path(file_path)
         try:
@@ -354,12 +357,13 @@ def apply_wrapping(candidates: list) -> tuple:
                 continue
             lines[idx] = line[:c.col_start] + '_(' + c.raw + ')' + line[c.col_end:]
             wrapped += 1
+            ok_positions.add((c.file, c.line, c.col_start))
             changed = True
 
         if changed:
             path.write_text('\n'.join(lines), encoding='utf-8')
 
-    return wrapped, skipped
+    return wrapped, skipped, ok_positions
 
 
 def unwrap_candidates(candidates: list) -> tuple:

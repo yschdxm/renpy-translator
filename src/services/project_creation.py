@@ -122,6 +122,43 @@ def extract_game_zip(zip_path, extract_dir: Path, progress_cb=None) -> str:
     return str(extract_dir)
 
 
+# SDK 的精简标准库可能缺游戏脚本 init 阶段 import 的模块：这类模块作者
+# 通常直接塞进发行包 lib/pythonX.Y（如 Lab Rats 2 在脚本里 import unittest，
+# 其依赖 pprint 就是作者手动放进自带 lib 的），SDK 里没有 → translate 跑
+# init 即 ImportError。玩家正常玩没事（用的是游戏自带 lib），只有 SDK 生成
+# 模板时中招。按报错从游戏自带运行库把该模块复制进项目副本 game/ 下
+# （loader 会从 game/ 找到它）后重试。
+# py2: No module named pprint；py3: No module named 'pprint'
+_MISSING_MOD_RE = re.compile(
+    r"(?:ImportError|ModuleNotFoundError): No module named (?:'([^']+)'|(\S+))")
+
+
+def heal_missing_module(game_work_dir: Path, output: str):
+    """按 SDK 输出补齐 init 缺失的标准库模块，返回模块名（未补则 None）
+
+    源只认游戏自带的 lib/pythonX.Y（作者补丁所在），找不到源、或 game/ 下
+    已有同名模块仍报错（注入无效）时返回 None，走原有报错路径。
+    """
+    m = _MISSING_MOD_RE.search(output or '')
+    if not m:
+        return None
+    name = (m.group(1) or m.group(2)).split('.')[0]
+    game_sub = game_work_dir / 'game'
+    if (game_sub / (name + '.py')).exists() or (game_sub / name).is_dir():
+        return None
+    for lib in sorted((game_work_dir / 'lib').glob('python*')):
+        src = lib / (name + '.py')
+        if src.is_file():
+            shutil.copyfile(src, game_sub / (name + '.py'))
+            return name
+        pkg = lib / name
+        if (pkg / '__init__.py').is_file():
+            shutil.copytree(pkg, game_sub / name,
+                            copy_function=shutil.copyfile)
+            return name
+    return None
+
+
 async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
                                 decompiled_rel: list, db,
                                 logger: TranslationLogger,
@@ -163,6 +200,15 @@ async def generate_tl_templates(sdk_path: str, game_work_dir: Path,
                 bad = rel
                 break
         if bad is None:
+            healed = heal_missing_module(
+                game_work_dir, sdk_result.get('output') or '')
+            if healed:
+                logger.warning(
+                    f'游戏 init 引用了 SDK 标准库缺失的模块 {healed}，'
+                    '已从游戏自带运行库复制到项目副本，重试生成...',
+                    panel='projects')
+                progress(0.55, f'已补齐缺失模块 {healed}，重试生成...')
+                continue
             # 必须带上 SDK 输出：返回码本身无法区分是游戏脚本
             # 解析失败还是 SDK 版本不匹配
             tail = (sdk_result.get('output') or '')[-2000:].strip()

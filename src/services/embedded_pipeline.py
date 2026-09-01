@@ -104,14 +104,16 @@ class EmbeddedPipeline:
         finally:
             screener.close()
 
-        # 保存判定（含静态分析的危险用途标记）
+        # 保存判定（含静态分析的危险用途标记）；批次失败保持未决的
+        # 候选 ai_keep=None，归一为 -1 入库（0 会被当成"判不翻"）
         for r in undecided:
             c = r['candidate']
             danger = bool(getattr(c, 'static_danger', False))
+            keep_db = -1 if c.ai_keep is None else (1 if c.ai_keep else 0)
             await loop.run_in_executor(
                 None, self.db.update_embedded_ai,
-                r['id'], c.ai_keep, c.ai_reason, danger)
-            r['ai_keep'] = 1 if c.ai_keep else 0
+                r['id'], keep_db, c.ai_reason, danger)
+            r['ai_keep'] = keep_db
             r['ai_reason'] = c.ai_reason
             r['ai_danger'] = 1 if danger else 0
 
@@ -119,6 +121,8 @@ class EmbeddedPipeline:
         """全部重判：清空判定后重新预筛"""
         loop = asyncio.get_event_loop()
         ids = [r['id'] for r in rows]
+        before = {r['id']: r['ai_keep'] for r in rows
+                  if r['ai_keep'] in (0, 1)}
         await loop.run_in_executor(None, self.db.reset_embedded_ai, ids)
         for r in rows:
             r['ai_keep'] = -1
@@ -126,6 +130,19 @@ class EmbeddedPipeline:
             r['candidate'].ai_keep = None
             r['candidate'].ai_reason = ''
         await self.screen_undecided(rows, on_progress, cancel_event)
+
+        # 翻转透明化：判定温度为 0 后重判可复现，残余翻转主要来自批次
+        # 上下文差异；翻转条目仍走人工确认，不会自动进入翻译
+        flips = [r for r in rows
+                 if r['id'] in before and r['ai_keep'] in (0, 1)
+                 and r['ai_keep'] != before[r['id']]]
+        if flips:
+            to_keep = sum(1 for r in flips if r['ai_keep'] == 1)
+            self.logger.info(
+                f'重判完成: {len(rows)} 条，与上轮一致 '
+                f'{len(rows) - len(flips)}，翻转 {len(flips)}'
+                f'（改判为可翻译 {to_keep} / 改判为不翻 {len(flips) - to_keep}）；'
+                '翻转条目仍需人工确认', panel='ui')
 
     async def refine_rows(self, rows, on_progress=None, cancel_event=None):
         """批量 agentic 精判（跳过粗筛，每行都走带工具的精审），写库
@@ -178,10 +195,11 @@ class EmbeddedPipeline:
         for r in rows:
             c = r['candidate']
             danger = bool(getattr(c, 'static_danger', False))
+            keep_db = -1 if c.ai_keep is None else (1 if c.ai_keep else 0)
             await loop.run_in_executor(
                 None, self.db.update_embedded_ai,
-                r['id'], c.ai_keep, c.ai_reason, danger)
-            r['ai_keep'] = 1 if c.ai_keep else 0
+                r['id'], keep_db, c.ai_reason, danger)
+            r['ai_keep'] = keep_db
             r['ai_reason'] = c.ai_reason
             r['ai_danger'] = 1 if danger else 0
 
@@ -267,11 +285,20 @@ class EmbeddedPipeline:
         chosen = [r['candidate'] for r in chosen_rows]
 
         _stage('正在标记源码...')
-        wrapped, skipped = await loop.run_in_executor(None, apply_wrapping, chosen)
-        self.logger.info(f'内嵌文本标记: {wrapped} 成功, {skipped} 跳过', panel='ui')
+        wrapped, skipped, ok_pos = await loop.run_in_executor(
+            None, apply_wrapping, chosen)
+        self.logger.info(
+            f'内嵌文本标记: {wrapped} 成功, {skipped} 跳过'
+            f'（跳过的保留在待复核，下轮可重试）', panel='ui')
+        # 只有实际包裹成功的才标 marked：位置校验失败（源码被改动/读取
+        # 失败）的若也标 marked，源码未变却退出复核列表，静默漏翻
         chosen_ids = {r['id'] for r in chosen_rows}
+        marked_ids = [
+            r['id'] for r in chosen_rows
+            if (r['candidate'].file, r['candidate'].line,
+                r['candidate'].col_start) in ok_pos]
         await loop.run_in_executor(
-            None, self.db.set_embedded_status, list(chosen_ids), 'marked')
+            None, self.db.set_embedded_status, marked_ids, 'marked')
         await loop.run_in_executor(
             None, self.db.set_embedded_status,
             [r['id'] for r in rows if r['id'] not in chosen_ids], 'skipped')

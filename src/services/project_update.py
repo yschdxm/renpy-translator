@@ -298,7 +298,7 @@ def rewrap_marked_embedded(db, game_work_dir: Path, game_bak_dir: Path,
     if to_wrap:
         # apply_wrapping 自带位置校验（源码变了就跳过），
         # 坐标来自对同一新树的全新扫描，正常不会跳过
-        wrapped, skipped = apply_wrapping([c for _, c in to_wrap])
+        wrapped, skipped, _ok = apply_wrapping([c for _, c in to_wrap])
         if skipped:
             logger.warning(
                 f'内嵌重标记有 {skipped} 条位置校验未通过（对应文本需重新标记）',

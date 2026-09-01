@@ -36,8 +36,10 @@ def test_find_candidates(wrapped_game):
 
 def test_wrap_unwrap_roundtrip(wrapped_game):
     _, f, cands = wrapped_game
-    wrapped, skipped = apply_wrapping(cands)
+    wrapped, skipped, ok_pos = apply_wrapping(cands)
     assert (wrapped, skipped) == (3, 0)
+    # 成功位置集合与候选一一对应（标记层只把 ok 位置标 marked）
+    assert ok_pos == {(c.file, c.line, c.col_start) for c in cands}
     assert '_(' in f.read_text(encoding='utf-8')
 
     removed, skipped = unwrap_candidates(cands)

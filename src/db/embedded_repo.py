@@ -47,11 +47,21 @@ class EmbeddedRepo:
                         (c.rel_file, c.line, c.col_start, c.raw, c.text,
                          c.kind, c.hint, c.confidence, now)
                     )
-                    result.append({
+                    new = {
                         'id': cur.lastrowid, 'candidate': c,
                         'ai_keep': -1, 'ai_reason': '', 'ai_danger': 0,
                         'status': 'pending',
-                    })
+                    }
+                    result.append(new)
+                    # 判重字典同步补插：同一行里同一字面量出现多次时
+                    # （如 ("Back","Back")），扫描会产出两个同 key 候选，
+                    # 不补插会让第二个被当新行重复插入
+                    existing[key] = {
+                        'id': new['id'], 'rel_file': c.rel_file,
+                        'line': c.line, 'raw': c.raw,
+                        'ai_keep': -1, 'ai_reason': '', 'ai_danger': 0,
+                        'status': 'pending',
+                    }
         return result
 
     @_auto_reconnect
