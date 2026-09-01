@@ -153,6 +153,11 @@ const columns: DataTableColumns<NameRow> = [
           size: 'small',
         })
       }
+      // 无显示名角色没有可翻译的名字：不允许手动输入翻译
+      if (!r.original) {
+        return h('span', { style: 'color: #555; display: block; min-height: 20px' },
+          '（无需翻译）')
+      }
       return h('span', {
         style: `cursor: text; display: block; min-height: 20px; ${r.translated ? '' : 'color: #666'}`,
         onClick: () => startEdit(r),
@@ -165,7 +170,11 @@ const columns: DataTableColumns<NameRow> = [
     render: (r) => h(NTag, {
       size: 'small',
       type: processing.value.has(r.original) ? 'warning' : r.name_done ? 'success' : 'default',
-    }, () => processing.value.has(r.original) ? '处理中' : r.name_done ? '完成' : '待翻译'),
+    }, () => {
+      // 无显示名角色（泛指形参/玩家命名主角）没有可翻译的名字，不算待翻译
+      if (!r.original) return '无需翻译'
+      return processing.value.has(r.original) ? '处理中' : r.name_done ? '完成' : '待翻译'
+    }),
   },
   {
     title: '分析', key: 'analysis_status', width: 90,

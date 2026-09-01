@@ -170,19 +170,23 @@ class CharacterRepo:
 
     @_auto_reconnect
     def get_untranslated_characters(self) -> list[dict]:
-        """获取未翻译的角色"""
+        """获取未翻译的角色（无显示名角色不需要翻译人名——仅分析，
+        由批量的"补充分析"路径覆盖，不算未翻译）"""
         rows = self._conn.execute(
-            "SELECT * FROM characters WHERE (cn_name='' OR cn_name IS NULL) AND is_placeholder=0"
+            "SELECT * FROM characters WHERE (cn_name='' OR cn_name IS NULL) "
+            "AND is_placeholder=0 AND display_name != ''"
         ).fetchall()
         return [self._row_to_character_dict(r) for r in rows]
 
     @_auto_reconnect
     def get_char_dict_count(self) -> dict:
-        """统计角色翻译"""
+        """统计角色翻译（无显示名角色没有可翻译的名字，
+        不计入总数也不算未翻译——否则永远凑不齐"人名全部翻译"，
+        对话翻译前置检查会被它们卡死）"""
         row = self._conn.execute(
             """SELECT COUNT(*) as total,
                SUM(CASE WHEN cn_name != '' AND cn_name IS NOT NULL THEN 1 ELSE 0 END) as translated
-               FROM characters WHERE is_placeholder=0"""
+               FROM characters WHERE is_placeholder=0 AND display_name != ''"""
         ).fetchone()
         total = row["total"] or 0
         translated = row["translated"] or 0

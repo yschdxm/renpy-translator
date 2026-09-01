@@ -273,18 +273,16 @@ class NameTranslationService:
         loop = asyncio.get_event_loop()
         completed_count = 0
 
-        def _get_todo():
-            chars = self.db.get_untranslated_characters()
-            profiles = self.db.get_all_profiles()
-            return chars, profiles
-
-        chars_todo, profiles = await loop.run_in_executor(None, _get_todo)
+        chars_todo = await loop.run_in_executor(
+            None, self.db.get_untranslated_characters)
         total = len(chars_todo)
 
         if total == 0:
             all_chars = await loop.run_in_executor(None, self.db.get_characters)
+            # 按行 profile_json 精确判断（无显示名角色共享空显示名，
+            # name-key 字典会互相误覆盖导致后者永远轮不到分析）
             unanalyzed = [(c['display_name'], c['variable'] or None) for c in all_chars
-                          if c['display_name'] not in profiles and not c['is_placeholder']]
+                          if not c['profile_json'] and not c['is_placeholder']]
             if not unanalyzed:
                 return {'completed': 0, 'total': 0, 'stopped': False, 'nothing': True}
             total = len(unanalyzed)

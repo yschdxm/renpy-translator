@@ -110,10 +110,11 @@ async def _check_dialogue_prerequisites(state: AppState):
         raise ApiError(
             409, 'PREREQUISITE',
             f'还有 {names["untranslated"]} 个人名未翻译，请先在「人名翻译」完成')
-    profiles = await state.db_call(state.db.get_all_profiles)
     chars = await state.db_call(state.db.get_characters)
-    unanalyzed = [c['display_name'] for c in chars
-                  if not c['is_placeholder'] and c['display_name'] not in profiles]
+    # 按行 profile_json 精确判断（无显示名角色在 name-key 字典里共享
+    # 空键会互相误覆盖）；无显示名角色的展示名回退变量名
+    unanalyzed = [(c['display_name'] or c['variable']) for c in chars
+                  if not c['is_placeholder'] and not c['profile_json']]
     if unanalyzed:
         raise ApiError(
             409, 'PREREQUISITE',
