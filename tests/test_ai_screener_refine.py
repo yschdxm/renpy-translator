@@ -24,7 +24,8 @@ def _text_msg(content):
 
 def _verdicts(*ids):
     return json.dumps({'verdicts': [
-        {'id': i, 'keep': True, 'reason': f'r{i}'} for i in ids]})
+        {'id': i, 'keep': True, 'reason': f'r{i}',
+         'evidence': f'a.rpy:{i + 1}'} for i in ids]})
 
 
 class FakeTranslator:
@@ -77,7 +78,7 @@ class TestRefineBatchPartialVerdicts:
         s = _mk_screener(tr, tmp_path)
         result = s._refine_batch(_batch(3))
         assert sorted(result) == [0, 1, 2]
-        assert result[2] == (True, 'r2')
+        assert result[2] == (True, 'r2', 'a.rpy:3', '')
         assert tr.rounds == 2
 
     def test_broken_json_then_complete(self, tmp_path):
@@ -98,16 +99,13 @@ class TestRefineBatchPartialVerdicts:
         ])
         s = _mk_screener(tr, tmp_path)
         result = s._refine_batch(_batch(2))
-        assert result[0] == (False, 'x')
-        assert result[1] == (True, 'r1')
+        assert result[0] == (False, 'x', '', '')
+        assert result[1] == (True, 'r1', 'a.rpy:2', '')
 
 
 class TestDeterministicTemperature:
-    """判定任务固定 0 温度：同输入同判定，全部重判不再随机翻转
-
-    背景：粗筛/精审曾沿用用户配置的翻译温度（0.3+），重判同一候选
-    两轮结果不同（0↔1 翻转），用户看到"再筛一遍又出新的可翻译内容"。
-    """
+    """判定任务固定 0 温度：票间去相关性来自输入差异（洗牌+变体），
+    而非温度——温度注入的是噪声不是独立信息。"""
 
     def test_refine_uses_zero_temperature(self, tmp_path):
         tr = FakeTranslator([_tool_msg('submit_verdicts', _verdicts(0))])
@@ -118,105 +116,17 @@ class TestDeterministicTemperature:
     def test_coarse_uses_zero_temperature(self, tmp_path):
         tr = FakeTranslator([])
         tr.analyze_reply = json.dumps(
-            [{'id': 0, 'keep': True, 'confident': True, 'reason': '界面文本'}],
+            [{'id': 0, 'keep': True, 'reason': '界面文本'}],
             ensure_ascii=False)
         s = _mk_screener(tr, tmp_path)
-        verdicts = s._coarse_batch(
+        verdicts = s._coarse_vote(
             [{'id': 0, 'text': 'Settings', 'hint': '界面',
-              'kind': 'screen', 'rel_file': 'a.rpy', 'line': 1}])
-        assert verdicts[0] == (True, True, '界面文本')
+              'kind': 'screen', 'rel_file': 'a.rpy', 'line': 1}], 0)
+        assert verdicts[0] == (True, '界面文本')
         assert tr.analyze_temps == [0]
 
 
-# ---- 整批失败不中断：跳过 → 收尾重试 → 仍败保持未决 ----
-
-class FakeTree:
-    def lines(self, rel):
-        return ['x = 1', 'y = 2']
-
-
-def _cands(n):
-    return [SimpleNamespace(
-        text=f't{i}', hint='h', kind='python', rel_file='a.rpy',
-        line=i + 1, file='a.rpy', static_reason='', static_danger=False,
-        ai_keep=None, ai_confident=False, ai_reason='') for i in range(n)]
-
-
-def _progress():
-    return {'phase': '', 'done': 0, 'total': 0, 'finished': False}
-
-
-def _screener_for_screen(tmp_path):
-    from concurrent.futures import ThreadPoolExecutor
-    s = _mk_screener(FakeTranslator([]), tmp_path)
-    s._pool = ThreadPoolExecutor(max_workers=2)
-    s._tree = FakeTree()
-    s.REFINE_BATCH = 2
-    s.COARSE_BATCH = 2
-    return s
-
-
 class TestBatchFailureNotFatal:
-    def test_refine_retry_succeeds(self, tmp_path):
-        """首批抛异常不中断：其余批次照跑，收尾重试成功则全部判定"""
-        s = _screener_for_screen(tmp_path)
-        calls = {'n': 0}
-
-        def fake_refine(batch, progress=None):
-            calls['n'] += 1
-            if calls['n'] == 1:
-                raise RuntimeError('10 轮追问后仍未获判决')
-            return {idx: (True, f'r{idx}') for idx, _ in batch}
-
-        s._refine_batch = fake_refine
-        cands = _cands(4)
-        s._refine_screen(cands, _progress())
-        assert all(c.ai_keep is True for c in cands)
-        assert calls['n'] == 3  # 2 批 + 1 次收尾重试
-
-    def test_refine_retry_fails_keeps_pending(self, tmp_path):
-        """重试仍失败：候选保持未决，原因带失败摘要，不抛"""
-        s = _screener_for_screen(tmp_path)
-
-        def always_fail(batch, progress=None):
-            raise RuntimeError("AI 最后输出: '我不会判'")
-
-        s._refine_batch = always_fail
-        cands = _cands(4)
-        s._refine_screen(cands, _progress())  # 不抛
-        assert all(c.ai_keep is None for c in cands)
-        assert all('精审失败' in c.ai_reason for c in cands)
-        assert all(c.ai_confident is False for c in cands)
-
-    def test_coarse_retry_fails_keeps_pending(self, tmp_path):
-        """粗筛批失败同样跳过+收尾重试+保持未决"""
-        s = _screener_for_screen(tmp_path)
-
-        def always_fail(batch):
-            raise ValueError('粗筛返回无法解析: ...')
-
-        s._coarse_batch = always_fail
-        cands = _cands(4)
-        s._coarse_screen(cands, _progress())  # 不抛
-        assert all(c.ai_keep is None for c in cands)
-        assert all('粗筛失败' in c.ai_reason for c in cands)
-
-    def test_coarse_retry_succeeds(self, tmp_path):
-        s = _screener_for_screen(tmp_path)
-        calls = {'n': 0}
-
-        def fake_coarse(batch):
-            calls['n'] += 1
-            if calls['n'] == 1:
-                raise ValueError('bad json')
-            return {it['id']: (True, True, '界面文本') for it in batch}
-
-        s._coarse_batch = fake_coarse
-        cands = _cands(4)
-        s._coarse_screen(cands, _progress())
-        assert all(c.ai_keep is True for c in cands)
-        assert calls['n'] == 3
-
     def test_all_rounds_incomplete_raises(self, tmp_path):
         """追问到轮数上限仍缺 → 响亮失败（不静默降级）"""
         s = _mk_screener(FakeTranslator([]), tmp_path)
