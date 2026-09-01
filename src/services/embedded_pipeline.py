@@ -1,18 +1,19 @@
 """内嵌文本提取管线服务（从 text_panel 抽取，无 UI 依赖）
 
-流程：扫描 → 合并持久化 → AI 预筛（只判未决）→ [人工确认/全部重判] →
-标记源码 → SDK 重生成 → 解析合并入库。
+流程：扫描 → 合并持久化 → AI 预筛（只判未决）→ [人工确认/灰区复核] →
+应用选择（strings 表 / _() 包裹分流）→ 入库。
 
 粒度化 API，NiceGUI 面板与 FastAPI 任务共用同一实现：
     pipe = EmbeddedPipeline(db, translator, project_dir, sdk_path, logger)
     rows = await pipe.scan_and_merge()
     await pipe.screen_undecided(rows, on_progress=lambda phase, done, total: ...)
-    # ... 人工确认（UI/任务 ask）；重判 → pipe.rescreen_all(rows) ...
+    # ... 人工确认（UI/任务 ask）；复核 → pipe.recheck_grayzone(rows) ...
     result = await pipe.apply_selection(rows, chosen_rows, stage=lambda text: ...)
 
 失败哲学：不降级——无翻译器/无 SDK/AI 失败均抛异常，由调用方响亮呈现。
 """
 import asyncio
+import re
 import time
 from pathlib import Path
 
@@ -26,6 +27,27 @@ def _swallow_task_error(task):
         task.result()
     except Exception:
         pass
+
+
+def _grayzone_rows(rows: list, flip_ids: set) -> list:
+    """灰区复核目标（判定与证据可能冲突的行；纯函数便于单测）：
+    - 判 keep 且有非显示用途警告（ai_danger）——危险方向必须核实
+    - 判 drop 但像自然语言长文本（去插值后 ≥20 字符且 ≥3 词）——可能错杀
+    - 历史翻转过的行（verdict_log 中出现过不同判定）
+    """
+    out = []
+    for r in rows:
+        if r['ai_keep'] == 1 and r.get('ai_danger'):
+            out.append(r)
+            continue
+        if r['ai_keep'] == 0:
+            text = re.sub(r'\[[^\]]*\]', '', r['candidate'].text).strip()
+            if len(text) >= 20 and len(text.split()) >= 3:
+                out.append(r)
+                continue
+        if r['id'] in flip_ids:
+            out.append(r)
+    return out
 
 
 class EmbeddedPipeline:
@@ -105,44 +127,107 @@ class EmbeddedPipeline:
             screener.close()
 
         # 保存判定（含静态分析的危险用途标记）；批次失败保持未决的
-        # 候选 ai_keep=None，归一为 -1 入库（0 会被当成"判不翻"）
+        # 候选 ai_keep=None，归一为 -1 入库（0 会被当成"判不翻"）。
+        # keep=1 的行一并决定应用路径（strings 表 / _() 包裹）。
+        # stage 按判定来源区分：精审判决带证据引用（粗筛票决没有）——
+        # verdict_log 的审计链据此能精确还原"谁判的"
+        from usage_rules import decide_apply_path
         for r in undecided:
             c = r['candidate']
             danger = bool(getattr(c, 'static_danger', False))
             keep_db = -1 if c.ai_keep is None else (1 if c.ai_keep else 0)
+            apply_path = decide_apply_path(c) if keep_db == 1 else ''
+            evidence = getattr(c, 'ai_evidence', '')
             await loop.run_in_executor(
                 None, self.db.update_embedded_ai,
-                r['id'], keep_db, c.ai_reason, danger)
+                r['id'], keep_db, c.ai_reason, danger,
+                evidence, apply_path,
+                'refine' if evidence else 'coarse')
             r['ai_keep'] = keep_db
             r['ai_reason'] = c.ai_reason
             r['ai_danger'] = 1 if danger else 0
+            r['ai_evidence'] = getattr(c, 'ai_evidence', '')
+            r['apply_path'] = apply_path
 
-    async def rescreen_all(self, rows, on_progress=None, cancel_event=None):
-        """全部重判：清空判定后重新预筛"""
+    async def recheck_grayzone(self, rows, on_progress=None, cancel_event=None):
+        """灰区复核（取代"全部重判"）：只对判定与证据可能冲突的行做
+        锚定精审；其余行一律不重送（判定冻结——级联判定已产出终判，
+        复核的目的是纠错，不是重掷骰子）。
+
+        锚定精审：上轮判定与理由随条目给出，除非工具找到矛盾的新证据
+        （必须引用 file:line）否则维持原判——翻转即纠错，都有据可查。
+        """
+        from ai_screener import AIScreener, ScreeningCancelled
+        from source_tree import SourceTree
+        from usage_rules import UsageAnalyzer, decide_apply_path
         loop = asyncio.get_event_loop()
-        ids = [r['id'] for r in rows]
-        before = {r['id']: r['ai_keep'] for r in rows
-                  if r['ai_keep'] in (0, 1)}
-        await loop.run_in_executor(None, self.db.reset_embedded_ai, ids)
-        for r in rows:
-            r['ai_keep'] = -1
-            r['ai_reason'] = ''
-            r['candidate'].ai_keep = None
-            r['candidate'].ai_reason = ''
-        await self.screen_undecided(rows, on_progress, cancel_event)
 
-        # 翻转透明化：判定温度为 0 后重判可复现，残余翻转主要来自批次
-        # 上下文差异；翻转条目仍走人工确认，不会自动进入翻译
-        flips = [r for r in rows
-                 if r['id'] in before and r['ai_keep'] in (0, 1)
-                 and r['ai_keep'] != before[r['id']]]
-        if flips:
-            to_keep = sum(1 for r in flips if r['ai_keep'] == 1)
-            self.logger.info(
-                f'重判完成: {len(rows)} 条，与上轮一致 '
-                f'{len(rows) - len(flips)}，翻转 {len(flips)}'
-                f'（改判为可翻译 {to_keep} / 改判为不翻 {len(flips) - to_keep}）；'
-                '翻转条目仍需人工确认', panel='ui')
+        flip_ids = set(await loop.run_in_executor(
+            None, self.db.get_embedded_flip_history))
+        targets = _grayzone_rows(rows, flip_ids)
+        if not targets:
+            self.logger.info('灰区复核: 没有判定与证据冲突的行', panel='ui')
+            return
+
+        before = {r['id']: r['ai_keep'] for r in targets}
+        cands = [r['candidate'] for r in targets]
+        # 静态分析重跑（源码可能已变），与精审工具共用同一源码缓存
+        tree = SourceTree(str(self.base_dir))
+        await loop.run_in_executor(
+            None,
+            UsageAnalyzer(str(self.base_dir), files=tree.as_dict()).classify_all,
+            cands)
+
+        screener = AIScreener(self.translator, str(self.base_dir), self.logger,
+                              source_tree=tree)
+        anchored = {i: {'keep': bool(r['ai_keep']), 'reason': r['ai_reason']}
+                    for i, r in enumerate(targets)}
+        progress = {'phase': '复核', 'done': 0, 'total': len(cands),
+                    'finished': False}
+
+        def _run():
+            try:
+                screener._refine_screen(cands, progress, cancel_event,
+                                        anchored=anchored)
+            finally:
+                progress['finished'] = True
+
+        task = loop.run_in_executor(None, _run)
+        try:
+            while not progress.get('finished'):
+                if cancel_event is not None and cancel_event.is_set():
+                    task.add_done_callback(_swallow_task_error)
+                    raise ScreeningCancelled('灰区复核已取消')
+                if on_progress:
+                    on_progress(progress['phase'], progress['done'],
+                                progress['total'])
+                await asyncio.sleep(0.5)
+            await task
+        finally:
+            screener.close()
+
+        for r in targets:
+            c = r['candidate']
+            danger = bool(getattr(c, 'static_danger', False))
+            keep_db = -1 if c.ai_keep is None else (1 if c.ai_keep else 0)
+            apply_path = decide_apply_path(c) if keep_db == 1 else ''
+            await loop.run_in_executor(
+                None, self.db.update_embedded_ai,
+                r['id'], keep_db, c.ai_reason, danger,
+                getattr(c, 'ai_evidence', ''), apply_path, 'recheck')
+            r['ai_keep'] = keep_db
+            r['ai_reason'] = c.ai_reason
+            r['ai_danger'] = 1 if danger else 0
+            r['ai_evidence'] = getattr(c, 'ai_evidence', '')
+            r['apply_path'] = apply_path
+
+        # 翻转透明化：锚定复核的翻转都附新证据（evidence 引用），仍走人工确认
+        flips = [r for r in targets
+                 if r['ai_keep'] in (0, 1) and r['ai_keep'] != before[r['id']]]
+        self.logger.info(
+            f'灰区复核完成: 复核 {len(targets)} 条，维持 '
+            f'{len(targets) - len(flips)}，翻转 {len(flips)}'
+            '（翻转均有引用证据，仍需人工确认）', panel='ui')
 
     async def refine_rows(self, rows, on_progress=None, cancel_event=None):
         """批量 agentic 精判（跳过粗筛，每行都走带工具的精审），写库
@@ -192,21 +277,27 @@ class EmbeddedPipeline:
         finally:
             screener.close()
 
+        from usage_rules import decide_apply_path
         for r in rows:
             c = r['candidate']
             danger = bool(getattr(c, 'static_danger', False))
             keep_db = -1 if c.ai_keep is None else (1 if c.ai_keep else 0)
+            apply_path = decide_apply_path(c) if keep_db == 1 else ''
             await loop.run_in_executor(
                 None, self.db.update_embedded_ai,
-                r['id'], keep_db, c.ai_reason, danger)
+                r['id'], keep_db, c.ai_reason, danger,
+                getattr(c, 'ai_evidence', ''), apply_path, 'refine')
             r['ai_keep'] = keep_db
             r['ai_reason'] = c.ai_reason
             r['ai_danger'] = 1 if danger else 0
+            r['ai_evidence'] = getattr(c, 'ai_evidence', '')
+            r['apply_path'] = apply_path
 
     # ---- 单句精判 ----
 
     async def refine_single(self, row) -> tuple:
-        """单句 AI 精判（agentic，带工具），写库并返回 (keep, reason, danger)
+        """单句 AI 精判（agentic，带工具），写库并返回
+        (keep, reason, danger, evidence, apply_path)
 
         先跑静态用途分析，把出现点证据/危险用途注入精审输入，
         AI 不用从头盲查（refine_by_id 重建的候选没有 static_* 字段）。
@@ -214,7 +305,7 @@ class EmbeddedPipeline:
         """
         from ai_screener import AIScreener
         from source_tree import SourceTree
-        from usage_rules import UsageAnalyzer
+        from usage_rules import UsageAnalyzer, decide_apply_path
         loop = asyncio.get_event_loop()
         c = row['candidate']
         # 静态分析与精审工具共用同一源码缓存（单句也免两次全树扫描）
@@ -231,19 +322,23 @@ class EmbeddedPipeline:
                 None, screener._refine_batch, [(0, c)])
         finally:
             screener.close()
-        keep, reason = verdicts[0]
+        keep, reason, evidence, _apply = verdicts[0]
         danger = bool(getattr(c, 'static_danger', False))
+        apply_path = decide_apply_path(c) if keep else ''
         c.ai_keep, c.ai_reason = keep, reason
         row['ai_keep'] = 1 if keep else 0
         row['ai_reason'] = reason
         row['ai_danger'] = 1 if danger else 0
+        row['ai_evidence'] = evidence
+        row['apply_path'] = apply_path
         await loop.run_in_executor(
-            None, self.db.update_embedded_ai, row['id'], keep, reason, danger)
-        return keep, reason, danger
+            None, self.db.update_embedded_ai, row['id'], keep, reason, danger,
+            evidence, apply_path, 'refine_single')
+        return keep, reason, danger, evidence, apply_path
 
     async def refine_by_id(self, row_id: int) -> tuple:
         """按 db 行 id 单句精判（API 用：从 db 重建最小 Candidate）
-        返回 (keep, reason, danger)"""
+        返回 (keep, reason, danger, evidence, apply_path)"""
         from embedded_strings import Candidate
         loop = asyncio.get_event_loop()
         rec = await loop.run_in_executor(
@@ -262,17 +357,20 @@ class EmbeddedPipeline:
                'ai_keep': rec['ai_keep'], 'ai_reason': rec['ai_reason']}
         return await self.refine_single(row)
 
-    # ---- 步骤 4~6: 标记 → SDK 重生成 → 合并入库 ----
+    # ---- 步骤 4~6: 应用选择（strings 表 / _() 包裹分流）----
 
     async def apply_selection(self, rows, chosen_rows, stage=None,
                               cancel_event=None) -> dict:
         """应用人工选择。stage(text) 报告阶段。
         cancel_event: 可选 threading.Event，传给 SDK 子进程以便中止。
 
-        Returns: {'wrapped': int, 'skipped': int, 'inserted': int}
-        无 SDK 路径 / SDK 失败均抛异常（已标记的 _() 留在源码里无害，可重跑）。
+        分流：apply_path='table'（默认）的行写入 zz_embedded.rpy 翻译表
+        （零源码改动，不经 SDK）；'wrap' 的行包 _() 后走 SDK 重生成模板
+        （仅 wrap 行非空才需要 SDK）。
+        Returns: {'tabled': int, 'wrapped': int, 'skipped': int, 'inserted': int}
         """
         from embedded_strings import apply_wrapping
+        from services.embedded_table import regen_embedded_table
         loop = asyncio.get_event_loop()
 
         def _stage(text):
@@ -280,80 +378,112 @@ class EmbeddedPipeline:
                 stage(text)
 
         if not chosen_rows:
-            return {'wrapped': 0, 'skipped': 0, 'inserted': 0}
+            return {'tabled': 0, 'wrapped': 0, 'skipped': 0, 'inserted': 0}
 
-        chosen = [r['candidate'] for r in chosen_rows]
+        def _path_of(r):
+            return r.get('apply_path') or r['candidate'].apply_path or 'table'
 
-        _stage('正在标记源码...')
-        wrapped, skipped, ok_pos = await loop.run_in_executor(
-            None, apply_wrapping, chosen)
-        self.logger.info(
-            f'内嵌文本标记: {wrapped} 成功, {skipped} 跳过'
-            f'（跳过的保留在待复核，下轮可重试）', panel='ui')
-        # 只有实际包裹成功的才标 marked：位置校验失败（源码被改动/读取
-        # 失败）的若也标 marked，源码未变却退出复核列表，静默漏翻
+        wrap_rows = [r for r in chosen_rows if _path_of(r) == 'wrap']
+        table_rows = [r for r in chosen_rows if _path_of(r) != 'wrap']
         chosen_ids = {r['id'] for r in chosen_rows}
-        marked_ids = [
-            r['id'] for r in chosen_rows
-            if (r['candidate'].file, r['candidate'].line,
-                r['candidate'].col_start) in ok_pos]
-        await loop.run_in_executor(
-            None, self.db.set_embedded_status, marked_ids, 'marked')
+        inserted = 0
+
+        # ---- table 路径：写翻译表（零源码改动，不经 SDK） ----
+        if table_rows:
+            _stage('正在写入内嵌翻译表...')
+            await loop.run_in_executor(
+                None, self.db.set_embedded_status,
+                [r['id'] for r in table_rows], 'marked')
+            inserted += await loop.run_in_executor(
+                None, regen_embedded_table, self.db, self.game_root,
+                self.logger)
+            self.logger.info(
+                f'内嵌翻译表: {len(table_rows)} 条已写入 zz_embedded.rpy',
+                panel='ui')
+
+        # ---- wrap 路径：包 _() → SDK 重生成 → 合并入库 ----
+        wrapped = skipped = 0
+        if wrap_rows:
+            chosen = [r['candidate'] for r in wrap_rows]
+            _stage('正在标记源码...')
+            wrapped, skipped, ok_pos = await loop.run_in_executor(
+                None, apply_wrapping, chosen)
+            self.logger.info(
+                f'内嵌文本标记: {wrapped} 成功, {skipped} 跳过'
+                f'（跳过的保留在待复核，下轮可重试）', panel='ui')
+            # 只有实际包裹成功的才标 marked：位置校验失败（源码被改动/读取
+            # 失败）的若也标 marked，源码未变却退出复核列表，静默漏翻
+            marked_ids = [
+                r['id'] for r in wrap_rows
+                if (r['candidate'].file, r['candidate'].line,
+                    r['candidate'].col_start) in ok_pos]
+            await loop.run_in_executor(
+                None, self.db.set_embedded_status, marked_ids, 'marked')
+
+            # SDK 重新生成模板
+            if not self.sdk_path:
+                raise RuntimeError(
+                    f"已标记 {wrapped} 条，但未配置 Ren'Py SDK 路径，无法重新生成模板")
+
+            _stage('正在重新生成翻译模板...')
+            from sdk_manager import SDKManager
+
+            def _regen():
+                sdk = SDKManager()
+                sdk.sdk_path = Path(self.sdk_path)
+                # renpy.exe 在 Windows 上偶发访问冲突崩溃（0xC0000005，与负载/杀软
+                # 扫描相关的间歇性崩溃），延迟重试数次
+                for attempt in range(1, 6):
+                    result = sdk.generate_translations(
+                        str(self.game_root), 'chinese',
+                        cancel_event=cancel_event)
+                    if result['success'] or result.get('cancelled'):
+                        return result
+                    self.logger.warning(
+                        f'SDK 生成模板第 {attempt} 次失败: {result["message"]}',
+                        panel='ui')
+                    time.sleep(2)
+                return result
+
+            sdk_result = await loop.run_in_executor(None, _regen)
+            if sdk_result.get('cancelled'):
+                from ai_screener import ScreeningCancelled
+                raise ScreeningCancelled('SDK 重新生成模板已取消')
+            if not sdk_result['success']:
+                self.logger.error(
+                    f'SDK 重新生成模板失败: {sdk_result["message"]}', panel='ui')
+                raise RuntimeError(
+                    f'SDK 重新生成失败: {sdk_result["message"]}')
+
+            # 合并入库
+            _stage('正在合并新字符串入库...')
+            from tl_parser import parse_translation_files
+            tl_dir = self.game_root / 'game' / 'tl' / 'chinese'
+            tl_result = await loop.run_in_executor(
+                None, parse_translation_files, tl_dir, str(self.game_root),
+                self.logger)
+
+            # 把提取阶段的出处写进新字符串的 context_hint
+            # （候选 text 已反转义，tl old 文本含字面 \n，两种形式都建映射）
+            hint_map = {}
+            for c in chosen:
+                hint_map[c.text] = c.hint
+                hint_map[c.text.replace('\n', '\\n').replace('"', '\\"')] = c.hint
+            for it in tl_result.get('ui_texts', []):
+                if it['original_text'] in hint_map:
+                    it['context_hint'] = hint_map[it['original_text']]
+
+            inserted += await loop.run_in_executor(
+                None, self.db.insert_ui_texts_new_only,
+                tl_result.get('ui_texts', []))
+
+        # 未选行照旧标 skipped
         await loop.run_in_executor(
             None, self.db.set_embedded_status,
             [r['id'] for r in rows if r['id'] not in chosen_ids], 'skipped')
 
-        # SDK 重新生成模板
-        if not self.sdk_path:
-            raise RuntimeError(
-                f"已标记 {wrapped} 条，但未配置 Ren'Py SDK 路径，无法重新生成模板")
-
-        _stage('正在重新生成翻译模板...')
-        from sdk_manager import SDKManager
-
-        def _regen():
-            sdk = SDKManager()
-            sdk.sdk_path = Path(self.sdk_path)
-            # renpy.exe 在 Windows 上偶发访问冲突崩溃（0xC0000005，与负载/杀软
-            # 扫描相关的间歇性崩溃），延迟重试数次
-            for attempt in range(1, 6):
-                result = sdk.generate_translations(
-                    str(self.game_root), 'chinese', cancel_event=cancel_event)
-                if result['success'] or result.get('cancelled'):
-                    return result
-                self.logger.warning(
-                    f'SDK 生成模板第 {attempt} 次失败: {result["message"]}', panel='ui')
-                time.sleep(2)
-            return result
-
-        sdk_result = await loop.run_in_executor(None, _regen)
-        if sdk_result.get('cancelled'):
-            from ai_screener import ScreeningCancelled
-            raise ScreeningCancelled('SDK 重新生成模板已取消')
-        if not sdk_result['success']:
-            self.logger.error(f'SDK 重新生成模板失败: {sdk_result["message"]}', panel='ui')
-            raise RuntimeError(f'SDK 重新生成失败: {sdk_result["message"]}')
-
-        # 合并入库
-        _stage('正在合并新字符串入库...')
-        from tl_parser import parse_translation_files
-        tl_dir = self.game_root / 'game' / 'tl' / 'chinese'
-        tl_result = await loop.run_in_executor(
-            None, parse_translation_files, tl_dir, str(self.game_root), self.logger)
-
-        # 把提取阶段的出处写进新字符串的 context_hint
-        # （候选 text 已反转义，tl old 文本含字面 \n，两种形式都建映射）
-        hint_map = {}
-        for c in chosen:
-            hint_map[c.text] = c.hint
-            hint_map[c.text.replace('\n', '\\n').replace('"', '\\"')] = c.hint
-        for it in tl_result.get('ui_texts', []):
-            if it['original_text'] in hint_map:
-                it['context_hint'] = hint_map[it['original_text']]
-
-        inserted = await loop.run_in_executor(
-            None, self.db.insert_ui_texts_new_only, tl_result.get('ui_texts', []))
-
         self.logger.info(
-            f'内嵌文本提取完成: 标记 {wrapped}, 新增 {inserted} 条', panel='ui')
-        return {'wrapped': wrapped, 'skipped': skipped, 'inserted': inserted}
+            f'内嵌文本提取完成: 入表 {len(table_rows)}, 标记 {wrapped}, '
+            f'新增 {inserted} 条', panel='ui')
+        return {'tabled': len(table_rows), 'wrapped': wrapped,
+                'skipped': skipped, 'inserted': inserted}

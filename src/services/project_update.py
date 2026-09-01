@@ -472,6 +472,13 @@ class ProjectUpdater:
                 cancel_event=cancel_event)
             progress(0.60, 'SDK 模板就绪')
 
+            # 步骤6b: 内嵌 strings 表重生成（table 路径无需重标记——
+            # 全量重写 zz_embedded.rpy；新源码中消失的文本不写文件，
+            # 行保持 marked，文本回归后下次自动恢复；译文在步骤9
+            # 按 original_text 从旧 ui_texts 池继承）
+            from services.embedded_table import regen_embedded_table
+            await _rie(regen_embedded_table, db, game_work_dir, self.logger)
+
             # 步骤8: 解析新模板
             tl_dir = game_work_dir / 'game' / 'tl' / 'chinese'
             tl_exists = await _rie(tl_dir.exists)

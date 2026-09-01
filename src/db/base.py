@@ -106,10 +106,23 @@ CREATE TABLE IF NOT EXISTS embedded_candidates (
     ai_keep INTEGER DEFAULT -1,
     ai_reason TEXT DEFAULT '',
     ai_danger INTEGER DEFAULT 0,
+    ai_evidence TEXT DEFAULT '',
+    apply_path TEXT DEFAULT '',
     status TEXT DEFAULT 'pending',
     updated_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_embedded_status ON embedded_candidates(status);
+
+-- 判定历史（翻转审计链：灰区复核目标来源）
+CREATE TABLE IF NOT EXISTS embedded_verdict_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_id INTEGER DEFAULT 0,
+    ai_keep INTEGER DEFAULT -1,
+    ai_reason TEXT DEFAULT '',
+    stage TEXT DEFAULT '',
+    created_at TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_verdict_log_row ON embedded_verdict_log(row_id);
 
 -- 版本更新后失效的旧译文（新版游戏中已不存在的原文）
 CREATE TABLE IF NOT EXISTS obsolete_translations (
@@ -264,6 +277,8 @@ class Base:
             ('ui_texts', 'label', "TEXT DEFAULT ''"),
             ('ui_texts', 'context_hint', "TEXT DEFAULT ''"),
             ('embedded_candidates', 'ai_danger', "INTEGER DEFAULT 0"),
+            ('embedded_candidates', 'ai_evidence', "TEXT DEFAULT ''"),
+            ('embedded_candidates', 'apply_path', "TEXT DEFAULT ''"),
             ('story_nodes', 'first_text_cn', "TEXT DEFAULT ''"),
             ('story_edges', 'text_cn', "TEXT DEFAULT ''"),
             ('char_relations', 'category', "TEXT DEFAULT 'other'"),

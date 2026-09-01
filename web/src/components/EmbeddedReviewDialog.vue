@@ -5,7 +5,7 @@
  * 底：全选/全不选/仅选AI建议 | 取消 / 重判筛出 / 精判筛出 / 标记并重新生成模板
  */
 import { computed, ref, watch } from 'vue'
-import { NButton, NCheckbox, NInput, NScrollbar, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
+import { NButton, NCheckbox, NInput, NPagination, NScrollbar, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
 import { CodeOutline, SparklesOutline } from '@vicons/ionicons5'
 import { api, toastError } from '../api/client'
 import { useJobsStore, type JobView } from '../stores/jobs'
@@ -24,6 +24,8 @@ export interface EmbeddedRow {
   ai_keep: number   // 1 / 0 / -1
   ai_reason: string
   ai_danger: number // 1 = 静态分析发现比较/键名/资源等非显示用途
+  ai_evidence: string // AI 判决引用的代码位置（file:line）
+  apply_path: string  // 'table' = 写入翻译表（不改源码）, 'wrap' = 源码包 _()
   source: string    // 'rule' = 静态规则判定, 'ai' = 模型判定
   status: string
 }
@@ -39,6 +41,7 @@ const refining = ref<Set<number>>(new Set())
 const snippetFor = ref<number | null>(null)
 const reasonFor = ref<number | null>(null)
 const answering = ref(false)
+const page = ref(1)
 
 function defaultChecked(r: EmbeddedRow): boolean {
   if (r.ai_keep !== -1) return !!r.ai_keep
@@ -52,9 +55,12 @@ watch(() => props.question.question_id, () => {
   chosen.value = new Set(rows.value.filter(defaultChecked).map((r) => r.id))
   snippetFor.value = null
   reasonFor.value = null
+  page.value = 1
 }, { immediate: true })
 
 const chosenCount = computed(() => chosen.value.size)
+
+// ---- 筛选 ----
 
 // ---- 筛选 ----
 const search = ref('')
@@ -102,6 +108,18 @@ const dangerOptions = [
   { label: '无 ⚠ 风险', value: 'safe' },
 ]
 
+// ---- 分页（候选可达数千行，全量渲染 checkbox/tag/按钮会卡死对话框） ----
+const PAGE_SIZE = 100
+const pageCount = computed(() =>
+  Math.max(1, Math.ceil(filteredRows.value.length / PAGE_SIZE)))
+const pagedRows = computed(() =>
+  filteredRows.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE))
+
+// 筛选条件变化回到第一页
+watch([search, verdictFilter, sourceFilter, kindFilter, dangerFilter], () => {
+  page.value = 1
+})
+
 function toggle(id: number, v: boolean) {
   if (v) chosen.value.add(id)
   else chosen.value.delete(id)
@@ -147,11 +165,13 @@ async function refineOne(row: EmbeddedRow) {
   refining.value.add(row.id)
   await acquireRefineSlot()
   try {
-    const data = await api.post<{ ai_keep: number; ai_reason: string; ai_danger: number }>(
+    const data = await api.post<{ ai_keep: number; ai_reason: string; ai_danger: number; ai_evidence: string; apply_path: string }>(
       `/api/current/embedded/refine/${row.id}`)
     row.ai_keep = data.ai_keep
     row.ai_reason = data.ai_reason
     row.ai_danger = data.ai_danger
+    row.ai_evidence = data.ai_evidence
+    row.apply_path = data.apply_path
     row.source = 'ai'   // 单句精判是模型判定
     toggle(row.id, !!data.ai_keep)
   } catch (e) {
@@ -205,13 +225,14 @@ function truncate(s: string, n: number): string {
       </span>
     </n-space>
     <div style="font-size: 12px; color: #e8a33d; margin-bottom: 8px">
-      ✓/✗ 为预筛建议（规则=静态分析确定，AI=模型判定），⚠ 表示该字符串另有比较/键名/资源用途，
-      包 _() 后这些用途可能失效，请点「理由」查看 AI 核实结论。最终以你的勾选为准。<br>
+      ✓/✗ 为级联判定结论（规则=静态分析确定，AI=模型多票判定），已判定的条目默认冻结不再重筛；
+      ⚠ 表示该字符串另有比较/键名/资源用途。「复核灰区」只针对判定与证据冲突的条目做锚定纠错。最终以你的勾选为准。<br>
+      「表」= 写入翻译表（不改源码，逻辑比较仍用原文）；「包」= 源码包 _()（拼接/格式化用途只能这样）。
       define 期求值的数据在游戏中途切换语言不会更新（开局选中文或重启后正常）。
     </div>
 
     <n-scrollbar style="max-height: 46vh">
-      <div v-for="r in filteredRows" :key="r.id" style="padding: 3px 0; border-bottom: 1px solid #262626">
+      <div v-for="r in pagedRows" :key="r.id" style="padding: 3px 0; border-bottom: 1px solid #262626">
         <n-space align="center" :wrap="false" size="small">
           <n-checkbox
             :checked="chosen.has(r.id)" size="small"
@@ -224,6 +245,11 @@ function truncate(s: string, n: number): string {
           <n-tag
             v-if="r.ai_danger" size="tiny" type="warning" :bordered="false"
           >⚠</n-tag>
+          <n-tag
+            v-if="r.ai_keep === 1 && r.apply_path" size="tiny" :bordered="false"
+            :type="r.apply_path === 'wrap' ? 'info' : 'default'"
+            :title="r.apply_path === 'wrap' ? '源码包 _()（拼接/格式化用途）' : '写入翻译表（不改源码）'"
+          >{{ r.apply_path === 'wrap' ? '包' : '表' }}</n-tag>
           <n-tag
             v-if="r.ai_keep !== -1" size="tiny"
             :type="r.ai_keep ? 'success' : 'error'" :bordered="false"
@@ -251,6 +277,9 @@ function truncate(s: string, n: number): string {
             ⚠ 静态分析发现该字符串另有比较/键名/资源等非显示用途，翻译后这些用途可能失效。
           </span>
           {{ r.ai_reason }}
+          <span v-if="r.ai_evidence" style="color: #6a9fd8">
+            <br>证据：{{ r.ai_evidence }}
+          </span>
         </div>
         <code-snippet
           v-if="snippetFor === r.id"
@@ -258,14 +287,18 @@ function truncate(s: string, n: number): string {
         />
       </div>
     </n-scrollbar>
+    <n-pagination
+      v-if="pageCount > 1" v-model:page="page" :page-count="pageCount"
+      size="small" style="margin-top: 6px; justify-content: center"
+    />
 
     <n-space justify="end" style="margin-top: 10px">
       <n-button size="small" :disabled="answering" @click="answer({ action: 'cancel' })">取消</n-button>
       <n-button
         size="small" type="warning" :disabled="answering || !filteredRows.length"
-        @click="answer({ action: 'rescreen', row_ids: filteredRows.map((r) => r.id) })"
+        @click="answer({ action: 'recheck', row_ids: filteredRows.map((r) => r.id) })"
       >
-        重判筛出的 {{ filteredRows.length }} 条
+        复核灰区 {{ filteredRows.length }} 条
       </n-button>
       <n-button
         size="small" type="warning" :disabled="answering || !filteredRows.length"

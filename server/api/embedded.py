@@ -32,6 +32,8 @@ def _row_payload(r: dict) -> dict:
         'file': c.rel_file, 'line': c.line, 'confidence': c.confidence,
         'raw': c.raw,
         'ai_keep': r['ai_keep'], 'ai_reason': reason, 'ai_danger': danger,
+        'ai_evidence': r.get('ai_evidence', ''),
+        'apply_path': r.get('apply_path', ''),
         # 判定来源：rule=静态规则确定，ai=模型判定（前端显示不同标识）
         'source': 'rule' if reason.startswith(RULE_REASON_PREFIX) else 'ai',
         'status': r.get('status', 'pending'),
@@ -74,14 +76,15 @@ async def scan(state: AppState = Depends(require_project)):
                 ids = set(answer.get('row_ids') or [])
                 return [r for r in rows if r['id'] in ids] if ids else rows
 
-            if action == 'rescreen':
+            if action == 'recheck':
                 target = _target_rows()
-                job.emit_log(f'重判 {len(target)} 条：清空判定，重新 AI 预筛')
-                await pipe.rescreen_all(
+                job.emit_log(f'灰区复核 {len(target)} 条（锚定上轮判定，'
+                             '仅纠错不重猜）')
+                await pipe.recheck_grayzone(
                     target,
                     on_progress=lambda phase, done, total: job.emit_progress(
                         done / max(total, 1) * 0.9,
-                        f'AI 重判（{phase}）: {done}/{total}'),
+                        f'灰区复核（{phase}）: {done}/{total}'),
                     cancel_event=job.cancel_event)
                 continue
             if action == 'refine_all':
@@ -118,11 +121,13 @@ async def refine(row_id: int, state: AppState = Depends(require_project)):
         raise ApiError(409, 'NO_TRANSLATOR', '请先配置翻译器（模型配置）')
     pipe = _pipeline(state)
     try:
-        keep, reason, danger = await pipe.refine_by_id(row_id)
+        keep, reason, danger, evidence, apply_path = await pipe.refine_by_id(
+            row_id)
     except KeyError as e:
         raise ApiError(404, 'NOT_FOUND', str(e))
     return {'ai_keep': 1 if keep else 0, 'ai_reason': reason,
-            'ai_danger': 1 if danger else 0}
+            'ai_danger': 1 if danger else 0, 'ai_evidence': evidence,
+            'apply_path': apply_path}
 
 
 @router.get('/snippet')
