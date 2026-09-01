@@ -26,7 +26,8 @@ _RESOURCE_EXTS = {
 
 # A 类：屏幕语言裸字符串（textbutton/text/label/tooltip，未包 _()）
 _SCREEN_STRING_RE = re.compile(
-    r'\b(textbutton|text|label|tooltip)\s+("(?:[^"\\]|\\.)*?")'
+    r'\b(textbutton|text|label|tooltip)\s+'
+    r'("(?:[^"\\]|\\.)*?"|\'(?:[^\'\\]|\\.)*?\')'
 )
 
 # B 类：python 字符串字面量
@@ -36,6 +37,24 @@ _PY_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*?"|\'(?:[^\'\\]|\\.)*?\'')
 _TRIPLE_RE = re.compile(
     r'"""(?:[^"\\]|\\.|"(?!""))*?"""|\'\'\'(?:[^\'\\]|\\.|\'(?!\'\'))*?\'\'\''
 )
+
+# screen 参数默认值：screen stats(title="Player", sub='x')
+_KWARG_STR_RE = re.compile(
+    r'(\w+)\s*=\s*("(?:[^"\\]|\\.)*?"|\'(?:[^\'\\]|\\.)*?\')')
+
+# screen 作用域内的 Notify("...") 动作串（Show/Hide/Play 的参数是
+# 屏幕名/资源路径，不提取）
+_NOTIFY_STR_RE = re.compile(
+    r'\bNotify\(\s*("(?:[^"\\]|\\.)*?"|\'(?:[^\'\\]|\\.)*?\')')
+
+# python 显示调用点（字符串是第一参数）：hint 与置信度增强用
+_DISPLAY_CALL_RE = re.compile(
+    r'(renpy\.notify|notify|renpy\.display_notify|renpy\.input|Text'
+    r'|renpy\.say)\(\s*$')
+_DISPLAY_CALL_HINTS = {
+    'renpy.notify': '通知', 'notify': '通知', 'renpy.display_notify': '通知',
+    'renpy.input': '输入提示', 'Text': '界面文本', 'renpy.say': '对话',
+}
 
 # python 上下文识别
 _PY_BLOCK_START_RE = re.compile(r'^(init\s+(-?\d+\s+)?)?python\b.*:')
@@ -47,6 +66,21 @@ _SCOPE_PATTERNS = [
 ]
 
 _SCOPE_KIND_NAMES = {'screen': '界面', 'label': '场景'}
+
+
+def _string_prefix(line: str, start: int) -> str:
+    """字面量的前缀（f/r/b/u 组合，如 'f'、'rf'），无则 ''
+
+    f"..." 被包 _() 会变成 f_(...) 非法语法且位置校验挡不住；
+    r/b 前缀串的转义语义与 _unescape 不符——带前缀的字面量整体跳过。
+    前缀串前若是标识符字符（df"x" 的 f 是变量名尾部）则不是前缀。
+    """
+    j = start - 1
+    while j >= 0 and line[j] in 'fFrRbBuU':
+        j -= 1
+    if j < start - 1 and (j < 0 or not (line[j].isalnum() or line[j] in '_.')):
+        return line[j + 1:start]
+    return ''
 
 
 def resolve_source_root(game_root) -> Path:
@@ -74,8 +108,10 @@ class Candidate:
     hint: str          # 出处描述
     confidence: str    # 'high' | 'low'（启发式）
     ai_keep: object = None   # AI 预筛结果：True/False/None(未筛或未决)
-    ai_confident: bool = True  # AI 自评置信度（False 时进入精审）
+    ai_confident: bool = True  # 级联判定内部状态（非模型自评）
     ai_reason: str = ''
+    ai_evidence: str = ''      # AI 判决引用的证据（file:line）
+    apply_path: str = ''       # 'table'（进翻译表）| 'wrap'（源码包 _()）
 
 
 def _unescape(s: str) -> str:
@@ -201,6 +237,21 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
             m = re.match(pattern, stripped)
             if m:
                 scope_stack.append((indent, kind, m.group(1)))
+                if kind == 'screen':
+                    # screen 参数默认值：screen stats(title="Player") 的
+                    # 字符串参数（渲染时被 kwarg 引用，是常见漏提取点）
+                    for km in _KWARG_STR_RE.finditer(raw_line):
+                        kw_literal = km.group(2)
+                        kw_text = _unescape(kw_literal[1:-1])
+                        if _is_noise(kw_text, 'screen'):
+                            continue
+                        out.append(Candidate(
+                            file=file_path, rel_file=rel_file, line=line_no,
+                            col_start=km.start(2), col_end=km.end(2),
+                            raw=kw_literal, text=kw_text, kind='screen',
+                            hint=f'{m.group(1)}界面·参数默认',
+                            confidence=_confidence(kw_text, 'screen'),
+                        ))
                 break
 
         scope_name = scope_stack[-1][2] if scope_stack else ''
@@ -230,6 +281,24 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
                 hint=make_hint(kind_name),
                 confidence=_confidence(text, 'screen'),
             ))
+
+        # ---- screen 作用域内的 Notify("...") 动作串 ----
+        if scope_kind == 'screen':
+            for m in _NOTIFY_STR_RE.finditer(raw_line):
+                # 已包 _()（Notify(_("x"))）跳过
+                if raw_line[max(0, m.start(1) - 3):m.start(1)].endswith('_('):
+                    continue
+                raw_literal = m.group(1)
+                text = _unescape(raw_literal[1:-1])
+                if _is_noise(text, 'screen'):
+                    continue
+                out.append(Candidate(
+                    file=file_path, rel_file=rel_file, line=line_no,
+                    col_start=m.start(1), col_end=m.end(1),
+                    raw=raw_literal, text=text, kind='screen',
+                    hint=make_hint('通知'),
+                    confidence=_confidence(text, 'screen'),
+                ))
 
         # ---- B 类：python 上下文字符串字面量 ----
         # 判定当前行是否在 python 上下文
@@ -265,10 +334,33 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
             # 单行三引号字面量区间：其中的内容不是可标记的字符串
             triple_spans = [m.span() for m in _TRIPLE_RE.finditer(raw_line)]
 
+            # 单行闭合三引号字面量本身是候选（_("""...""") 是合法语法，
+            # Ren'Py 的 _() 扫描也支持三引号）；多行块仍在上面整块跳过
+            for tm in _TRIPLE_RE.finditer(raw_line):
+                if _string_prefix(raw_line, tm.start()):
+                    continue
+                if raw_line[max(0, tm.start() - 3):tm.start()].endswith('_('):
+                    continue
+                raw_literal = tm.group(0)
+                text = _unescape(raw_literal[3:-3])
+                if _is_noise(text, 'python'):
+                    continue
+                out.append(Candidate(
+                    file=file_path, rel_file=rel_file, line=line_no,
+                    col_start=tm.start(), col_end=tm.end(),
+                    raw=raw_literal, text=text, kind='python',
+                    hint=make_hint('脚本文本'),
+                    confidence=_confidence(text, 'python'),
+                ))
+
             for m in _PY_STRING_RE.finditer(raw_line):
                 if any(s <= m.start() and m.end() <= e for s, e in triple_spans):
                     continue
                 raw_literal = m.group(0)
+                # f/r/b/u 前缀字面量：包 _() 会变 f_(...) 非法语法或转义
+                # 语义被破坏——整体跳过（含插值的 f-string 也无法 old/new 匹配）
+                if _string_prefix(raw_line, m.start()):
+                    continue
                 # 已被 _() 包裹的跳过（重复运行安全）
                 prefix = raw_line[max(0, m.start() - 3):m.start()]
                 if prefix.endswith('_('):
@@ -304,12 +396,21 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
                 text = _unescape(raw_literal[1:-1])
                 if _is_noise(text, 'python'):
                     continue
+                # 显示调用点（renpy.notify("...") 等第一参数）：
+                # 用途几乎没有悬念，hint 写具体、置信度拉满
+                dm = _DISPLAY_CALL_RE.search(before)
+                if dm:
+                    hint = make_hint(_DISPLAY_CALL_HINTS[dm.group(1)])
+                    conf = 'high'
+                else:
+                    hint = make_hint('脚本文本')
+                    conf = _confidence(text, 'python')
                 out.append(Candidate(
                     file=file_path, rel_file=rel_file, line=line_no,
                     col_start=m.start(), col_end=m.end(),
                     raw=raw_literal, text=text, kind='python',
-                    hint=make_hint('脚本文本'),
-                    confidence=_confidence(text, 'python'),
+                    hint=hint,
+                    confidence=conf,
                 ))
 
         # define/default 跨行表达式：跟踪括号余额
