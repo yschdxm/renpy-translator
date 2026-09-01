@@ -2,6 +2,8 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
+from llm_client import FatalAPIError
+
 from ..deps import require_project
 from ..errors import ApiError
 from ..state import AppState
@@ -122,13 +124,15 @@ async def _check_dialogue_prerequisites(state: AppState):
 def _make_translate_job(state: AppState, content_type: str, items: list):
     """批翻译任务体：逐批翻译，批间响应取消
 
-    单批解析失败（句数不匹配）由 service 暂存到 failed_batches 并返回空 dict，
-    任务继续后续批次；结束时汇总暂存数量。
+    单批失败（句数不匹配/整批异常）由 service 暂存到 failed_batches 并
+    返回空 dict，任务继续后续批次；全部批次跑完后对本任务暂存的条目
+    自动重试一轮，仍失败的保留在「失败条目」（可手动重试/单翻）。
     """
     async def body(job):
         service = _service(state)
         batches = await service.prepare_batches(items, content_type)
         total_items = len(items)
+        scope_ids = {it['id'] for it in items}
         done = 0
         stashed = 0
         job.emit_log(f'共 {total_items} 条，分 {len(batches)} 批')
@@ -139,9 +143,58 @@ def _make_translate_job(state: AppState, content_type: str, items: list):
             done += len(batch)
             job.emit_progress(done / total_items,
                               f'已翻译 {done}/{total_items}（第 {i+1}/{len(batches)} 批）')
-        if stashed:
-            job.emit_log(f'{stashed} 条未译出已暂存，'
-                         '可在页面「失败条目」中重试/单翻/手动')
+
+        # 收尾自动重试：本任务范围内暂存的条目再给一轮机会。
+        # stash_on_failure=False——重试成功的直接落库，仍失败的由这里
+        # 重新暂存（避免同一批在表里翻倍）
+        recs = await state.db_call(state.db.list_failed_batches, content_type)
+        touched = {}  # batch_id -> (范围内条目, 范围外条目, 原错误摘要)
+        for rec in recs:
+            mine = [it for it in rec['items'] if it['id'] in scope_ids]
+            if mine:
+                touched[rec['id']] = (
+                    mine,
+                    [it for it in rec['items'] if it['id'] not in scope_ids],
+                    rec.get('error', ''))
+        retry_items = [it for mine, _, _ in touched.values() for it in mine]
+        if retry_items:
+            job.emit_log(f'{len(retry_items)} 条未译出，做最后一轮自动重试...')
+            # 与主流程同一套 token 预算分批：一次性塞全部会超上下文，
+            # 失败条目多时重试反而必败
+            retry_results = {}
+            retry_batches = await service.prepare_batches(
+                retry_items, content_type)
+            for batch in retry_batches:
+                job.check_cancelled()
+                try:
+                    retry_results.update(await service.translate_batch(
+                        batch, content_type, stash_on_failure=False))
+                except FatalAPIError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - 单批重试失败不中断，落入"仍失败"重新暂存
+                    job.emit_log(
+                        f'重试批次失败（{len(batch)} 条）: {str(e)[:120]}')
+            still = [it for it in retry_items if it['id'] not in retry_results]
+            stashed = len(still)
+            # 旧记录整体清掉后按需重建：范围外条目原样回写（不跟着被删），
+            # 范围内仍失败的重新暂存
+            for batch_id in touched:
+                await state.db_call(state.db.delete_failed_batch, batch_id)
+            for batch_id, (_, rest, error) in touched.items():
+                if rest:
+                    await state.db_call(
+                        state.db.add_failed_batch, content_type, rest,
+                        error or f'历史暂存 {len(rest)} 条')
+            if still:
+                await state.db_call(
+                    state.db.add_failed_batch, content_type, still,
+                    f'自动重试后仍失败 {len(still)} 条')
+            if still:
+                job.emit_log(f'{stashed} 条重试后仍未译出，已保留在'
+                             '「失败条目」中（可手动重试/单翻/编辑）')
+            else:
+                job.emit_log(f'重试全部成功（{len(retry_items)} 条）')
+
         return {'translated': done - stashed, 'total': total_items,
                 'stashed': stashed}
     return body

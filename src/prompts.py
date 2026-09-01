@@ -261,10 +261,11 @@ def build_batch_user_prompt(items: List[dict],
             label = item.get('label', '')
             if label:
                 entry["scene"] = label
-        else:
-            hint = item.get('context_hint', '')
-            if hint:
-                entry["hint"] = hint
+        # hint 两种类型都带：UI 的出处提示，或重试时注入的纠正指令
+        # （标记校验失败原因贴着原文展示，模型按它修正上一版的错误）
+        hint = item.get('context_hint', '') or item.get('hint', '')
+        if hint:
+            entry["hint"] = hint
         structured.append(entry)
 
     prompt += f"【请翻译以下 JSON 数组中每一项的 text 字段，共 {n} 条】\n"

@@ -5,7 +5,7 @@
 
 契约（translator 层）：
 - 返回 (merged {0基索引: 译文}, terms, fail_reasons {0基索引: 原因})
-- 多次重试按 id 合并（先到先得），能匹配的直接通过
+- 重试只重发未译出/存疑的条目（子集 id 重编），已成功的不再重发也不被覆盖
 - 未返回/为空/存疑（贴错行、长度悬殊）的条目不进 merged，原因进 fail_reasons
 
 契约（service 层）：匹配的译文落库，未译出的逐条暂存 failed_batches，
@@ -139,7 +139,8 @@ def test_parse_length_mismatch_suspicious():
 # ---- translator 层：解析不完整自动重试 + 按 id 合并 ----
 
 def test_translator_retries_on_mismatch(translator, monkeypatch):
-    """第一次句数不匹配、第二次正常：重试发生且合并为完整结果"""
+    """第一次句数不匹配、第二次正常：重试发生且合并为完整结果。
+    重试只发失败条目（子集 id 重编），已成功的第 1 句保留首轮译文"""
     calls = []
 
     def fake_call_api(messages, temperature, max_tokens, tools=None,
@@ -147,24 +148,25 @@ def test_translator_retries_on_mismatch(translator, monkeypatch):
         calls.append(1)
         if len(calls) == 1:
             return _fake_message([{'id': 1, 'translation': '只有一句'}])
-        return _ok_message(3)
+        # 第 2 轮只重发失败的 2 条（原批索引 1、2 → 子集 id 1、2）
+        return _ok_message(2)
 
     monkeypatch.setattr(translator, '_call_api', fake_call_api)
     merged, terms, fail_reasons = translator.translate_batch(
         _items(), content_type='dialogue')
 
     assert len(calls) == 2
-    assert merged == {0: '译文1', 1: '译文2', 2: '译文3'}
+    assert merged == {0: '只有一句', 1: '译文1', 2: '译文2'}
     assert fail_reasons == {}
 
 
 def test_translator_merges_across_attempts(translator, monkeypatch):
-    """多次尝试各译出一部分：按 id 合并（同一句以最近一次返回为准）"""
+    """多次尝试各译出一部分：失败子集逐轮补齐合并"""
     responses = [
         _fake_message([{'id': 1, 'translation': '第一句'},
                        {'id': 2, 'translation': '第二句'}]),
-        _fake_message([{'id': 2, 'translation': '第二句（覆盖）'},
-                       {'id': 3, 'translation': '第三句'}]),
+        # 第 2 轮子集只剩原批索引 2（子集 id 1）
+        _fake_message([{'id': 1, 'translation': '第三句'}]),
     ]
     calls = []
 
@@ -177,7 +179,7 @@ def test_translator_merges_across_attempts(translator, monkeypatch):
     merged, _, fail_reasons = translator.translate_batch(
         _items(), content_type='dialogue')
 
-    assert merged == {0: '第一句', 1: '第二句（覆盖）', 2: '第三句'}
+    assert merged == {0: '第一句', 1: '第二句', 2: '第三句'}
     assert fail_reasons == {}
 
 
@@ -188,7 +190,9 @@ def test_translator_gives_up_after_max_retries(translator, monkeypatch):
     def always_bad(messages, temperature, max_tokens, tools=None,
                    tool_choice=None, return_message=False, task_type=''):
         calls.append(1)
-        return _fake_message([{'id': 1, 'translation': '只有一句'}])
+        if len(calls) == 1:
+            return _fake_message([{'id': 1, 'translation': '只有一句'}])
+        return _fake_message([])  # 重试轮模型仍不交卷
 
     monkeypatch.setattr(translator, '_call_api', always_bad)
     merged, _, fail_reasons = translator.translate_batch(
@@ -198,6 +202,53 @@ def test_translator_gives_up_after_max_retries(translator, monkeypatch):
     assert merged == {0: '只有一句'}
     assert set(fail_reasons) == {1, 2}
     assert all('未返回' in r for r in fail_reasons.values())
+
+
+# ---- service 层：整批异常不中断任务 ----
+
+async def test_service_whole_batch_failure_stashed(translator, db, monkeypatch):
+    """整批 API 异常：整批暂存、返回空结果让后续批次继续（不抛）"""
+    def boom(*a, **k):
+        raise RuntimeError('网络断开')
+
+    monkeypatch.setattr(translator, 'translate_batch', boom)
+    svc = TranslationService(translator, db, TranslationLogger())
+    items = db.get_all_dialogues()
+
+    results = await svc.translate_batch(items, 'dialogue')
+
+    assert results == {}
+    batches = db.list_failed_batches('dialogue')
+    assert len(batches) == 1
+    assert len(batches[0]['items']) == len(items)
+    assert all('整批异常' in it['reason'] for it in batches[0]['items'])
+
+
+async def test_service_whole_batch_no_stash_reraises(translator, db, monkeypatch):
+    """stash_on_failure=False（失败条目重试任务自己管）：仍上抛"""
+    def boom(*a, **k):
+        raise RuntimeError('网络断开')
+
+    monkeypatch.setattr(translator, 'translate_batch', boom)
+    svc = TranslationService(translator, db, TranslationLogger())
+
+    with pytest.raises(RuntimeError):
+        await svc.translate_batch(db.get_all_dialogues(), 'dialogue',
+                                  stash_on_failure=False)
+
+
+async def test_service_fatal_api_error_reraises(translator, db, monkeypatch):
+    """配置类致命错误（key 无效/余额耗尽）仍上抛中止——继续跑每批都会失败"""
+    from llm_client import FatalAPIError
+
+    def fatal(*a, **k):
+        raise FatalAPIError(401, 'unauthorized')
+
+    monkeypatch.setattr(translator, 'translate_batch', fatal)
+    svc = TranslationService(translator, db, TranslationLogger())
+
+    with pytest.raises(FatalAPIError):
+        await svc.translate_batch(db.get_all_dialogues(), 'dialogue')
 
 
 # ---- service 层：匹配落库 + 未译出暂存 ----
@@ -211,9 +262,10 @@ async def test_service_batch_retry_then_persisted(translator, db, monkeypatch):
                       tool_choice=None, return_message=False, task_type=''):
         calls.append(1)
         if len(calls) == 1:
-            # 句数不匹配：少一句
+            # 句数不匹配：少两句
             return _fake_message([{'id': 1, 'translation': '你好'}])
-        return _ok_message(len(items))
+        # 重试只发失败的 2 条（子集 id 重编）
+        return _ok_message(len(items) - 1)
 
     monkeypatch.setattr(translator, '_call_api', fake_call_api)
     svc = TranslationService(translator, db, TranslationLogger())
@@ -222,23 +274,28 @@ async def test_service_batch_retry_then_persisted(translator, db, monkeypatch):
 
     assert len(calls) == 2  # 重试确实发生
     assert len(results) == len(items)
-    # 落库校验
+    # 落库校验：首条保留首轮译文，其余两条来自重试
     saved = {r['id']: r for r in db.get_all_dialogues()}
+    expected = ['你好', '译文1', '译文2']
     for i, it in enumerate(items):
         row = saved[it['id']]
-        assert row['translated_text'] == f'译文{i + 1}'
+        assert row['translated_text'] == expected[i]
         assert row['is_translated']
-        assert results[it['id']] == f'译文{i + 1}'
+        assert results[it['id']] == expected[i]
     # 全部译出，无暂存
     assert db.count_failed_batches('dialogue') == 0
 
 
 async def test_service_batch_partial_saved_and_stashed(translator, db, monkeypatch):
     """重试耗尽仍缺句：匹配的落库不受阻，未译出的逐条暂存（任务不中断）"""
+    calls = []
 
     def always_bad(messages, temperature, max_tokens, tools=None,
                    tool_choice=None, return_message=False, task_type=''):
-        return _fake_message([{'id': 1, 'translation': '只有一句'}])
+        calls.append(1)
+        if len(calls) == 1:
+            return _fake_message([{'id': 1, 'translation': '只有一句'}])
+        return _fake_message([])  # 重试轮模型仍不交卷
 
     monkeypatch.setattr(translator, '_call_api', always_bad)
     svc = TranslationService(translator, db, TranslationLogger())
@@ -262,10 +319,14 @@ async def test_service_batch_partial_saved_and_stashed(translator, db, monkeypat
 
 async def test_service_batch_parse_failure_no_stash(translator, db, monkeypatch):
     """stash_on_failure=False（失败条目重试任务）：只返回结果，不入暂存"""
+    calls = []
 
     def always_bad(messages, temperature, max_tokens, tools=None,
                    tool_choice=None, return_message=False, task_type=''):
-        return _fake_message([{'id': 1, 'translation': '只有一句'}])
+        calls.append(1)
+        if len(calls) == 1:
+            return _fake_message([{'id': 1, 'translation': '只有一句'}])
+        return _fake_message([])  # 重试轮模型仍不交卷
 
     monkeypatch.setattr(translator, '_call_api', always_bad)
     svc = TranslationService(translator, db, TranslationLogger())

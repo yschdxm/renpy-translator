@@ -11,15 +11,19 @@ router = APIRouter(prefix='/current/export', tags=['export'])
 @router.get('/info')
 async def export_info(state: AppState = Depends(require_project)):
     from .projects import _exports_dir
+    from services.game_export import scan_markup_issues
     d = await state.db_call(state.db.get_dialogue_count)
     u = await state.db_call(state.db.get_ui_text_count)
     n = await state.db_call(state.db.get_char_dict_count)
     total = d['total'] + u['total'] + n['total']
     translated = d['translated'] + u['translated'] + n['translated']
+    # 标记校验前置：这些译文导出时会被闸门拦截保留英文，提前列出让用户修订
+    markup_issues = await state.db_call(scan_markup_issues, state.db)
     return {
         'dialogue': d, 'ui': u, 'names': n,
         'total': total, 'translated': translated,
         'percent': round(translated / total * 100, 1) if total else 0,
+        'markup_issues': markup_issues,
         # 导出产物只有 exports/{项目名}/{项目名}-translated.zip
         'exports_dir': str(_exports_dir(state, state.current_project)),
     }

@@ -219,11 +219,31 @@ class TranslationService:
                     )
                 )
             except FatalAPIError:
-                # 不可重试的致命错误，向上传递以中止批量任务
+                # 配置类致命错误（key 无效/余额耗尽）：后续批全会失败，
+                # 继续无意义，向上传递以中止批量任务
                 raise
             except Exception as e:
-                # 重试耗尽：向上抛出，由面板中断整个批量任务（不做单句回退）
-                raise RuntimeError(f"批次翻译失败（{len(items)} 条，已重试 {self.translator.MAX_RETRIES} 次）: {e}") from e
+                # 整批失败不中断任务：整批暂存（批量任务收尾会自动重试
+                # 一轮），返回空结果让后续批次继续
+                reason = f'整批异常（已重试 {self.translator.MAX_RETRIES} 次）: {e}'
+                if stash_on_failure:
+                    def _stash_all():
+                        self.db.add_failed_batch(
+                            content_type,
+                            [{'id': it['id'],
+                              'original_text': it.get('original_text', ''),
+                              'character': it.get('character', ''),
+                              'reason': reason} for it in items],
+                            f'整批失败 {len(items)} 条')
+                    await loop.run_in_executor(None, _stash_all)
+                    self.logger.error(
+                        f'整批 {len(items)} 条翻译失败已暂存'
+                        '（任务收尾将自动重试）: ' + str(e)[:200],
+                        panel=content_type)
+                    return {}
+                raise RuntimeError(
+                    f"批次翻译失败（{len(items)} 条，已重试 "
+                    f"{self.translator.MAX_RETRIES} 次）: {e}") from e
 
         # 逐句写库 + 术语入库 + 未译出条目暂存
         def _save_all():

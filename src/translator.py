@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Callable
 
 from llm_client import LLMClient, FatalAPIError  # noqa: F401  (FatalAPIError 供旧路径 import)
+import markup_check
 from prompts import (
     ANALYSIS_SYSTEM_PROMPT,
     STYLE_GUIDE_PROMPT,
@@ -43,6 +44,54 @@ def _strip_speaker_prefix(text: str, character: str) -> str:
             if text.startswith(prefix):
                 return text[len(prefix):].strip()
     return text
+
+
+# 标记校验失败后的纠正重译温度：低于创作温度，让模型专注按清单修错
+# 而不是重新发挥；单句/UI/批内重试三处统一口径
+_MARKUP_FIX_TEMPERATURE = 0.3
+
+
+def _submit_translations_tools(n: int) -> list:
+    """批翻译的 submit_translations 工具 schema（恰好 n 条，按 id 对齐）"""
+    return [{
+        "type": "function",
+        "function": {
+            "name": "submit_translations",
+            "description": "按 id 提交全部译文，以及原文中新出现的游戏专有名词术语",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "translations": {
+                        "type": "array",
+                        "description": f"恰好 {n} 条译文，每条用 id 对应输入条目的 text 译文",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "输入条目的 id"},
+                                "translation": {"type": "string", "description": "该条 text 的译文"},
+                            },
+                            "required": ["id", "translation"],
+                        },
+                        "minItems": n,
+                        "maxItems": n,
+                    },
+                    "terms": {
+                        "type": "array",
+                        "description": "原文中新出现且术语表中没有的游戏专有名词，没有则为空数组",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "en_term": {"type": "string"},
+                                "cn_term": {"type": "string"},
+                            },
+                            "required": ["en_term", "cn_term"],
+                        },
+                    },
+                },
+                "required": ["translations"],
+            },
+        },
+    }]
 
 
 def clean_name_result(raw: str) -> str:
@@ -146,6 +195,26 @@ class AITranslator:
 
         # 兜底：剥掉模型误加的说话人前缀（[角色]/【角色】/角色:）
         translated = _strip_speaker_prefix(translated, character)
+
+        # 标记一致性：插值/标签被破坏会让游戏渲染该句时报错，
+        # 带纠正指令重译一次，仍不过则保留待导出闸门拦截
+        probs = markup_check.check_pair(text, translated)
+        if probs:
+            raw = self._call_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt +
+                     '\n\n【必须修正】上一版译文未通过校验：'
+                     + '；'.join(probs)},
+                ],
+                temperature=_MARKUP_FIX_TEMPERATURE,
+                max_tokens=self.config.max_tokens,
+                task_type='dialogue',
+            )
+            fixed, fixed_terms = self._parse_translation_response(raw)
+            fixed = _strip_speaker_prefix(fixed, character)
+            if not markup_check.check_pair(text, fixed):
+                translated, terms = fixed, fixed_terms
 
         if debug:
             print(f'[翻译] 翻译结果: {translated}')
@@ -256,6 +325,24 @@ class AITranslator:
             task_type='ui',
         )
         translated, terms = self._parse_translation_response(raw)
+
+        # 标记一致性：带纠正指令重译一次，仍不过则保留待导出闸门拦截
+        probs = markup_check.check_pair(text, translated)
+        if probs:
+            raw = self._call_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt +
+                     '\n\n【必须修正】上一版译文未通过校验：'
+                     + '；'.join(probs)},
+                ],
+                temperature=_MARKUP_FIX_TEMPERATURE,
+                max_tokens=self.config.max_tokens,
+                task_type='ui',
+            )
+            fixed, fixed_terms = self._parse_translation_response(raw)
+            if not markup_check.check_pair(text, fixed):
+                translated, terms = fixed, fixed_terms
         return translated, terms
 
     # ---- 内容级校验阈值 ----
@@ -336,6 +423,12 @@ class AITranslator:
                     break
             if idx in suspicious:
                 continue
+            # 标记一致性：插值/标签被破坏是渲染级错误（游戏内报错），
+            # 比长度悬殊更确定，违规原因同时作为重试的纠正指令
+            probs = markup_check.check_pair(own, text)
+            if probs:
+                suspicious[idx] = '标记校验未通过：' + '；'.join(probs)
+                continue
             # 长度悬殊：漏译大半或多句合并进一条的典型信号
             lo, lt = len(own), len(text)
             if lo >= cls._SHORT_ORIG and (
@@ -390,69 +483,40 @@ class AITranslator:
 
         # Tool Calls：translations 用 {id, translation} 对象数组，靠 id 对齐
         n = len(items)
-        tools = [{
-            "type": "function",
-            "function": {
-                "name": "submit_translations",
-                "description": "按 id 提交全部译文，以及原文中新出现的游戏专有名词术语",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "translations": {
-                            "type": "array",
-                            "description": f"恰好 {n} 条译文，每条用 id 对应输入条目的 text 译文",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": {"type": "integer", "description": "输入条目的 id"},
-                                    "translation": {"type": "string", "description": "该条 text 的译文"},
-                                },
-                                "required": ["id", "translation"],
-                            },
-                            "minItems": n,
-                            "maxItems": n,
-                        },
-                        "terms": {
-                            "type": "array",
-                            "description": "原文中新出现且术语表中没有的游戏专有名词，没有则为空数组",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "en_term": {"type": "string"},
-                                    "cn_term": {"type": "string"},
-                                },
-                                "required": ["en_term", "cn_term"],
-                            },
-                        },
-                    },
-                    "required": ["translations"],
-                },
-            },
-        }]
+        tools = _submit_translations_tools(n)
 
         # 解析失败（句数不匹配）也重试：模型偶发漏译/多译，重新请求通常能恢复；
-        # 多次尝试按 id 合并（同一句以最近一次返回为准，与旧版"成功的整批结果生效"
-        # 语义一致），最后仍缺/存疑的条目随原因一并返回
+        # 重试只重发未译出/存疑的条目（带纠正 hint），已成功的不再浪费 token
+        # 也不会被后一轮的新译文覆盖；多次尝试按 id 合并（同一句以最近一次
+        # 返回为准），最后仍缺/存疑的条目随原因一并返回
         merged: Dict[int, str] = {}
         terms_all: List[dict] = []
         seen_terms: set = set()
         suspicious_all: Dict[int, str] = {}
+        send_items = items          # 本轮发送的条目（首轮全批，重试仅失败条目）
+        send_map = None             # 重试时：子集索引 -> 原批索引
+        current_user_prompt = user_prompt
+        current_tools = tools
         for attempt in range(1, self.MAX_RETRIES + 1):
             message = self._call_api(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": current_user_prompt}
                 ],
                 temperature=self.config.temperature,
                 max_tokens=max_tokens,
-                tools=tools,
+                tools=current_tools,
                 # 注意：不能强制指定函数（{"type": "function", ...}），
                 # deepseek 思考模式会拒绝该 tool_choice（400），auto 下模型也会可靠调用
                 tool_choice="auto",
                 return_message=True,
                 task_type=content_type,
             )
-            placed, terms, suspicious = self._parse_tool_response(message, items)
+            placed, terms, suspicious = self._parse_tool_response(
+                message, send_items)
+            if send_map is not None:
+                placed = {send_map[k]: v for k, v in placed.items()}
+                suspicious = {send_map[k]: v for k, v in suspicious.items()}
             merged.update(placed)
             for idx in placed:
                 suspicious_all.pop(idx, None)  # 后续尝试正常译出的不再算存疑
@@ -464,6 +528,26 @@ class AITranslator:
             if len(merged) == n:
                 break
             if attempt < self.MAX_RETRIES:
+                # 未译出/存疑的条目带纠正指令重试：把失败原因写进该条
+                # hint（贴着原文展示），比整批盲目重发更容易译对
+                failing = [i for i in range(n) if i not in merged]
+                if failing:
+                    retry_items = []
+                    for i in failing:
+                        it = dict(items[i])
+                        reason = suspicious_all.get(
+                            i, '模型未返回该句译文')
+                        base = it.get('hint') or ''
+                        it['hint'] = (
+                            (base + '；' if base else '')
+                            + f'上一版译文未通过校验，必须修正：{reason}')
+                        retry_items.append(it)
+                    send_items = retry_items
+                    send_map = failing
+                    current_user_prompt = build_batch_user_prompt(
+                        retry_items, context_before, content_type)
+                    current_tools = _submit_translations_tools(
+                        len(retry_items))
                 print(f'[批次翻译] {n - len(merged)}/{n} 句未匹配，'
                       f'进行第 {attempt + 1}/{self.MAX_RETRIES} 次尝试...')
 
@@ -485,8 +569,13 @@ class AITranslator:
 
         return merged, terms_all, fail_reasons
 
-    def analyze_text(self, prompt: str, max_tokens: int = None) -> str:
-        """分析文本（不使用翻译系统提示词）"""
+    def analyze_text(self, prompt: str, max_tokens: int = None,
+                     temperature: float = None) -> str:
+        """分析文本（不使用翻译系统提示词）
+
+        temperature: 判定类任务（预筛/复核）传 0——同一输入必须给出
+        同一判定，否则全部重判时结果随机翻转；缺省用配置温度（创作类）
+        """
         if not self.client:
             raise ValueError("请先配置API Key")
 
@@ -498,7 +587,8 @@ class AITranslator:
                 {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ],
-            temperature=self.config.temperature,
+            temperature=(self.config.temperature if temperature is None
+                         else temperature),
             max_tokens=max_tokens or self.config.max_tokens,
             task_type='analysis',
         )

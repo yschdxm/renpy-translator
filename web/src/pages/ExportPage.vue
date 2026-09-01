@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /** 导出游戏页：统计 + 一键导出（任务进度走全局对话框） */
 import { computed, onMounted, ref } from 'vue'
-import { NButton, NCard, NPopconfirm, NSpace, NText, useMessage } from 'naive-ui'
+import { NAlert, NButton, NCard, NPopconfirm, NSpace, NText, useMessage } from 'naive-ui'
 import { FolderOpenOutline, PlayOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, toastError } from '../api/client'
 import { renderIcon } from '../components/icons'
@@ -13,6 +13,13 @@ const message = useMessage()
 const jobsStore = useJobsStore()
 const session = useSessionStore()
 
+interface MarkupIssue {
+  kind: string
+  original: string
+  translation: string
+  reason: string
+}
+
 interface ExportInfo {
   dialogue: { total: number; translated: number }
   ui: { total: number; translated: number }
@@ -20,6 +27,7 @@ interface ExportInfo {
   total: number
   translated: number
   percent: number
+  markup_issues: { count: number; samples: MarkupIssue[] }
   exports_dir: string
 }
 
@@ -113,5 +121,28 @@ onMounted(load)
         </n-space>
       </n-space>
     </n-card>
+
+    <n-alert
+      v-if="info && info.markup_issues.count > 0"
+      type="warning" size="small" style="margin: 0 0 16px"
+    >
+      <div style="margin-bottom: 6px">
+        {{ info.markup_issues.count }} 条译文破坏了插值 [表达式] 或标签 {标签}
+        ——导出时这些条目将保留英文原文（否则游戏渲染会报错）。
+        请在「文本翻译」/「字符串翻译」页修订后重新导出。
+      </div>
+      <div
+        v-for="(s, i) in info.markup_issues.samples" :key="i"
+        style="font-size: 12px; opacity: 0.85; margin-top: 4px"
+      >
+        · {{ s.translation }}<br>
+        <span style="opacity: 0.75">{{ s.reason }}</span>
+      </div>
+      <div v-if="info.markup_issues.count > info.markup_issues.samples.length"
+        style="font-size: 12px; opacity: 0.75; margin-top: 4px"
+      >
+        …其余 {{ info.markup_issues.count - info.markup_issues.samples.length }} 条同理（完整清单见导出日志）
+      </div>
+    </n-alert>
   </div>
 </template>

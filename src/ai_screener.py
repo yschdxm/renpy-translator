@@ -195,29 +195,64 @@ class AIScreener:
             items.append(item)
 
         progress.update(phase='粗筛', done=0, total=len(items))
+        failed = []
         for start in range(0, len(items), self.COARSE_BATCH):
             self._check_cancel()
             batch = items[start:start + self.COARSE_BATCH]
-            # 失败直接上抛，不降级
-            verdicts = self._coarse_batch(batch)
-            for it in batch:
-                v = verdicts.get(it['id'])
-                if v is not None:
-                    keep, confident, reason = v
-                    candidates[it['id']].ai_keep = keep
-                    candidates[it['id']].ai_confident = confident
-                    candidates[it['id']].ai_reason = reason
-                else:
-                    # 粗筛响应遗漏的条目按未决处理（进入精审判定，非降级）
-                    candidates[it['id']].ai_confident = False
+            # 单批失败跳过不抛，收尾统一重试（与精审同一策略）
+            try:
+                verdicts = self._coarse_batch(batch)
+            except ScreeningCancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 - 批次失败留待收尾重试
+                failed.append((batch, e))
+                progress['done'] = min(start + self.COARSE_BATCH, len(items))
+                continue
+            self._apply_coarse(candidates, batch, verdicts)
             progress['done'] = min(start + self.COARSE_BATCH, len(items))
+
+        if failed:
+            self._log(f'粗筛 {len(failed)} 批失败，其余批次完成后统一重试...')
+            for batch, first_err in failed:
+                self._check_cancel()
+                try:
+                    verdicts = self._coarse_batch(batch)
+                except ScreeningCancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 - 重试仍败，保持未决
+                    msg = str(e) or str(first_err)
+                    for it in batch:
+                        c = candidates[it['id']]
+                        c.ai_keep = None
+                        c.ai_confident = False
+                        c.ai_reason = f'粗筛失败，保持未决: {msg[:160]}'
+                    self._log(f'重试后仍有 {len(batch)} 条粗筛未决'
+                              '（可人工判定或重新预筛）')
+                    continue
+                self._apply_coarse(candidates, batch, verdicts)
+
+    @staticmethod
+    def _apply_coarse(candidates: list, batch: list, verdicts: dict):
+        """把粗筛判决写回候选；响应遗漏的条目转精审（非降级）"""
+        for it in batch:
+            v = verdicts.get(it['id'])
+            if v is not None:
+                keep, confident, reason = v
+                candidates[it['id']].ai_keep = keep
+                candidates[it['id']].ai_confident = confident
+                candidates[it['id']].ai_reason = reason
+            else:
+                candidates[it['id']].ai_confident = False
 
     def _coarse_batch(self, batch: list) -> dict:
         """单批粗筛，返回 {id: (keep, confident, reason)}"""
         items_json = json.dumps(batch, ensure_ascii=False)
         result = self.translator.analyze_text(
             _COARSE_PROMPT.format(items_json=items_json),
-            max_tokens=max(self.translator.config.max_tokens, 8000))
+            max_tokens=max(self.translator.config.max_tokens, 8000),
+            # 判定任务固定 0 温度：同输入同判定，全部重判时结果可复现，
+            # 不会因翻译温度的随机性把上轮判定的条目翻转
+            temperature=0)
         m = re.search(r'\[.*\]', result, re.S)
         if not m:
             raise ValueError(f'粗筛返回无法解析: {result[:100]}')
@@ -247,19 +282,55 @@ class AIScreener:
         batches = [uncertain[i:i + self.REFINE_BATCH]
                    for i in range(0, len(uncertain), self.REFINE_BATCH)]
 
-        # 失败直接上抛，不降级
+        # 单批失败跳过不抛（整批中断代价太大），全部批次跑完后对失败批
+        # 做最后一轮重试；重试仍失败则候选保持未决并写明原因
         # as_completed 按完成顺序推进进度（map 按提交顺序，慢批次会卡住进度条）
         futures = {self._pool.submit(self._refine_batch, b, progress): b
                    for b in batches}
+        failed = []
         for fut in as_completed(futures):
             self._check_cancel()
-            verdicts = fut.result()
-            for idx, (keep, reason) in verdicts.items():
-                candidates[idx].ai_keep = keep
-                candidates[idx].ai_reason = reason
-                candidates[idx].ai_confident = True
-            progress['done'] = min(progress['done'] + len(futures[fut]),
+            b = futures[fut]
+            try:
+                verdicts = fut.result()
+            except ScreeningCancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 - 批次失败留待收尾重试
+                failed.append((b, e))
+                progress['done'] = min(progress['done'] + len(b),
+                                       len(uncertain))
+                continue
+            self._apply_verdicts(candidates, verdicts)
+            progress['done'] = min(progress['done'] + len(b),
                                    len(uncertain))
+
+        if failed:
+            self._log(f'精审 {len(failed)}/{len(batches)} 批失败，'
+                      '其余批次完成后统一重试这批...')
+            for b, first_err in failed:
+                self._check_cancel()
+                try:
+                    verdicts = self._refine_batch(b)
+                except ScreeningCancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 - 重试仍败，保持未决
+                    msg = str(e) or str(first_err)
+                    for idx, c in b:
+                        c.ai_keep = None
+                        c.ai_confident = False
+                        c.ai_reason = f'精审失败，保持未决: {msg[:160]}'
+                    self._log(f'重试后仍有 {len(b)} 条未获判决（已保留为'
+                              '未决，可人工判定或再次精判）')
+                    continue
+                self._apply_verdicts(candidates, verdicts)
+
+    @staticmethod
+    def _apply_verdicts(candidates: list, verdicts: dict):
+        """把 {候选索引: (keep, reason)} 写回候选并标记已决"""
+        for idx, (keep, reason) in verdicts.items():
+            candidates[idx].ai_keep = keep
+            candidates[idx].ai_reason = reason
+            candidates[idx].ai_confident = True
 
     def _refine_batch(self, batch: list, progress: dict = None) -> dict:
         """单批 agentic 精审：多轮 tool 循环，返回 {候选索引: (keep, reason)}
@@ -293,7 +364,8 @@ class AIScreener:
                 progress['phase'] = f'精审·第 {round_no} 轮'
             message = self.translator.chat_completion(
                 messages=messages,
-                temperature=self.translator.config.temperature,
+                # 判定任务固定 0 温度（理由同粗筛）：重判可复现
+                temperature=0,
                 max_tokens=self.translator.config.max_tokens,
                 tools=_TOOLS, tool_choice="auto",
                 return_message=True, task_type='analysis',
@@ -373,7 +445,8 @@ class AIScreener:
             + (f'只需输出还缺判决的 id: {missing}。' if accepted else '')})
         message = self.translator.chat_completion(
             messages=messages,
-            temperature=self.translator.config.temperature,
+            # 判定任务固定 0 温度（理由同多轮循环）：重判可复现
+            temperature=0,
             max_tokens=max(self.translator.config.max_tokens, 8000),
             return_message=True, task_type='analysis',
         )
@@ -384,9 +457,19 @@ class AIScreener:
         missing = [n for n, idx in id_map.items() if idx not in accepted]
         if not missing:
             return accepted
+        # 附 AI 最后输出：批次最终失败时（跳过+收尾重试仍败），用户能
+        # 看到模型实际回了什么来定位问题
+        last = (getattr(message, 'content', '') or '')
+        if not last and getattr(message, 'tool_calls', None):
+            last = '; '.join(
+                (tc.function.arguments or '')[:120]
+                for tc in message.tool_calls)
+        shown = missing[:8]
+        more = f' 等 {len(missing)} 条' if len(missing) > 8 else ''
         raise RuntimeError(
             f'精审批次 {self.MAX_ROUNDS} 轮追问后仍有 {len(missing)} 条'
-            f'候选未获判决（id: {missing}）')
+            f'候选未获判决（id: {shown}{more}）；'
+            f'AI 最后输出: {last[:200]!r}')
 
     def _parse_verdict_args(self, arguments: str, id_map: dict) -> dict:
         """解析 submit_verdicts 工具参数，返回 {候选索引: (keep, reason)}。

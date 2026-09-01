@@ -13,6 +13,7 @@ from pathlib import Path
 from database import ProjectDatabase
 from logger import TranslationLogger
 from project_manager import ProjectManager
+import markup_check
 
 # Ren'Py 对台词和菜单选项做 % 格式化（sayexports/menuexports 中的
 # what % tag_quoting_dict），裸 % 会抛 ValueError，必须写成 %%。
@@ -57,6 +58,38 @@ def escape_translation(text: str, percent: str = 'say') -> str:
     return text.replace('"', '\\"')
 
 
+def scan_markup_issues(db, sample_limit: int = 20) -> dict:
+    """扫描库内已译条目的标记一致性（导出预检前置）
+
+    与导出闸门同一套校验：扫出的条目导出时会被拦截、保留英文原文。
+    前置到导出页展示，让用户在导出前去翻译界面修订，而不是导出后
+    才在日志里看到拦截清单。
+
+    返回 {'count': 违规总数, 'samples': [{kind, original, translation,
+    reason}]}（samples 截断到 sample_limit 条，够定位问题即可）。
+    """
+    samples = []
+    total = 0
+    for kind, rows in (('dialogue', db.get_all_dialogues()),
+                       ('ui', db.get_all_ui_texts())):
+        for r in rows:
+            orig = r.get('original_text') or ''
+            trans = r.get('translated_text') or ''
+            if not orig or not trans:
+                continue
+            probs = markup_check.check_pair(orig, trans)
+            if probs:
+                total += 1
+                if len(samples) < sample_limit:
+                    samples.append({
+                        'kind': kind,
+                        'original': orig[:80],
+                        'translation': trans[:80],
+                        'reason': '；'.join(probs)[:160],
+                    })
+    return {'count': total, 'samples': samples}
+
+
 class ExportCancelled(Exception):
     """导出被取消（协作式：循环内检查 cancel_event 触发）"""
 
@@ -85,6 +118,7 @@ class GameExporter:
         self.db = db
         self.logger = logger
         self._cancel_event = None  # threading.Event，由 export() 注入
+        self._blocked = []  # [(原文, 原因)] 标记校验拦截的译文（导出闸门）
 
     def _check_cancel(self):
         if self._cancel_event is not None and self._cancel_event.is_set():
@@ -113,6 +147,7 @@ class GameExporter:
         Returns: {'success': bool, 'message': str}
         """
         self._cancel_event = cancel_event
+        self._blocked = []
         try:
             self._check_cancel()
             # 预检：中文字体由用户自行放置（软件不携带字体，版权原因），
@@ -205,6 +240,16 @@ class GameExporter:
                     lambda c, t: progress(0.75 + (c / t) * 0.1,
                                           f'正在填充字符串翻译... ({c}/{t})'))
                 log(f'字符串翻译: {u_count} 条')
+
+                # 导出闸门汇总：破坏插值/标签的译文保留英文原文，
+                # 宁可显示英文也不让游戏渲染时报错
+                if self._blocked:
+                    log(f'⚠ 标记校验拦截 {len(self._blocked)} 条译文'
+                        f'（已保留英文原文，请在翻译界面修订后重新导出）:')
+                    for text, reason in self._blocked[:10]:
+                        log(f'  · {text[:40]} — {reason[:90]}')
+                    if len(self._blocked) > 10:
+                        log(f'  ...其余 {len(self._blocked) - 10} 条同理')
 
             # 添加语言选择
             progress(0.9, '正在添加语言选择界面...')
@@ -303,9 +348,17 @@ class GameExporter:
                         if content_match and content_match.group(1) not in ('old', 'new'):
                             text = content_match.group(2).replace('\\"', '"')
                             if text in translation_dict:
-                                translated = escape_translation(translation_dict[text])
-                                new_lines.append(f'    {content_match.group(1)} "{translated}"')
-                                filled += 1
+                                cn = translation_dict[text]
+                                probs = markup_check.check_pair(text, cn)
+                                if probs:
+                                    # 译文破坏插值/标签会让游戏渲染该句时报错，
+                                    # 保留英文原文（少一句翻译好过崩溃），记录清单
+                                    self._blocked.append((text, '；'.join(probs)))
+                                    new_lines.append(lines[i + 1])
+                                else:
+                                    translated = escape_translation(cn)
+                                    new_lines.append(f'    {content_match.group(1)} "{translated}"')
+                                    filled += 1
                             else:
                                 new_lines.append(lines[i + 1])
                             i += 2
@@ -313,9 +366,15 @@ class GameExporter:
                         elif narration_match:
                             text = narration_match.group(1).replace('\\"', '"')
                             if text in translation_dict:
-                                translated = escape_translation(translation_dict[text])
-                                new_lines.append(f'    "{translated}"')
-                                filled += 1
+                                cn = translation_dict[text]
+                                probs = markup_check.check_pair(text, cn)
+                                if probs:
+                                    self._blocked.append((text, '；'.join(probs)))
+                                    new_lines.append(lines[i + 1])
+                                else:
+                                    translated = escape_translation(cn)
+                                    new_lines.append(f'    "{translated}"')
+                                    filled += 1
                             else:
                                 new_lines.append(lines[i + 1])
                             i += 2
@@ -347,9 +406,15 @@ class GameExporter:
                         new_match = re.match(r'^\s+new\s+"(.*)"\s*$', lines[i + 1])
                         if new_match:
                             if translated:
-                                escaped = escape_translation(translated, percent='string')
-                                new_lines.append(f'    new "{escaped}"')
-                                filled += 1
+                                probs = markup_check.check_pair(old_text, translated)
+                                if probs:
+                                    self._blocked.append(
+                                        (old_text, '；'.join(probs)))
+                                    new_lines.append(lines[i + 1])
+                                else:
+                                    escaped = escape_translation(translated, percent='string')
+                                    new_lines.append(f'    new "{escaped}"')
+                                    filled += 1
                             else:
                                 new_lines.append(lines[i + 1])
                             i += 2
