@@ -288,19 +288,25 @@ def test_glossary_prompt_append_only(tmp_path):
 
 
 def test_extract_cache_info():
-    """usage 缓存字段提取：DeepSeek/OpenAI 两种形态，无字段返回 None"""
+    """usage 缓存字段提取：DeepSeek/OpenAI 两种形态，无字段返回 None。
+    必须从 model_dump() 字典读（openai SDK 不把非标字段暴露为对象属性）"""
     from llm_client import _extract_cache_info
-    ds = SimpleNamespace(usage=SimpleNamespace(
-        prompt_tokens=1000, prompt_cache_hit_tokens=800,
-        prompt_cache_miss_tokens=200))
-    assert _extract_cache_info(ds) == (800, 1000)
-    oai = SimpleNamespace(usage=SimpleNamespace(
-        prompt_tokens=1000,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=512)))
-    assert _extract_cache_info(oai) == (512, 1000)
-    none_resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1000))
-    assert _extract_cache_info(none_resp) is None
-    assert _extract_cache_info(SimpleNamespace()) is None
+
+    class FakeResp:
+        def __init__(self, usage):
+            self._usage = usage
+
+        def model_dump(self):
+            return {'usage': self._usage}
+
+    assert _extract_cache_info(FakeResp({
+        'prompt_tokens': 1000, 'prompt_cache_hit_tokens': 800,
+        'prompt_cache_miss_tokens': 200})) == (800, 1000)
+    assert _extract_cache_info(FakeResp({
+        'prompt_tokens': 1000,
+        'prompt_tokens_details': {'cached_tokens': 512}})) == (512, 1000)
+    assert _extract_cache_info(FakeResp({'prompt_tokens': 1000})) is None
+    assert _extract_cache_info(FakeResp({})) is None
 
 
 def test_cache_stats_accumulate(translator, monkeypatch):

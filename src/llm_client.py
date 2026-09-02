@@ -46,15 +46,20 @@ def _extract_cache_info(response) -> tuple:
 
     DeepSeek: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
     OpenAI:   usage.prompt_tokens_details.cached_tokens
+
+    注意必须从 model_dump() 字典读：openai SDK 不把提供商的非标 usage
+    字段（prompt_cache_hit_tokens）暴露为对象属性（在 model_extra 或
+    被丢弃），getattr 链式访问永远落空。
     """
-    usage = getattr(response, 'usage', None)
-    if usage is None:
+    try:
+        usage = response.model_dump().get('usage') or {}
+    except Exception:
         return None
-    total = getattr(usage, 'prompt_tokens', 0) or 0
-    hit = getattr(usage, 'prompt_cache_hit_tokens', None)  # DeepSeek
+    total = usage.get('prompt_tokens') or 0
+    hit = usage.get('prompt_cache_hit_tokens')  # DeepSeek
     if hit is None:
-        details = getattr(usage, 'prompt_tokens_details', None)  # OpenAI
-        hit = getattr(details, 'cached_tokens', None) if details else None
+        details = usage.get('prompt_tokens_details') or {}  # OpenAI
+        hit = details.get('cached_tokens')
     if not hit:
         return None
     return int(hit), int(total)
