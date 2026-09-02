@@ -71,6 +71,26 @@ def extract_tags(text: str) -> set:
             if not g.strip().startswith('#')}
 
 
+def check_newline(original: str, translation: str) -> list:
+    """译文真实换行检查，返回违规原因列表（空 = 通过）
+
+    官方文档口径：Ren'Py 字符串不支持跨行（say/menu/translate 字符串
+    都是单逻辑行），字符串内的换行必须写成转义形式 \\n；多行文本要用
+    三引号或 _p() 块。AI 把原文的 \\n（两字符）"贴心"展开成真实换行是
+    最常见的违规形态——原文没有真实换行而译文有，即为违规。
+
+    原文本身含真实换行（多行模板/_p 块）时译文同形不算违规；
+    导出层 escape_translation 本来就能把真实换行安全写成 \\n，
+    所以这里只进翻译期纠正链路，不进导出拦截闸门。
+    """
+    if ('\n' in translation or '\r' in translation) \
+            and '\n' not in original and '\r' not in original:
+        return ['译文包含原文没有的真实换行符——Ren\'Py 字符串不支持跨行，'
+                '请把换行写成转义形式 \\n（反斜杠+n 两字符），'
+                '与原文的 \\n 位置一一对应']
+    return []
+
+
 def check_pair(original: str, translation: str) -> list:
     """校验译文相对原文的标记一致性，返回违规原因列表（空 = 通过）
 

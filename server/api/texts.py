@@ -292,6 +292,7 @@ async def list_failed_items(content_type: str,
                 'character': it.get('character', ''),
                 'original_text': it.get('original_text', ''),
                 'reason': it.get('reason', ''),
+                'rejected': it.get('rejected', ''),
                 'created_at': rec['created_at'],
             })
     return {'items': items, 'count': len(items), 'batch_count': len(recs)}

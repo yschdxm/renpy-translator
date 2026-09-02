@@ -197,8 +197,10 @@ class AITranslator:
         translated = _strip_speaker_prefix(translated, character)
 
         # 标记一致性：插值/标签被破坏会让游戏渲染该句时报错，
-        # 带纠正指令重译一次，仍不过则保留待导出闸门拦截
-        probs = markup_check.check_pair(text, translated)
+        # 带纠正指令重译一次，仍不过则保留待导出闸门拦截。
+        # 换行检查同路（官方文档：字符串不支持跨行，换行必须写 \n 转义）
+        probs = (markup_check.check_pair(text, translated)
+                 + markup_check.check_newline(text, translated))
         if probs:
             raw = self._call_api(
                 messages=[
@@ -213,7 +215,8 @@ class AITranslator:
             )
             fixed, fixed_terms = self._parse_translation_response(raw)
             fixed = _strip_speaker_prefix(fixed, character)
-            if not markup_check.check_pair(text, fixed):
+            if not (markup_check.check_pair(text, fixed)
+                    + markup_check.check_newline(text, fixed)):
                 translated, terms = fixed, fixed_terms
 
         if debug:
@@ -327,7 +330,8 @@ class AITranslator:
         translated, terms = self._parse_translation_response(raw)
 
         # 标记一致性：带纠正指令重译一次，仍不过则保留待导出闸门拦截
-        probs = markup_check.check_pair(text, translated)
+        probs = (markup_check.check_pair(text, translated)
+                 + markup_check.check_newline(text, translated))
         if probs:
             raw = self._call_api(
                 messages=[
@@ -341,7 +345,8 @@ class AITranslator:
                 task_type='ui',
             )
             fixed, fixed_terms = self._parse_translation_response(raw)
-            if not markup_check.check_pair(text, fixed):
+            if not (markup_check.check_pair(text, fixed)
+                    + markup_check.check_newline(text, fixed)):
                 translated, terms = fixed, fixed_terms
         return translated, terms
 
@@ -354,28 +359,30 @@ class AITranslator:
 
     @staticmethod
     def _parse_tool_response(message, items: List[dict]
-                             ) -> tuple[Dict[int, str], List[dict], Dict[int, str]]:
+                             ) -> tuple[Dict[int, str], List[dict], Dict[int, str], Dict[int, str]]:
         """解析 tool calls 响应
 
         translations 是 [{id, translation}, ...]，按 id 放回位置（id 从 1 开始）。
-        返回 (已放置译文 {0基索引: 译文}, 术语, 存疑原因 {0基索引: reason})。
+        返回 (已放置译文 {0基索引: 译文}, 术语, 存疑原因 {0基索引: reason},
+              被拒译文 {0基索引: 译文})。
 
         不再整批判废：结构非法（无 tool_calls / JSON 损坏 / translations 非数组）
-        时返回 ({}, [], {})；id 越界/重复/译文为空的条目单独跳过（成为未匹配）。
-        已放置译文再做内容级校验，存疑的移出结果并记入原因，由上层暂存核验。
+        时返回 ({}, [], {}, {})；id 越界/重复/译文为空的条目单独跳过（成为未匹配）。
+        已放置译文再做内容级校验，存疑的移出结果——被拒译文保留在 rejected 里
+        （AI 毕竟返回过，失败条目页面要展示出来供人工修订/采用）。
         """
         expected = len(items)
         calls = getattr(message, 'tool_calls', None)
         if not calls:
-            return {}, [], {}
+            return {}, [], {}, {}
         try:
             args = json.loads(calls[0].function.arguments)
         except (json.JSONDecodeError, TypeError, AttributeError):
-            return {}, [], {}
+            return {}, [], {}, {}
 
         raw = args.get('translations')
         if not isinstance(raw, list):
-            return {}, [], {}
+            return {}, [], {}, {}
 
         # 按 id 对齐（兼容模型乱序返回）；无法落位的条目跳过而非整批判废
         placed: Dict[int, str] = {}
@@ -393,6 +400,7 @@ class AITranslator:
             placed[idx - 1] = text
 
         suspicious = AITranslator._content_sanity_check(items, placed)
+        rejected = {idx: placed[idx] for idx in suspicious}
         for idx in suspicious:
             placed.pop(idx, None)
 
@@ -401,7 +409,7 @@ class AITranslator:
             if isinstance(t, dict) and t.get('en_term') and t.get('cn_term'):
                 terms.append({'en_term': str(t['en_term']), 'cn_term': str(t['cn_term'])})
 
-        return placed, terms, suspicious
+        return placed, terms, suspicious, rejected
 
     @classmethod
     def _content_sanity_check(cls, items: List[dict],
@@ -425,7 +433,8 @@ class AITranslator:
                 continue
             # 标记一致性：插值/标签被破坏是渲染级错误（游戏内报错），
             # 比长度悬殊更确定，违规原因同时作为重试的纠正指令
-            probs = markup_check.check_pair(own, text)
+            probs = (markup_check.check_pair(own, text)
+                     + markup_check.check_newline(own, text))
             if probs:
                 suspicious[idx] = '标记校验未通过：' + '；'.join(probs)
                 continue
@@ -446,7 +455,9 @@ class AITranslator:
         """批次翻译多句文本
 
         items: [{'original_text': ..., 'character': ...}]
-        返回 (已匹配译文 {0基索引: 译文}, 术语列表, 未译出原因 {0基索引: reason})。
+        返回 (已匹配译文 {0基索引: 译文}, 术语列表, 未译出原因 {0基索引: reason},
+              被拒译文 {0基索引: 译文})——被拒译文是 AI 返回过但内容校验
+              未通过的版本，失败条目页面展示供人工修订/采用。
         解析不完整（句数不匹配）会自动重试并按 id 合并多次尝试的结果；
         重试耗尽仍缺失或内容校验存疑的条目不进 merged，原因进 fail_reasons。
         """
@@ -493,6 +504,7 @@ class AITranslator:
         terms_all: List[dict] = []
         seen_terms: set = set()
         suspicious_all: Dict[int, str] = {}
+        rejected_all: Dict[int, str] = {}  # 校验被拒的译文（失败条目页面展示用）
         send_items = items          # 本轮发送的条目（首轮全批，重试仅失败条目）
         send_map = None             # 重试时：子集索引 -> 原批索引
         current_user_prompt = user_prompt
@@ -512,15 +524,18 @@ class AITranslator:
                 return_message=True,
                 task_type=content_type,
             )
-            placed, terms, suspicious = self._parse_tool_response(
+            placed, terms, suspicious, rejected = self._parse_tool_response(
                 message, send_items)
             if send_map is not None:
                 placed = {send_map[k]: v for k, v in placed.items()}
                 suspicious = {send_map[k]: v for k, v in suspicious.items()}
+                rejected = {send_map[k]: v for k, v in rejected.items()}
             merged.update(placed)
             for idx in placed:
                 suspicious_all.pop(idx, None)  # 后续尝试正常译出的不再算存疑
+                rejected_all.pop(idx, None)    # 后续尝试正常译出的不再算被拒
             suspicious_all.update(suspicious)
+            rejected_all.update(rejected)
             for t in terms:
                 if t['en_term'] not in seen_terms:
                     seen_terms.add(t['en_term'])
@@ -567,7 +582,7 @@ class AITranslator:
             if terms_all:
                 print(f'[批次翻译] 术语: {terms_all}')
 
-        return merged, terms_all, fail_reasons
+        return merged, terms_all, fail_reasons, rejected_all
 
     def analyze_text(self, prompt: str, max_tokens: int = None,
                      temperature: float = None) -> str:

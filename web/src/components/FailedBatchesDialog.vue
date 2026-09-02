@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /** 失败条目核验对话框：批次翻译中未译出/存疑的条目，
- *  可全部重试（拆小批任务）、单句 AI 翻译、手动填写译文，或直接关闭。 */
+ *  AI 曾返回但被拒的译文默认填进译文框（像翻译页一样行内直接修改），
+ *  点「采用」或按 Enter 才落库——不自动保存，改错了关掉也不会误写。 */
 import { ref, watch } from 'vue'
 import {
   NButton, NEmpty, NInput, NInputNumber, NModal, NPopconfirm, NSpace, NTag,
@@ -15,7 +16,9 @@ interface FailedItem {
   character: string
   original_text: string
   reason: string
+  rejected: string  // AI 返回过但校验被拒的译文（预填进译文框）
   created_at: string
+  draft: string     // 行内译文框内容（默认 = rejected）
 }
 
 const props = defineProps<{ show: boolean; contentType: 'ui' | 'dialogue' }>()
@@ -31,15 +34,14 @@ const items = ref<FailedItem[]>([])
 const loading = ref(false)
 const chunkSize = ref(10)
 const translatingIds = ref<Set<number>>(new Set())
-const editingId = ref(0)
-const editingText = ref('')
+const savingIds = ref<Set<number>>(new Set())
 
 async function load() {
   loading.value = true
   try {
     const data = await api.get<{ items: FailedItem[]; count: number }>(
       `/api/current/texts/${props.contentType}/failed-batches`)
-    items.value = data.items
+    items.value = data.items.map((it) => ({ ...it, draft: it.rejected || '' }))
   } catch (e) {
     toastError(message, e)
   } finally {
@@ -49,7 +51,7 @@ async function load() {
 
 watch(() => props.show, (v) => { if (v) load() })
 
-/** 条目已译出（单翻/手动/重试成功）后从列表移除并通知父页刷新 */
+/** 条目已译出（单翻/采用/重试成功）后从列表移除并通知父页刷新 */
 function onItemDone(id: number) {
   items.value = items.value.filter((it) => it.id !== id)
   emit('changed')
@@ -77,16 +79,11 @@ async function translateOne(it: FailedItem) {
   }
 }
 
-// ---- 手动翻译 ----
-function startEdit(it: FailedItem) {
-  editingId.value = it.id
-  editingText.value = ''
-}
-
+// ---- 采用译文（显式确认才落库；Enter 同效） ----
 async function commitEdit(it: FailedItem) {
-  const value = editingText.value.trim()
-  editingId.value = 0
-  if (!value) return
+  const value = it.draft.trim()
+  if (!value || savingIds.value.has(it.id)) return
+  savingIds.value.add(it.id)
   try {
     await api.patch(`/api/current/texts/${props.contentType}/${it.id}`,
                     { translated_text: value })
@@ -94,6 +91,20 @@ async function commitEdit(it: FailedItem) {
     onItemDone(it.id)
   } catch (e) {
     toastError(message, e)
+  } finally {
+    savingIds.value.delete(it.id)
+  }
+}
+
+/** 可采用的条数（译文框非空），用于「全部采用」按钮 */
+function adoptableCount(): number {
+  return items.value.filter((it) => it.draft.trim()).length
+}
+
+// ---- 全部采用：把所有非空译文框的内容落库（逐条复用采用逻辑） ----
+async function adoptAll() {
+  for (const it of [...items.value]) {
+    if (it.draft.trim()) await commitEdit(it)
   }
 }
 
@@ -116,8 +127,9 @@ async function clearAll() {
     style="width: 820px" @update:show="emit('update:show', $event)"
   >
     <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 10px">
-      以下条目在批次翻译中未译出（模型未返回或译文存疑）。可全部重试（拆小批通常能恢复）、
-      逐条 AI 翻译或手动填写；直接关闭则保持未翻译，下次「全部翻译」会重新拾起。
+      以下条目在批次翻译中未译出（模型未返回或译文存疑）。AI 曾返回的译文已填进译文框，
+      可直接修改——点「采用」或按 Enter 才落库，不会自动保存。
+      直接关闭则保持未翻译，下次「全部翻译」会重新拾起。
     </n-text>
 
     <n-space align="center" style="margin-bottom: 10px" wrap>
@@ -125,6 +137,9 @@ async function clearAll() {
       <n-input-number v-model:value="chunkSize" size="small" :min="1" :max="50" style="width: 90px" />
       <n-button size="small" type="primary" :disabled="items.length === 0" @click="retryAll">
         全部重试（{{ items.length }} 条）
+      </n-button>
+      <n-button size="small" type="primary" secondary :disabled="adoptableCount() === 0" @click="adoptAll">
+        全部采用（{{ adoptableCount() }} 条）
       </n-button>
       <n-popconfirm @positive-click="clearAll">
         <template #trigger>
@@ -151,20 +166,20 @@ async function clearAll() {
               size="tiny" type="primary" quaternary
               :loading="translatingIds.has(it.id)" @click="translateOne(it)"
             >AI翻译</n-button>
-            <n-button size="tiny" quaternary @click="startEdit(it)">手动翻译</n-button>
+            <n-button
+              size="tiny" type="success" :disabled="!it.draft.trim()"
+              :loading="savingIds.has(it.id)" @click="commitEdit(it)"
+            >采用</n-button>
           </n-space>
         </n-space>
         <div style="font-size: 13px; white-space: pre-wrap">{{ it.original_text }}</div>
-        <div v-if="editingId === it.id" style="margin-top: 6px">
-          <n-input
-            v-model:value="editingText" type="textarea" size="small"
-            :autosize="{ minRows: 1, maxRows: 4 }" placeholder="输入译文，Enter 保存 / Esc 取消"
-            autofocus
-            @keydown.enter.prevent="commitEdit(it)"
-            @keydown.esc="editingId = 0"
-            @blur="commitEdit(it)"
-          />
-        </div>
+        <n-input
+          v-model:value="it.draft" type="textarea" size="small"
+          :autosize="{ minRows: 1, maxRows: 4 }"
+          :placeholder="it.rejected ? 'AI 译文（未通过校验），可直接修改' : '输入译文'"
+          style="margin-top: 6px"
+          @keydown.enter.prevent="commitEdit(it)"
+        />
       </div>
     </div>
   </n-modal>

@@ -16,7 +16,8 @@ def _slim_items(items: list[dict]) -> list[dict]:
     return [{'id': it['id'],
              'original_text': it.get('original_text', ''),
              'character': it.get('character', ''),
-             'reason': it.get('reason', '')} for it in items]
+             'reason': it.get('reason', ''),
+             'rejected': it.get('rejected', '')} for it in items]
 
 
 class FailedRepo:

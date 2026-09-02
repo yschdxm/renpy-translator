@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
-from markup_check import check_pair, extract_interps, extract_tags
+from markup_check import check_newline, check_pair, extract_interps, extract_tags
 from translator import AITranslator, TranslationConfig
 from services.game_export import GameExporter
 
@@ -112,6 +112,30 @@ def test_nested_outer_rewrite_detected():
     assert any('丢失了原文的插值' in p and '[len(x[i])]' in p for p in probs)
 
 
+# ---- 译文真实换行检查 ----
+
+def test_raw_newline_rejected():
+    """原文是字面 \\n（两字符），译文却展开成真实换行——违规
+    （官方文档：Ren'Py 字符串不支持跨行，换行必须写 \\n 转义）"""
+    probs = check_newline('Join them\\nNext line.',
+                          '加入他们\n下一行。')
+    assert len(probs) == 1 and '换行' in probs[0] and '\\n' in probs[0]
+
+
+def test_literal_backslash_n_passes():
+    """译文按原文形式写字面 \\n → 通过"""
+    assert check_newline('Join them\\nNext.', '加入他们\\n下一行。') == []
+
+
+def test_raw_newline_in_original_exempt():
+    """原文本身含真实换行（多行模板/_p 块），译文同形不算违规"""
+    assert check_newline('第一行\n第二行', 'one\ntwo') == []
+
+
+def test_no_newline_passes():
+    assert check_newline('plain', '普通') == []
+
+
 # ---- 批次翻译接入：违规进存疑并带纠正指令重试 ----
 
 def _fake_message(translations):
@@ -124,7 +148,7 @@ def _fake_message(translations):
 def test_parse_marks_bad_markup_suspicious():
     items = [{'original_text': 'Honor to [tribe_name].'}]
     msg = _fake_message([{'id': 1, 'translation': '向[部落名]致敬。'}])
-    placed, _, suspicious = AITranslator._parse_tool_response(msg, items)
+    placed, _, suspicious, _ = AITranslator._parse_tool_response(msg, items)
     assert placed == {}
     assert '标记校验未通过' in suspicious[0]
 
@@ -142,7 +166,7 @@ def test_batch_retry_receives_correction_hint(translator, monkeypatch):
         return _fake_message([{'id': 1, 'translation': '向[tribe_name]致敬。'}])
 
     monkeypatch.setattr(translator, '_call_api', fake_call_api)
-    merged, _, fail_reasons = translator.translate_batch(
+    merged, _, fail_reasons, _rej = translator.translate_batch(
         [{'original_text': 'Honor to [tribe_name].'}],
         content_type='dialogue')
 
@@ -160,7 +184,7 @@ def test_batch_gives_up_keeps_reason(translator, monkeypatch):
         return _fake_message([{'id': 1, 'translation': '向[部落名]致敬。'}])
 
     monkeypatch.setattr(translator, '_call_api', always_bad)
-    merged, _, fail_reasons = translator.translate_batch(
+    merged, _, fail_reasons, _rej = translator.translate_batch(
         [{'original_text': 'Honor to [tribe_name].'}],
         content_type='dialogue')
     assert merged == {}

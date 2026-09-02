@@ -206,18 +206,19 @@ class TranslationService:
 
         async with self._semaphore:
             try:
-                translated_map, terms, fail_reasons = await loop.run_in_executor(
-                    self._executor,
-                    lambda: self.translator.translate_batch(
-                        items,
-                        content_type=content_type,
-                        glossary_text=glossary_text,
-                        character_profiles=character_profiles,
-                        context_before=context_before,
-                        style_guide=style_guide,
-                        context_window_tokens=self.max_context_k * 1024,
+                translated_map, terms, fail_reasons, rejected_map = \
+                    await loop.run_in_executor(
+                        self._executor,
+                        lambda: self.translator.translate_batch(
+                            items,
+                            content_type=content_type,
+                            glossary_text=glossary_text,
+                            character_profiles=character_profiles,
+                            context_before=context_before,
+                            style_guide=style_guide,
+                            context_window_tokens=self.max_context_k * 1024,
+                        )
                     )
-                )
             except FatalAPIError:
                 # 配置类致命错误（key 无效/余额耗尽）：后续批全会失败，
                 # 继续无意义，向上传递以中止批量任务
@@ -266,7 +267,9 @@ class TranslationService:
                 {'id': it['id'],
                  'original_text': it.get('original_text', ''),
                  'character': it.get('character', ''),
-                 'reason': fail_reasons.get(i, '模型未返回该句译文')}
+                 'reason': fail_reasons.get(i, '模型未返回该句译文'),
+                 # AI 返回过但校验被拒的译文（失败条目页面展示供修订/采用）
+                 'rejected': rejected_map.get(i, '')}
                 for i, it in enumerate(items) if not translated_map.get(i)
             ]
             if failed_items and stash_on_failure:

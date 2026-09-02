@@ -69,7 +69,7 @@ def db(tmp_path):
 def test_parse_partial_placement():
     """句数不足：能匹配的照常落位，缺失的留空（不再整批判废）"""
     msg = _fake_message([{'id': 1, 'translation': '你好'}])
-    placed, terms, suspicious = AITranslator._parse_tool_response(msg, _items(2))
+    placed, terms, suspicious, _ = AITranslator._parse_tool_response(msg, _items(2))
     assert placed == {0: '你好'}
     assert terms == []
     assert suspicious == {}
@@ -81,7 +81,7 @@ def test_parse_out_of_order_aligned_by_id():
         {'id': 2, 'translation': '二'},
         {'id': 1, 'translation': '一'},
     ])
-    placed, terms, _ = AITranslator._parse_tool_response(msg, _items(2))
+    placed, terms, _, _rej = AITranslator._parse_tool_response(msg, _items(2))
     assert placed == {0: '一', 1: '二'}
     assert terms == []
 
@@ -92,7 +92,7 @@ def test_parse_empty_translation_rejected():
         {'id': 1, 'translation': '一'},
         {'id': 2, 'translation': ''},
     ])
-    placed, _, _ = AITranslator._parse_tool_response(msg, _items(2))
+    placed, _, _, _rej = AITranslator._parse_tool_response(msg, _items(2))
     assert placed == {0: '一'}
 
 
@@ -104,7 +104,7 @@ def test_parse_misaligned_translation_suspicious():
         {'id': 1, 'translation': '我非常爱你，亲爱的。'},
         {'id': 2, 'translation': 'I love you so much, darling.'},  # 贴了第 1 条的原文
     ])
-    placed, _, suspicious = AITranslator._parse_tool_response(msg, items)
+    placed, _, suspicious, _ = AITranslator._parse_tool_response(msg, items)
     assert placed == {0: '我非常爱你，亲爱的。'}
     assert '贴错行' in suspicious[1]
 
@@ -117,7 +117,7 @@ def test_parse_similar_originals_not_flagged():
         {'id': 1, 'translation': 'I love you.'},  # 与两条原文都几乎相同
         {'id': 2, 'translation': '我爱你！'},
     ])
-    placed, _, suspicious = AITranslator._parse_tool_response(msg, items)
+    placed, _, suspicious, _ = AITranslator._parse_tool_response(msg, items)
     assert placed == {0: 'I love you.', 1: '我爱你！'}
     assert suspicious == {}
 
@@ -131,7 +131,7 @@ def test_parse_length_mismatch_suspicious():
         {'id': 1, 'translation': '短'},
         {'id': 2, 'translation': '短'},
     ])
-    placed, _, suspicious = AITranslator._parse_tool_response(msg, items)
+    placed, _, suspicious, _ = AITranslator._parse_tool_response(msg, items)
     assert placed == {1: '短'}
     assert '长度' in suspicious[0]
 
@@ -152,7 +152,7 @@ def test_translator_retries_on_mismatch(translator, monkeypatch):
         return _ok_message(2)
 
     monkeypatch.setattr(translator, '_call_api', fake_call_api)
-    merged, terms, fail_reasons = translator.translate_batch(
+    merged, terms, fail_reasons, _rej = translator.translate_batch(
         _items(), content_type='dialogue')
 
     assert len(calls) == 2
@@ -176,7 +176,7 @@ def test_translator_merges_across_attempts(translator, monkeypatch):
         return responses[min(len(calls) - 1, len(responses) - 1)]
 
     monkeypatch.setattr(translator, '_call_api', fake_call_api)
-    merged, _, fail_reasons = translator.translate_batch(
+    merged, _, fail_reasons, _rej = translator.translate_batch(
         _items(), content_type='dialogue')
 
     assert merged == {0: '第一句', 1: '第二句', 2: '第三句'}
@@ -195,7 +195,7 @@ def test_translator_gives_up_after_max_retries(translator, monkeypatch):
         return _fake_message([])  # 重试轮模型仍不交卷
 
     monkeypatch.setattr(translator, '_call_api', always_bad)
-    merged, _, fail_reasons = translator.translate_batch(
+    merged, _, fail_reasons, _rej = translator.translate_batch(
         _items(), content_type='dialogue')
 
     assert len(calls) == AITranslator.MAX_RETRIES
@@ -315,6 +315,53 @@ async def test_service_batch_partial_saved_and_stashed(translator, db, monkeypat
     stashed = batches[0]['items']
     assert [it['id'] for it in stashed] == [items[1]['id'], items[2]['id']]
     assert all(it['reason'] for it in stashed)
+
+
+async def test_service_stash_keeps_rejected_translation(translator, tmp_path, monkeypatch):
+    """AI 返回过但校验被拒（长度悬殊）的译文随暂存保留——
+    失败条目页面要展示出来供人工修订/采用"""
+    db = ProjectDatabase(str(tmp_path / 'p.db'))
+    db.connect()
+    db.insert_dialogues([
+        {'file_path': 'game/a.rpy', 'line_number': 1, 'label': 'start',
+         'character': 'e', 'original_text':
+         'This is a fairly long sentence that should translate into '
+         'something substantial.'},
+        {'file_path': 'game/a.rpy', 'line_number': 2, 'label': 'start',
+         'character': 'e', 'original_text':
+         'Another reasonably long line of dialogue written here for '
+         'testing purposes.'},
+    ])
+
+    calls = []
+
+    def short_answer(messages, temperature, max_tokens, tools=None,
+                     tool_choice=None, return_message=False, task_type=''):
+        calls.append(1)
+        if len(calls) > 1:
+            # 重试只发失败条目（子集 id 重编）：仍回过短译文
+            return _fake_message([{'id': 1, 'translation': '短'}])
+        return _fake_message([
+            {'id': 1, 'translation':
+             '这是一段相当长的句子，应该能翻译成有实质内容的译文。'},
+            {'id': 2, 'translation': '短'},  # 长度悬殊存疑被拒
+        ])
+
+    monkeypatch.setattr(translator, '_call_api', short_answer)
+    svc = TranslationService(translator, db, TranslationLogger())
+    items = db.get_all_dialogues()
+
+    results = await svc.translate_batch(items, 'dialogue')
+
+    assert len(results) == 1
+    batches = db.list_failed_batches('dialogue')
+    assert len(batches) == 1
+    assert [it['id'] for it in batches[0]['items']] == [items[1]['id']]
+    stashed = batches[0]['items'][0]
+    # 被拒译文随暂存保留
+    assert stashed['rejected'] == '短'
+    assert '长度' in stashed['reason']
+    db.close()
 
 
 async def test_service_batch_parse_failure_no_stash(translator, db, monkeypatch):
