@@ -40,6 +40,26 @@ _RETRYABLE_REASONS = {
 }
 
 
+def _extract_cache_info(response) -> tuple:
+    """从响应 usage 提取 prompt 缓存命中信息，返回 (命中 tokens, 总输入 tokens)；
+    提供商没回缓存字段时返回 None
+
+    DeepSeek: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
+    OpenAI:   usage.prompt_tokens_details.cached_tokens
+    """
+    usage = getattr(response, 'usage', None)
+    if usage is None:
+        return None
+    total = getattr(usage, 'prompt_tokens', 0) or 0
+    hit = getattr(usage, 'prompt_cache_hit_tokens', None)  # DeepSeek
+    if hit is None:
+        details = getattr(usage, 'prompt_tokens_details', None)  # OpenAI
+        hit = getattr(details, 'cached_tokens', None) if details else None
+    if not hit:
+        return None
+    return int(hit), int(total)
+
+
 class LLMClient:
     """OpenAI 兼容接口客户端（含统一重试与错误分类）"""
 
@@ -48,6 +68,7 @@ class LLMClient:
     def __init__(self, config, api_log_callback: Optional[Callable[[dict, dict, str], None]] = None):
         self.config = config
         self.client: Optional[OpenAI] = None
+        self.last_cache_info = None  # 最近一次调用的 (缓存命中, 总输入) tokens
         self.api_log_callback = api_log_callback
         # api_log_callback(request_body, response_body, task_type)
         self._init_client()
@@ -96,6 +117,7 @@ class LLMClient:
                     kwargs['tools'] = tools
                     kwargs['tool_choice'] = tool_choice
                 response = self.client.chat.completions.create(**kwargs)
+                self.last_cache_info = _extract_cache_info(response)
                 if self.api_log_callback:
                     try:
                         self.api_log_callback(kwargs, response.model_dump(), task_type)

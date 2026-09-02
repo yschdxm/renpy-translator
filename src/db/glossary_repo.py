@@ -125,10 +125,15 @@ class GlossaryRepo:
 
     @_auto_reconnect
     def get_glossary_for_prompt(self) -> str:
-        """获取术语表文本（用于提示词，供 AI 参考）"""
-        # 数据库中的术语（用户手动添加/自动提取）
+        """获取术语表文本（用于提示词，供 AI 参考）
+
+        ORDER BY rowid：顺序确定且新术语严格追加在末尾——批翻译每批
+        都会插入 AI 新术语，追加式增长才能保证批 N+1 的系统提示是
+        批 N 的前缀超集（DeepSeek/OpenAI prompt 缓存按 token 0 起
+        严格前缀匹配，乱序或中间插入会断掉全部前缀）"""
         db_rows = self._conn.execute(
-            "SELECT en_term, cn_term, term_type FROM glossary WHERE cn_term != '' AND cn_term IS NOT NULL"
+            "SELECT en_term, cn_term, term_type FROM glossary "
+            "WHERE cn_term != '' AND cn_term IS NOT NULL ORDER BY rowid"
         ).fetchall()
 
         lines = ["已有术语表（以下术语已有翻译，请直接使用，不要重复提取）："]

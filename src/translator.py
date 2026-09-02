@@ -51,19 +51,27 @@ def _strip_speaker_prefix(text: str, character: str) -> str:
 _MARKUP_FIX_TEMPERATURE = 0.3
 
 
-def _submit_translations_tools(n: int) -> list:
-    """批翻译的 submit_translations 工具 schema（恰好 n 条，按 id 对齐）"""
+def _submit_translations_tools() -> list:
+    """批翻译的 submit_translations 工具 schema（按 id 对齐提交全部译文）
+
+    schema 必须对所有调用字节一致：OpenAI/DeepSeek 的 prompt 缓存按
+    token 0 起严格前缀匹配且 tools 段计入前缀（通常还在 messages 之前
+    渲染）——此前把批次大小 n 插进 description/minItems/maxItems，
+    整批与重试子批的 schema 不同，从 token 0 就断掉全部缓存前缀。
+    条数要求由 user prompt 文本承载（build_batch_user_prompt 的
+    "共 n 条"），解析层按 id 对齐、容忍部分覆盖，不依赖 schema 强约束。
+    """
     return [{
         "type": "function",
         "function": {
             "name": "submit_translations",
-            "description": "按 id 提交全部译文，以及原文中新出现的游戏专有名词术语",
+            "description": "按 id 提交本批全部译文，以及原文中新出现的游戏专有名词术语",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "translations": {
                         "type": "array",
-                        "description": f"恰好 {n} 条译文，每条用 id 对应输入条目的 text 译文",
+                        "description": "本批全部译文，每条用 id 对应输入条目的 text 译文",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -72,8 +80,6 @@ def _submit_translations_tools(n: int) -> list:
                             },
                             "required": ["id", "translation"],
                         },
-                        "minItems": n,
-                        "maxItems": n,
                     },
                     "terms": {
                         "type": "array",
@@ -107,6 +113,10 @@ class AITranslator:
     def __init__(self, config: TranslationConfig):
         self.config = config
         self._llm = LLMClient(config)
+        # prompt 缓存命中累计（DeepSeek/OpenAI 缓存优化效果指标，见
+        # llm_client._extract_cache_info；cache_stats_delta 取增量）
+        self.cache_hit_total = 0
+        self.cache_prompt_total = 0
 
     @property
     def client(self):
@@ -138,11 +148,22 @@ class AITranslator:
     def _call_api(self, messages: list, temperature: float, max_tokens: int,
                   tools: list = None, tool_choice: dict = None,
                   return_message: bool = False, task_type: str = ''):
-        """兼容旧签名，委托给 LLMClient.chat_completion"""
-        return self._llm.chat_completion(
+        """兼容旧签名，委托给 LLMClient.chat_completion；
+        顺带累计 prompt 缓存命中（缓存优化效果的可观测指标）"""
+        result = self._llm.chat_completion(
             messages=messages, temperature=temperature, max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice,
             return_message=return_message, task_type=task_type)
+        info = getattr(self._llm, 'last_cache_info', None)
+        if info:
+            self.cache_hit_total += info[0]
+            self.cache_prompt_total += info[1]
+        return result
+
+    def cache_stats_delta(self, before: tuple) -> tuple:
+        """(hit, total) 自 before 以来的增量（任务/批次命中率日志用）"""
+        return (self.cache_hit_total - before[0],
+                self.cache_prompt_total - before[1])
 
     def translate_text(self, text: str, character: str = "",
                        context_before: List[dict] = None,
@@ -494,7 +515,7 @@ class AITranslator:
 
         # Tool Calls：translations 用 {id, translation} 对象数组，靠 id 对齐
         n = len(items)
-        tools = _submit_translations_tools(n)
+        tools = _submit_translations_tools()
 
         # 解析失败（句数不匹配）也重试：模型偶发漏译/多译，重新请求通常能恢复；
         # 重试只重发未译出/存疑的条目（带纠正 hint），已成功的不再浪费 token
@@ -561,8 +582,7 @@ class AITranslator:
                     send_map = failing
                     current_user_prompt = build_batch_user_prompt(
                         retry_items, context_before, content_type)
-                    current_tools = _submit_translations_tools(
-                        len(retry_items))
+                    current_tools = _submit_translations_tools()
                 print(f'[批次翻译] {n - len(merged)}/{n} 句未匹配，'
                       f'进行第 {attempt + 1}/{self.MAX_RETRIES} 次尝试...')
 

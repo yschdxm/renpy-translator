@@ -146,10 +146,14 @@ class CharacterRepo:
 
     @_auto_reconnect
     def get_characters_for_prompt(self) -> str:
-        """获取人名翻译词典文本（用于提示词，供 AI 参考）"""
+        """获取人名翻译词典文本（用于提示词，供 AI 参考）
+
+        ORDER BY rowid：顺序确定（prompt 缓存按 token 0 起严格前缀
+        匹配，乱序会断前缀）；人名在对话翻译前已定型，段内容天然稳定"""
         rows = self._conn.execute(
             "SELECT display_name, cn_name FROM characters "
-            "WHERE cn_name != '' AND cn_name IS NOT NULL AND is_placeholder=0"
+            "WHERE cn_name != '' AND cn_name IS NOT NULL AND is_placeholder=0 "
+            "ORDER BY rowid"
         ).fetchall()
         if not rows:
             return ""

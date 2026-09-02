@@ -205,6 +205,8 @@ class TranslationService:
         context_before, _ = await loop.run_in_executor(None, _get_context)
 
         async with self._semaphore:
+            cache_before = (getattr(self.translator, 'cache_hit_total', 0),
+                            getattr(self.translator, 'cache_prompt_total', 0))
             try:
                 translated_map, terms, fail_reasons, rejected_map = \
                     await loop.run_in_executor(
@@ -285,6 +287,14 @@ class TranslationService:
                 '可在翻译页「失败条目」中重试/单翻/手动',
                 panel=content_type)
         self.logger.info(f"批次翻译完成: {len(results)}/{len(items)} 条", panel=content_type)
+        # prompt 缓存命中率（DeepSeek/OpenAI 缓存字段存在时才有增量；
+        # 提供商不回缓存字段则静默不输出）
+        if hasattr(self.translator, 'cache_stats_delta'):
+            hit, total = self.translator.cache_stats_delta(cache_before)
+            if hit and total:
+                self.logger.info(
+                    f'prompt 缓存命中 {hit}/{total} tokens'
+                    f'（{hit / total * 100:.0f}%）', panel=content_type)
         return results
 
     async def translate_single(self, item_id: int, content_type: str,

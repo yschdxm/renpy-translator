@@ -253,6 +253,69 @@ async def test_service_fatal_api_error_reraises(translator, db, monkeypatch):
 
 # ---- service 层：匹配落库 + 未译出暂存 ----
 
+# ---- prompt 缓存命中率优化 ----
+
+def test_tools_schema_constant():
+    """submit_translations 工具 schema 必须对所有调用字节一致：
+    OpenAI/DeepSeek 的缓存前缀包含 tools 段（通常在 messages 之前渲染），
+    此前把批次大小 n 插进 description/minItems/maxItems 会从 token 0
+    断掉全部前缀。条数要求由 user prompt 文本承载"""
+    from translator import _submit_translations_tools
+    schema = _submit_translations_tools()
+    assert schema == _submit_translations_tools()
+    text = json.dumps(schema, ensure_ascii=False)
+    assert 'minItems' not in text and 'maxItems' not in text
+    assert '恰好' not in text
+
+
+def test_glossary_prompt_append_only(tmp_path):
+    """术语表文本必须追加式增长：批翻译每批插入 AI 新术语，
+    批 N+1 的系统提示是批 N 的前缀超集（严格前缀缓存才能命中）"""
+    db = ProjectDatabase(str(tmp_path / 'p.db'))
+    db.connect()
+    db.add_glossary_batch([{'en_term': 'sword', 'cn_term': '剑',
+                            'term_type': 'other', 'source': 'ai'}])
+    t1 = db.get_glossary_for_prompt()
+    db.add_glossary_batch([{'en_term': 'shield', 'cn_term': '盾',
+                            'term_type': 'other', 'source': 'ai'}])
+    t2 = db.get_glossary_for_prompt()
+    assert t2.startswith(t1)
+    # 重复插入已有术语不移动位置（幂等且顺序稳定）
+    db.add_glossary_batch([{'en_term': 'sword', 'cn_term': '剑',
+                            'term_type': 'other', 'source': 'ai'}])
+    assert db.get_glossary_for_prompt() == t2
+    db.close()
+
+
+def test_extract_cache_info():
+    """usage 缓存字段提取：DeepSeek/OpenAI 两种形态，无字段返回 None"""
+    from llm_client import _extract_cache_info
+    ds = SimpleNamespace(usage=SimpleNamespace(
+        prompt_tokens=1000, prompt_cache_hit_tokens=800,
+        prompt_cache_miss_tokens=200))
+    assert _extract_cache_info(ds) == (800, 1000)
+    oai = SimpleNamespace(usage=SimpleNamespace(
+        prompt_tokens=1000,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=512)))
+    assert _extract_cache_info(oai) == (512, 1000)
+    none_resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1000))
+    assert _extract_cache_info(none_resp) is None
+    assert _extract_cache_info(SimpleNamespace()) is None
+
+
+def test_cache_stats_accumulate(translator, monkeypatch):
+    """_call_api 累计缓存命中；cache_stats_delta 取增量"""
+    def fake_chat(messages, **kwargs):
+        translator._llm.last_cache_info = (100, 200)
+        return 'ok'
+
+    monkeypatch.setattr(translator._llm, 'chat_completion', fake_chat)
+    before = (translator.cache_hit_total, translator.cache_prompt_total)
+    translator._call_api([], 0.3, 100)
+    translator._call_api([], 0.3, 100)
+    assert translator.cache_stats_delta(before) == (200, 400)
+
+
 async def test_service_batch_retry_then_persisted(translator, db, monkeypatch):
     """首次解析不完整、重试成功：断言重试发生、结果返回且写入 SQLite"""
     calls = []
