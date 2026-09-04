@@ -3,7 +3,10 @@
 未包 _() 的字符串完全绕过 Ren'Py 翻译系统（SDK 模板提取不到）。
 本模块提供：
 - find_candidates: 启发式扫描候选字符串（A类=屏幕语言，B类=python 内嵌）
-- apply_wrapping: 把勾选的候选在原位置包成 _(...)，SDK 重生成模板后即可入库翻译
+- apply_wrapping: 把候选在原位置包成 _(...)——源码只读化后只在导出
+  副本上调用（GameExporter._apply_marked_wraps），工作副本永不被写入
+- relocate_wrap_candidates: 导出时按记录位置校验 + 同文件内容重定位
+  （标记/更新都不改源码，行号可能漂移）
 
 已知边界：
 - define 期求值的数据（字典/列表字面量）在定义时定值，游戏中途切语言不更新
@@ -119,6 +122,79 @@ def _unescape(s: str) -> str:
     return (s.replace('\\"', '"').replace("\\'", "'")
              .replace('\\n', '\n').replace('\\t', '\t')
              .replace('\\\\', '\\'))
+
+
+def relocate_wrap_candidates(rows: list, source_root: str) -> tuple:
+    """按记录位置校验并在同文件内重定位 wrap 候选
+
+    源码只读原则：标记/项目更新不再改源码，记录行号可能在版本间漂移。
+    导出时在目标目录（导出副本）上做定位：
+    - 记录位置 raw 命中 → 原样采用
+    - 未命中 → 同文件内搜该字面量：唯一匹配采用；多匹配取与记录行
+      号最近者；零匹配丢弃
+
+    rows: get_marked_embedded() 的 dict（id/rel_file/line/col_start/raw/
+    text/kind/hint）
+    返回 (candidates, moved_ids, lost_ids)：
+    - candidates 带重定位后坐标、file 指向 source_root 下文件
+    - moved_ids 需调用方回写 db.update_embedded_position
+    """
+    source_root = Path(source_root)
+    candidates = []
+    moved_ids = []
+    lost_ids = []
+    file_cache: dict = {}
+
+    def _lines(rel):
+        if rel not in file_cache:
+            try:
+                file_cache[rel] = (source_root / rel).read_text(
+                    encoding='utf-8').split('\n')
+            except OSError:
+                file_cache[rel] = None
+        return file_cache[rel]
+
+    for r in rows:
+        lines = _lines(r['rel_file'])
+        if lines is None:
+            lost_ids.append(r['id'])
+            continue
+        idx = r['line'] - 1
+        pos_ok = (0 <= idx < len(lines)
+                  and lines[idx][r['col_start']:r['col_start'] + len(r['raw'])]
+                  == r['raw'])
+        if pos_ok:
+            candidates.append(Candidate(
+                file=str(source_root / r['rel_file']), rel_file=r['rel_file'],
+                line=r['line'], col_start=r['col_start'],
+                col_end=r['col_start'] + len(r['raw']), raw=r['raw'],
+                text=r['text'], kind=r['kind'], hint=r.get('hint', ''),
+                confidence=''))
+            continue
+        # 行号漂移：同文件内容重定位
+        hits = []
+        for ln, line in enumerate(lines, 1):
+            start = 0
+            while True:
+                col = line.find(r['raw'], start)
+                if col < 0:
+                    break
+                hits.append((ln, col))
+                start = col + 1
+        if not hits:
+            lost_ids.append(r['id'])
+            continue
+        if len(hits) > 1:
+            hits.sort(key=lambda h: abs(h[0] - r['line']))
+        ln, col = hits[0]
+        if (ln, col) != (r['line'], r['col_start']):
+            moved_ids.append((r['id'], ln, col))
+        candidates.append(Candidate(
+            file=str(source_root / r['rel_file']), rel_file=r['rel_file'],
+            line=ln, col_start=col, col_end=col + len(r['raw']),
+            raw=r['raw'], text=r['text'], kind=r['kind'],
+            hint=r.get('hint', ''), confidence=''))
+    return candidates, moved_ids, lost_ids
 
 
 def _is_noise(text: str, kind: str) -> bool:
@@ -470,7 +546,9 @@ def apply_wrapping(candidates: list) -> tuple:
 def unwrap_candidates(candidates: list) -> tuple:
     """拆除候选位置的 _(...) 包裹（apply_wrapping 的逆操作）
 
-    导出校验发现标记破坏语法时用于定点取消该处翻译。
+    【legacy】源码只读化后生产路径不再拆包（工作副本从未被包裹，
+    healer 改为标 skipped + 重导出）——保留供测试/手工修复旧项目
+    工作副本中遗留的包裹用。
     记录的 col_start 指向带引号字面量起点；包裹后为 _(raw)，
     从文件末尾向开头处理保持偏移有效，目标位置不匹配时跳过。
 

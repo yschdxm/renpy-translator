@@ -5,6 +5,7 @@ import { NAlert, NButton, NCard, NPopconfirm, NSpace, NText, useMessage } from '
 import { FolderOpenOutline, PlayOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, toastError } from '../api/client'
 import { renderIcon } from '../components/icons'
+import MarkupIssuesDialog from '../components/MarkupIssuesDialog.vue'
 import ProgressLine from '../components/ProgressLine.vue'
 import { useJobsStore } from '../stores/jobs'
 import { useSessionStore } from '../stores/session'
@@ -32,6 +33,7 @@ interface ExportInfo {
 }
 
 const info = ref<ExportInfo | null>(null)
+const showMarkupDialog = ref(false)
 
 /** 未翻译条数（>0 时导出前弹确认提醒） */
 const untranslated = computed(() =>
@@ -129,7 +131,10 @@ onMounted(load)
       <div style="margin-bottom: 6px">
         {{ info.markup_issues.count }} 条译文破坏了插值 [表达式] 或标签 {标签}
         ——导出时这些条目将保留英文原文（否则游戏渲染会报错）。
-        请在「文本翻译」/「字符串翻译」页修订后重新导出。
+        <n-button size="tiny" type="warning" secondary
+          style="margin-left: 8px" @click="showMarkupDialog = true">
+          逐条修订
+        </n-button>
       </div>
       <div
         v-for="(s, i) in info.markup_issues.samples" :key="i"
@@ -141,8 +146,10 @@ onMounted(load)
       <div v-if="info.markup_issues.count > info.markup_issues.samples.length"
         style="font-size: 12px; opacity: 0.75; margin-top: 4px"
       >
-        …其余 {{ info.markup_issues.count - info.markup_issues.samples.length }} 条同理（完整清单见导出日志）
+        …其余 {{ info.markup_issues.count - info.markup_issues.samples.length }} 条同理，点「逐条修订」查看完整清单
       </div>
     </n-alert>
+
+    <markup-issues-dialog v-model:show="showMarkupDialog" @changed="load" />
   </div>
 </template>

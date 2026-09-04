@@ -1,5 +1,6 @@
 """游戏导出 API：统计信息 + 导出任务"""
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 
 from ..deps import require_project
 from ..errors import ApiError
@@ -27,6 +28,39 @@ async def export_info(state: AppState = Depends(require_project)):
         # 导出产物只有 exports/{项目名}/{项目名}-translated.zip
         'exports_dir': str(_exports_dir(state, state.current_project)),
     }
+
+
+@router.get('/markup-issues')
+async def list_markup_issues(state: AppState = Depends(require_project)):
+    """标记违规条目完整清单（导出页逐条修订对话框用）"""
+    from services.game_export import iter_markup_issues
+    rows = await state.db_call(
+        lambda db: list(iter_markup_issues(db)))
+    return {'rows': rows}
+
+
+class MarkupCheckIn(BaseModel):
+    kind: str      # dialogue | ui
+    id: int
+
+
+@router.post('/markup-check')
+async def markup_check_one(req: MarkupCheckIn,
+                           state: AppState = Depends(require_project)):
+    """单条复核：修订保存/AI重译后确认该条是否还有违规（免去全量重扫）"""
+    import markup_check
+    if req.kind == 'dialogue':
+        row = await state.db_call(state.db.get_dialogue, req.id)
+    elif req.kind == 'ui':
+        row = await state.db_call(state.db.get_ui_text, req.id)
+    else:
+        raise ApiError(400, 'BAD_KIND', f'未知类型: {req.kind}')
+    if not row:
+        raise ApiError(404, 'NOT_FOUND', f'条目不存在: {req.id}')
+    probs = markup_check.check_pair(
+        row.get('original_text') or '', row.get('translated_text') or '')
+    return {'problems': probs,
+            'translated_text': row.get('translated_text') or ''}
 
 
 @router.post('/game')

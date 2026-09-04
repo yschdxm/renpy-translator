@@ -3,7 +3,8 @@
 AI 预筛（粗筛代码片段、精审 read_code/search_code 工具）与静态用途分析
 （UsageAnalyzer 出现点搜索）都要反复读游戏 .rpy 源码：逐候选整文件读、
 每次工具调用全树 rglob+全量读。本类把 rel_path -> 行列表 缓存起来，
-带 mtime 校验失效（apply_wrapping 改写源码后下次读取自动重载）。
+带 mtime 校验失效（源码只读化后工作副本不再被工具改写，此校验主要
+兜外部改动/项目更新替换）。
 """
 from pathlib import Path
 
@@ -20,21 +21,26 @@ class SourceTree:
     - search(query): 全树子串搜索，复用已缓存内容
     """
 
-    def __init__(self, game_root: str):
-        """game_root: 与 find_candidates 的 rel_file 基准一致的源码根目录"""
+    def __init__(self, game_root: str, include_renpy_py: bool = False):
+        """game_root: 与 find_candidates 的 rel_file 基准一致的源码根目录；
+        include_renpy_py: 同时索引 *_ren.py（Ren'Py 8 的 Python 源码，
+        剧情图解析需要——不少游戏把事件注册写在 _ren.py 里）"""
         self.root = Path(game_root)
+        self._include_py = include_renpy_py
         self._file_list = None   # list[str] | None（懒扫描）
         self._cache = {}         # rel -> (mtime, lines)
 
     def files(self) -> list:
-        """全树 .rpy 相对路径列表（排序、去重）"""
+        """全树 .rpy（可选 + *_ren.py）相对路径列表（排序、去重）"""
         if self._file_list is None:
             out = []
-            for rpy in sorted(self.root.rglob('*.rpy')):
-                if _EXCLUDE_DIRS & set(rpy.parts):
-                    continue
-                out.append(rpy.relative_to(self.root).as_posix())
-            self._file_list = out
+            patterns = ['*.rpy', '*_ren.py'] if self._include_py else ['*.rpy']
+            for pat in patterns:
+                for rpy in sorted(self.root.rglob(pat)):
+                    if _EXCLUDE_DIRS & set(rpy.parts):
+                        continue
+                    out.append(rpy.relative_to(self.root).as_posix())
+            self._file_list = sorted(set(out))
         return self._file_list
 
     def lines(self, rel: str) -> list:

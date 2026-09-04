@@ -291,6 +291,51 @@ def test_fill_passes_good_translations(exporter):
     assert '向[tribe_name]致敬。' in out
 
 
+# ---- say 行说话人形态：点分属性/字符串字面量/下标 ----
+
+SAY_WHO_VARIANTS = '''translate chinese a_1:
+
+    # mc.name "So everything's still in there?"
+    mc.name "So everything's still in there?"
+
+translate chinese a_2:
+
+    # "Janitor" "They left all their stuff."
+    "Janitor" "They left all their stuff."
+
+translate chinese a_3:
+
+    # the_group[0] "We both say hi."
+    the_group[0] "We both say hi."
+
+translate chinese a_4:
+
+    # "She said \\"hi\\" loudly."
+    "She said \\"hi\\" loudly."
+'''
+
+
+def test_fill_dialogue_speaker_variants(exporter):
+    """mc.name / "Janitor" / the_group[0] 等说话人形态都要能填充。
+
+    旧实现 who 只认 \\w+：mc.name 这类动态说话人整行被静默跳过
+    （LR2 系游戏上万条）；带引号说话人还会被宽松旁白匹配误吞。"""
+    ex, tl = exporter
+    (tl / 'who.rpy').write_text(SAY_WHO_VARIANTS, encoding='utf-8')
+    mapping = {"So everything's still in there?": '东西都还在？',
+               'They left all their stuff.': '他们把东西都留下了。',
+               'We both say hi.': '我们俩打个招呼。',
+               'She said "hi" loudly.': '她大声说了"嗨"。'}
+    filled = ex._fill_dialogue(tl, mapping)
+    out = (tl / 'who.rpy').read_text(encoding='utf-8')
+    assert filled == 4
+    assert 'mc.name "东西都还在？"' in out
+    assert '"Janitor" "他们把东西都留下了。"' in out
+    assert 'the_group[0] "我们俩打个招呼。"' in out
+    assert '她大声说了' in out
+    assert ex._blocked == []
+
+
 # ---- 导出预检：库内坏译文前置清单 ----
 
 def test_scan_markup_issues(tmp_path):

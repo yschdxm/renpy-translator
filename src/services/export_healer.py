@@ -3,12 +3,15 @@
 校验：对导出目录跑 SDK translate（等价于全量解析所有 .rpy，含 tl 模板），
 解析报错中的 File/line 定位出错点。
 
+源码只读化后内嵌 wrap 只存在于导出副本（每轮导出重新应用），工作副本
+从未被包裹——内嵌修复不需要拆源码/SDK 重生成，标 skipped + 重导出即可。
+
 错误分类（报错文件位置 + 内嵌标记库对照，均为机械判定）：
 - game/tl/ 下：定位出错条目原文，对照内嵌标记库——
-  · 条目原文命中已标记候选 → 内嵌标记问题（该条目由 _() 标记生成），
-    拆除包裹 → SDK 重生成 → 重新导出
+  · 条目原文命中已标记候选 → 内嵌标记问题，命中行标 skipped
+    （重生成 zz 表）→ 重新导出
   · 未命中 → 译文问题：AI 修译文（fix/blank）→ 更新库 → 重填 tl → 再校验
-- game/ 其他 → 内嵌标记问题：按报错位置 ±3 行找已标记候选，同上拆除
+- game/ 其他 → 内嵌标记问题：按报错位置 ±3 行找已标记候选，同上
 - 其他位置   → 不可修复，响亮失败
 
 每轮至少修复一处才继续，最多 MAX_ROUNDS 轮。
@@ -17,7 +20,6 @@ import asyncio
 import json
 import re
 import threading
-import time
 from pathlib import Path
 
 from database import ProjectDatabase
@@ -55,13 +57,10 @@ class ExportHealer:
 
     def __init__(self, db: ProjectDatabase, translator, project_dir: str,
                  sdk_path: str, logger: TranslationLogger, exporter):
-        from embedded_strings import resolve_source_root
         self.db = db
         self.translator = translator
         self.project_dir = Path(project_dir)
         self.game_root = self.project_dir / 'game'
-        # 与 find_candidates 一致的 rel_file 基准
-        self.base_dir = resolve_source_root(self.game_root)
         self.sdk_path = sdk_path
         self.logger = logger
         self.exporter = exporter  # GameExporter（重填 tl 用）
@@ -111,6 +110,14 @@ class ExportHealer:
             errors = await loop.run_in_executor(
                 None, self._validate, export_dir)
             if not errors:
+                # SDK 校验会重新生成模板：源码中任何 _()（导出时包的 wrap、
+                # 游戏原生 _()、游戏补丁引入的 _()）此刻都被提取成 old 条目，
+                # 与 zz 表/其他模板里的同名条目构成"重复 old"（Ren'Py 加载
+                # 硬错误）。必须在打包前清扫——这是最后一道也是唯一一道
+                # 能覆盖"校验时才生成的模板"的防线。
+                from services.game_export import dedupe_string_tables
+                await loop.run_in_executor(
+                    None, dedupe_string_tables, export_dir, log)
                 log('编译校验通过')
                 return 'ok'
             log(f'发现 {len(errors)} 处报错，开始自动修复:')
@@ -211,8 +218,9 @@ class ExportHealer:
                     trans_errors.append(e)
 
         if game_errors or embedded_rows:
-            # 内嵌标记问题：拆除包裹 → 重生成 → 重新导出（优先于译文修复，
-            # 因为重导出会重建整个 tl，译文修复等重新导出后再做）
+            # 内嵌标记问题：命中行标 skipped + 重生成 zz 表 → 重新导出
+            # （优先于译文修复，因为重导出会重建整个 tl，
+            # 译文修复等重新导出后再做）
             ok = await self._heal_embedded(game_errors, embedded_rows, log)
             return 'reexport' if ok else 'fail'
 
@@ -337,15 +345,19 @@ class ExportHealer:
             self.logger.error(f'AI 修复译文失败: {e}', panel='export')
             return '', ''
 
-    # ========== 内嵌标记修复（游戏源码内的错误） ==========
+    # ========== 内嵌标记修复（导出副本编译错误） ==========
 
     async def _heal_embedded(self, errors: list, direct_rows: list, log) -> bool:
-        """定位报错对应的已标记候选并拆除 _() 包裹，然后 SDK 重生成模板
+        """命中行标 skipped 并重生成 zz 表，触发重导出
+
+        源码只读原则：工作副本从未被包裹，无需拆包；wrap 包裹只存在于
+        导出副本（每轮导出重新生成），把出问题的行标 skipped 后重导出
+        即不再包裹该处。修复回路从"改源码+SDK 重生成+重导出"变为
+        "改 DB+重导出"，无 SDK 往返。
 
         errors: game 源码报错（按位置 ±3 行匹配候选）
         direct_rows: tl 报错中按条目原文已命中的候选行（直接使用）
         """
-        from embedded_strings import Candidate, unwrap_candidates
         loop = asyncio.get_event_loop()
 
         marked = await loop.run_in_executor(None, self.db.get_marked_embedded)
@@ -367,57 +379,16 @@ class ExportHealer:
                     seen_ids.add(r['id'])
                     rows.append(r)
 
-        to_unwrap = [Candidate(
-            file=str(self.base_dir / r['rel_file']),
-            rel_file=r['rel_file'], line=r['line'],
-            col_start=r['col_start'],
-            col_end=r['col_start'] + len(r['raw']),
-            raw=r['raw'], text=r['text'], kind=r['kind'],
-            hint=r['hint'], confidence='') for r in rows]
-
-        for r in to_unwrap:
-            log(f"  拆除标记（取消该处翻译）: {r['text'][:40]!r} "
+        for r in rows:
+            log(f"  放弃该处翻译（标 skipped）: {r['text'][:40]!r} "
                 f"({r['rel_file']}:{r['line']})")
-        done_cands, skipped = await loop.run_in_executor(
-            None, unwrap_candidates, to_unwrap)
-        if not done_cands:
-            log('  拆除失败（源码位置已变化），无法自动修复')
-            return False
-        if skipped:
-            log(f'  {skipped} 处位置校验失败跳过')
-        # 只对实际成功拆除的行标 skipped；位置校验失败的行保持 marked，
-        # 下轮修复仍可匹配候选重试（否则候选丢失直接 fail）
-        done_set = {id(c) for c in done_cands}
-        done_ids = [r['id'] for r, c in zip(rows, to_unwrap)
-                    if id(c) in done_set]
+
+        # 标 skipped + 重生成 zz 表（条目移除）；wrap 位置坐标保持，
+        # skipped 行不再出现在 get_marked_embedded，导出时不再包裹
+        ids = [r['id'] for r in rows]
         await loop.run_in_executor(
-            None, self.db.set_embedded_status, done_ids, 'skipped')
-
-        # 工作区 SDK 重新生成模板（与内嵌管线一致，带崩溃重试）
-        log('重新生成翻译模板...')
-        from sdk_manager import SDKManager
-
-        def _regen():
-            sdk = SDKManager()
-            sdk.sdk_path = Path(self.sdk_path)
-            for attempt in range(1, 6):
-                result = sdk.generate_translations(
-                    str(self.game_root), 'chinese',
-                    cancel_event=self._sdk_cancel_event)
-                if result['success'] or result.get('cancelled'):
-                    return result
-                self.logger.warning(
-                    f'SDK 生成模板第 {attempt} 次失败: {result["message"]}',
-                    panel='export')
-                time.sleep(2)
-            return result
-
-        sdk_result = await loop.run_in_executor(None, _regen)
-        if sdk_result.get('cancelled'):
-            self._check_cancel()
-            log('  SDK 重新生成已取消')
-            return False
-        if not sdk_result['success']:
-            log(f"  SDK 重新生成失败: {sdk_result['message']}")
-            return False
+            None, self.db.set_embedded_status, ids, 'skipped')
+        from services.embedded_table import regen_embedded_table
+        await loop.run_in_executor(
+            None, regen_embedded_table, self.db, self.game_root, self.logger)
         return True

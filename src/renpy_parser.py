@@ -36,9 +36,12 @@ class RenpyParser:
     """Ren'Py脚本解析器"""
 
     # Ren'Py对话模式
+    # 说话人形态：普通名字 e、点分属性 mc.name、字符串字面量 "Janitor"
+    # （动态角色名）、下标 the_group[0]——不能只认 \w+，
+    # 否则引号说话人会被旁白模式误吞、整句台词丢失
     DIALOGUE_PATTERNS = [
-        # 角色对话: e "Hello"
-        r'^(\w+)\s+"((?:[^"\\]|\\.)*?)"',
+        # 角色对话: e "Hello" / mc.name "Hello" / "Janitor" "Hello"
+        r'^([\w.\[\]]+|"(?:[^"\\]|\\.)*?")\s+"((?:[^"\\]|\\.)*?)"',
         # 旁白对话: "Hello"
         r'^"((?:[^"\\]|\\.)*?)"',
         # nvl模式对话: e "Hello" nvl_narrator
@@ -177,6 +180,14 @@ class RenpyParser:
                         # 角色对话
                         char_var = match.group(1)
                         text = match.group(2)
+
+                        # 归一：引号说话人去引号（"Janitor" -> Janitor），
+                        # 点分属性/下标取根变量（mc.name/the_group[0] ->
+                        # mc/the_group），与角色表对齐
+                        if char_var.startswith('"'):
+                            char_var = char_var[1:-1]
+                        elif '.' in char_var or '[' in char_var:
+                            char_var = char_var.split('.')[0].split('[')[0]
 
                         # 过滤掉代码关键字
                         if char_var.lower() in self.CODE_KEYWORDS:

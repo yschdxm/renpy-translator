@@ -24,7 +24,9 @@
     )
 返回 {'success': True, 'carried': n, 'edited': n, 'new': n,
       'still_untranslated': n, 'obsolete': n, 'review': n,
-      'embedded_rewrapped': n, 'embedded_lost': n} 或 {'cancelled': True}。
+      'embedded_rewrapped': 0, 'embedded_lost': 0} 或 {'cancelled': True}。
+（源码只读化后更新不再重包裹内嵌标记——wrap 推迟到导出副本应用，
+这两个字段恒 0，仅为兼容旧报告结构保留。）
 """
 import asyncio
 import difflib
@@ -249,73 +251,6 @@ def merge_translations(old_dialogues: list[dict], old_ui: list[dict],
     }
 
 
-# ========== 内嵌文本重标记 ==========
-
-def rewrap_marked_embedded(db, game_work_dir: Path, game_bak_dir: Path,
-                           logger: TranslationLogger) -> tuple[int, int]:
-    """把旧版本已标记的内嵌 _() 在新源码上按内容重新定位并重新包裹。
-
-    行号在版本间会漂移，匹配键为 (rel_file, raw)；同一 (rel_file, raw)
-    出现多次时按 (line, col_start) 序位对位。必须在 SDK 重新生成模板之前
-    调用（否则 _() 字符串进不了新模板）。
-
-    同步函数（调用方放 executor）。返回 (重标记数, 丢失数)。
-    丢失的候选重置为 pending（保留 AI 判定，后续扫描可重新处理）。
-    """
-    from embedded_strings import apply_wrapping, find_candidates
-
-    marked = db.get_marked_embedded()
-    if not marked:
-        return (0, 0)
-
-    new_cands = find_candidates(str(game_work_dir))
-    new_by_key: dict[tuple, list] = {}
-    for c in new_cands:
-        new_by_key.setdefault((c.rel_file, c.raw), []).append(c)
-
-    old_by_key = None  # 需要序位匹配时才扫旧树
-    to_wrap = []       # (db_row, Candidate)
-    lost_ids = []
-    for row in marked:
-        key = (row['rel_file'], row['raw'])
-        matches = new_by_key.get(key, [])
-        if len(matches) == 1:
-            to_wrap.append((row, matches[0]))
-        elif len(matches) > 1:
-            if old_by_key is None:
-                old_by_key = {}
-                for c in find_candidates(str(game_bak_dir)):
-                    old_by_key.setdefault((c.rel_file, c.raw), []).append(c)
-            rank = 0
-            for c in old_by_key.get(key, []):
-                if (c.line, c.col_start) < (row['line'], row['col_start']):
-                    rank += 1
-            to_wrap.append((row, matches[min(rank, len(matches) - 1)]))
-        else:
-            lost_ids.append(row['id'])
-
-    rewrapped = 0
-    if to_wrap:
-        # apply_wrapping 自带位置校验（源码变了就跳过），
-        # 坐标来自对同一新树的全新扫描，正常不会跳过
-        wrapped, skipped, _ok = apply_wrapping([c for _, c in to_wrap])
-        if skipped:
-            logger.warning(
-                f'内嵌重标记有 {skipped} 条位置校验未通过（对应文本需重新标记）',
-                panel='projects')
-        rewrapped = wrapped
-        for row, c in to_wrap:
-            db.update_embedded_position(row['id'], c.line, c.col_start)
-    if lost_ids:
-        # merge_embedded_candidates 会跳过 status='marked' 的行——
-        # 丢失的必须重置回 pending，否则永远不再出现
-        db.set_embedded_status(lost_ids, 'pending')
-        logger.warning(
-            f'{len(lost_ids)} 条内嵌标记在新版中未找到（已重置为待处理）',
-            panel='projects')
-    return (rewrapped, len(lost_ids))
-
-
 # ========== 项目更新编排 ==========
 
 class ProjectUpdater:
@@ -454,13 +389,9 @@ class ProjectUpdater:
                     f'已删除新版本自带中文翻译（{official_tl} 个文件）',
                     panel='projects')
 
-            # 步骤6: 内嵌 _() 重标记（必须在 SDK 生成模板之前）
-            progress(0.52, '正在重新标记内嵌文本...')
-            rewrapped, lost = await _rie(
-                rewrap_marked_embedded, db, game_work_dir, game_bak, self.logger)
-            if rewrapped or lost:
-                self.logger.info(
-                    f'内嵌文本重标记: {rewrapped} 成功, {lost} 丢失', panel='projects')
+            # 步骤6: （原"内嵌 _() 重标记"已删除——源码只读原则：标记不再
+            # 改工作副本，wrap 包裹在导出时于导出副本应用，行号漂移由导出
+            # 时同文件重定位兜底，无需更新期任何源码操作）
 
             # 步骤7: SDK 重新生成模板
             sdk_path = await resolve_sdk_or_raise(
@@ -472,10 +403,13 @@ class ProjectUpdater:
                 cancel_event=cancel_event)
             progress(0.60, 'SDK 模板就绪')
 
-            # 步骤6b: 内嵌 strings 表重生成（table 路径无需重标记——
-            # 全量重写 zz_embedded.rpy；新源码中消失的文本不写文件，
-            # 行保持 marked，文本回归后下次自动恢复；译文在步骤9
-            # 按 original_text 从旧 ui_texts 池继承）
+            # 步骤7b: 内嵌 strings 表重生成——必须在 SDK 模板生成之后：
+            # zz 写条目前要按"全部现有模板"去重（重复 old 是 Ren'Py 硬
+            # 错误），模板未生成时去重集合缺项会写出重复条目。
+            # table/wrap 全部 marked 行（源码只读后两条路径都靠 zz 表
+            # 合成条目）；新源码中消失的文本不写文件，行保持 marked，
+            # 文本回归后下次自动恢复；译文在步骤9按 original_text 从旧
+            # ui_texts 池继承）
             from services.embedded_table import regen_embedded_table
             await _rie(regen_embedded_table, db, game_work_dir, self.logger)
 
@@ -532,8 +466,9 @@ class ProjectUpdater:
                 'still_untranslated': stats['still_untranslated'],
                 'obsolete': stats['obsolete'],
                 'review': stats['review'],
-                'embedded_rewrapped': rewrapped,
-                'embedded_lost': lost,
+                # 源码只读化后更新不再重包裹（wrap 推迟到导出副本应用）
+                'embedded_rewrapped': 0,
+                'embedded_lost': 0,
                 'updated_at': datetime.now().isoformat(),
             }
 

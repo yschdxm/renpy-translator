@@ -13,8 +13,6 @@ interface UpdateReport {
   still_untranslated: number
   obsolete: number
   review: number
-  embedded_rewrapped: number
-  embedded_lost: number
   updated_at: string
 }
 
@@ -106,10 +104,6 @@ const pendingReview = () => review.value.filter((r) => r.status === 'pending')
         </n-space>
         <n-text depth="3" style="font-size: 12px">
           更新时间 {{ report.updated_at?.replace('T', ' ').slice(0, 19) }}
-          <template v-if="report.embedded_rewrapped || report.embedded_lost">
-            · 内嵌文本重标记 {{ report.embedded_rewrapped }} 条
-            <template v-if="report.embedded_lost">（{{ report.embedded_lost }} 条未找到已重置）</template>
-          </template>
         </n-text>
 
         <!-- 微改复核：自动继承的留痕 + 待人工确认的近似句 -->

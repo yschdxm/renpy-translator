@@ -26,6 +26,18 @@ translate chinese test_label_12345678:
     # "Narration line."
     "Narration line."
 
+# game/scripts/foo.rpy:13
+    # "Janitor" "Hey, who's making all that noise?"
+    "Janitor" "Hey, who's making all that noise?"
+
+# game/scripts/foo.rpy:14
+    # the_group[0] "We say hi together."
+    the_group[0] "We say hi together."
+
+# game/scripts/foo.rpy:15
+    # "Narration with args." (what_color="#8c8")
+    "Narration with args." (what_color="#8c8")
+
 translate chinese strings:
 
     # game/scripts/foo.rpy:20
@@ -54,6 +66,28 @@ def test_dotted_speaker_parsed(tl_project):
     assert ('mc', 'Hey [lily.title].') in by_char
     assert ('mom', 'Hello there.') in by_char
     assert ('', 'Narration line.') in by_char
+
+
+def test_quoted_speaker_parsed(tl_project):
+    """字符串字面量说话人（"Janitor" "..."，动态角色名）整句入库，
+    去引号归一——原实现被旁白模式误吞成 original_text='Janitor' 的
+    垃圾旁白，真实台词完全丢失"""
+    by_char = {(d['character'], d['original_text']) for d in tl_project['dialogues']}
+    assert ('Janitor', "Hey, who's making all that noise?") in by_char
+    # 不得产出误吞的垃圾旁白
+    assert ('', 'Janitor') not in by_char
+
+
+def test_subscript_speaker_parsed(tl_project):
+    """下标说话人 the_group[0] 入库并归一为根变量 the_group"""
+    by_char = {(d['character'], d['original_text']) for d in tl_project['dialogues']}
+    assert ('the_group', 'We say hi together.') in by_char
+
+
+def test_narration_with_say_args(tl_project):
+    """带 say 参数的旁白：参数里的引号不得混进原文"""
+    by_char = {(d['character'], d['original_text']) for d in tl_project['dialogues']}
+    assert ('', 'Narration with args.') in by_char
 
 
 def test_say_line_number_from_comment(tl_project):

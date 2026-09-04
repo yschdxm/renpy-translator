@@ -29,6 +29,28 @@ _STRING_PROTECT_RE = re.compile(
     r'%%|%\(\w+\)[#0\- +]*(?:\d+)?(?:\.\d+)?[diouxXeEfFgGcrs]|%[a-zA-Z]'
 )
 
+# 旧版内嵌包装 bug 的遗留：f"..." 被在引号处插入 _() 变成 f_("...")。
+# 这在语法上是"调用函数 f_"，编译校验拦不住，运行时才 NameError。
+# 扫描端已修（前缀字面量不再成为候选），但旧工作副本里已写入的坏包装
+# 会随复制带进导出包——导出前按模式机械还原（f_("abc") -> f"abc"）。
+_LEGACY_WRAP_FIND_RE = re.compile(r'\b[frbuFRBU]{1,2}_\(')
+_LEGACY_WRAP_FIX_RE = re.compile(
+    r'\b([frbuFRBU]{1,2})_\(('
+    r'"(?:[^"\\\n]|\\.)*"' r'|'
+    r"'(?:[^'\\\n]|\\.)*'"
+    r')\)'
+)
+
+# tl 文件 say 行的说话人（who）形态：普通名字 janitor、点分属性 mc.name、
+# 下标 the_group[0]、字符串字面量 "Janitor"（动态角色名）。
+# 旧实现只认 \w+，mc.name 这类动态说话人整行填充被静默跳过
+# （LR2 系游戏上万条），游戏内显示英文。
+_SAY_CONTENT_RE = re.compile(
+    r'^\s+([\w.\[\]]+|"(?:[^"\\]|\\.)*")\s+"(.*)"')
+# 无说话人的旁白行：整行恰好一个字符串字面量（宽松写法会误吞
+# "Janitor" "text" 这类带引号说话人的行，把 who 也并进 text）
+_SAY_NARRATION_RE = re.compile(r'^\s+"((?:[^"\\]|\\.)*)"\s*$')
+
 
 def escape_translation(text: str, percent: str = 'say') -> str:
     """转义译文中的特殊字符，保证写入 .rpy 后是合法且可运行的字符串
@@ -58,6 +80,131 @@ def escape_translation(text: str, percent: str = 'say') -> str:
     return text.replace('"', '\\"')
 
 
+def iter_markup_issues(db):
+    """逐条产出库内已译条目的标记一致性问题（导出闸门同一套校验）
+
+    每条 {'kind', 'id', 'file', 'line', 'original', 'translation',
+    'reasons': [...]}。scan_markup_issues（导出页前置警告）与
+    markup-issues 修订接口共用。
+    """
+    for kind, rows in (('dialogue', db.get_all_dialogues()),
+                       ('ui', db.get_all_ui_texts())):
+        for r in rows:
+            orig = r.get('original_text') or ''
+            trans = r.get('translated_text') or ''
+            if not orig or not trans:
+                continue
+            probs = markup_check.check_pair(orig, trans)
+            if probs:
+                yield {'kind': kind, 'id': r['id'],
+                       'file': r.get('file_path', ''),
+                       'line': r.get('line_number', 0),
+                       'original': orig, 'translation': trans,
+                       'reasons': probs}
+
+
+def dedupe_string_tables(export_dir: Path, log) -> int:
+    """导出副本 tl 的 strings 表去重清扫（重复 old 是 Ren'Py 加载硬错误）
+
+    重复的三个来源，全部只在导出副本运行时才会合流：
+    - SDK 校验重新生成模板：源码中任何 _()（导出时包的 wrap、游戏
+      原生 _()、游戏补丁引入的 _()）被提取成 old 条目，与 zz 撞车
+    - 同一文本在游戏多处原生 _()：SDK 提取进多个模板文件
+    - zz 写条目的时刻早于某些模板生成（去重只对当时存在的文件）
+
+    保留策略：非 zz 文件优先于 zz（SDK 模板是"官方"出处）；同优先级
+    有译文优先。被弃条目若带译文而保留者为空，译文回填到保留者——
+    只删行与填 new，不动任何其他结构（空 strings 块/空文件对 Ren'Py
+    无害；下轮 SDK 校验也不会把 zz 没有的条目塞回 zz）。
+
+    返回清理的重复组数。
+    """
+    from services.embedded_table import ZZ_NAME, _OLD_LINE_RE
+
+    tl_dir = Path(export_dir) / 'game' / 'tl' / 'chinese'
+    if not tl_dir.is_dir():
+        return 0
+
+    _STRINGS_HEAD_RE = re.compile(r'^translate\s+\w+\s+strings\s*:')
+    _TRANSLATE_HEAD_RE = re.compile(r'^translate\s+\w+\s+\w+\s*:')
+    _NEW_LINE_RE = re.compile(r'^\s+new\s+"(.*)"\s*$')
+
+    entries = []
+    for rpy in sorted(tl_dir.rglob('*.rpy')):
+        try:
+            lines = rpy.read_text(encoding='utf-8', errors='ignore').split('\n')
+        except OSError:
+            continue
+        in_strings = False
+        last_old = None  # (入库形态 old, 行号)
+        for i, line in enumerate(lines):
+            if _STRINGS_HEAD_RE.match(line):
+                in_strings = True
+                continue
+            if _TRANSLATE_HEAD_RE.match(line):
+                in_strings = False
+                continue
+            if not in_strings:
+                continue
+            m = _OLD_LINE_RE.match(line)
+            if m:
+                last_old = (m.group(1).replace('\\"', '"'), i)
+                continue
+            m = _NEW_LINE_RE.match(line)
+            if m and last_old is not None:
+                entries.append({'file': rpy, 'old': last_old[0],
+                                'old_idx': last_old[1], 'new': m.group(1),
+                                'new_idx': i})
+                last_old = None
+
+    groups: dict = {}
+    for e in entries:
+        groups.setdefault(e['old'], []).append(e)
+
+    removals: dict = {}   # path -> 待删行号集合
+    fills = []            # (path, new 行号, 译文)
+    cleaned = 0
+    for old, es in groups.items():
+        if len(es) < 2:
+            continue
+        cleaned += 1
+        # 保留者：非 zz 优先，再有译文优先
+        es_sorted = sorted(es, key=lambda e: (e['file'].name == ZZ_NAME,
+                                              not e['new']))
+        keeper = es_sorted[0]
+        for e in es_sorted[1:]:
+            if not keeper['new'] and e['new']:
+                fills.append((keeper['file'], keeper['new_idx'], e['new']))
+                keeper = {**keeper, 'new': e['new']}
+            removals.setdefault(e['file'], set()).update(
+                (e['old_idx'], e['new_idx']))
+
+    if not removals:
+        return 0
+
+    # 按文件应用：删行（倒序无关，集合一次性滤除）+ 填 new
+    by_file: dict = {}
+    for path, idx in removals.items():
+        by_file.setdefault(path, {'drop': set(), 'fill': {}})
+        by_file[path]['drop'] |= idx
+    for path, idx, text in fills:
+        by_file.setdefault(path, {'drop': set(), 'fill': {}})
+        by_file[path]['fill'][idx] = text
+
+    for path, ops in by_file.items():
+        lines = path.read_text(encoding='utf-8', errors='ignore').split('\n')
+        for idx, text in ops['fill'].items():
+            if idx < len(lines):
+                lines[idx] = re.sub(
+                    r'^(\s*new\s+")(.*)("\s*)$',
+                    lambda m: m.group(1) + text + m.group(3), lines[idx])
+        lines = [l for i, l in enumerate(lines) if i not in ops['drop']]
+        path.write_text('\n'.join(lines), encoding='utf-8')
+
+    log(f'已清理 {cleaned} 组重复 old 条目（保留各组一条，译文不丢失）')
+    return cleaned
+
+
 def scan_markup_issues(db, sample_limit: int = 20) -> dict:
     """扫描库内已译条目的标记一致性（导出预检前置）
 
@@ -70,23 +217,15 @@ def scan_markup_issues(db, sample_limit: int = 20) -> dict:
     """
     samples = []
     total = 0
-    for kind, rows in (('dialogue', db.get_all_dialogues()),
-                       ('ui', db.get_all_ui_texts())):
-        for r in rows:
-            orig = r.get('original_text') or ''
-            trans = r.get('translated_text') or ''
-            if not orig or not trans:
-                continue
-            probs = markup_check.check_pair(orig, trans)
-            if probs:
-                total += 1
-                if len(samples) < sample_limit:
-                    samples.append({
-                        'kind': kind,
-                        'original': orig[:80],
-                        'translation': trans[:80],
-                        'reason': '；'.join(probs)[:160],
-                    })
+    for it in iter_markup_issues(db):
+        total += 1
+        if len(samples) < sample_limit:
+            samples.append({
+                'kind': it['kind'],
+                'original': it['original'][:80],
+                'translation': it['translation'][:80],
+                'reason': '；'.join(it['reasons'])[:160],
+            })
     return {'count': total, 'samples': samples}
 
 
@@ -183,6 +322,11 @@ class GameExporter:
                                  f'正在复制游戏文件... ({copied}/{total})')
             progress(0.5, '游戏文件复制完成')
             log('游戏文件复制完成')
+
+            self._repair_legacy_prefix_wraps(export_dir, log)
+            self._apply_marked_wraps(export_dir, log)
+            from services.game_patches import apply_game_patches
+            apply_game_patches(export_dir, log)
 
             # 移除反编译生成的 .rpy：Ren'Py 会优先加载 .rpy 而非原始 .rpyc，
             # 反编译代码仅供解析用，导出时删除以保证游戏运行原始编译代码
@@ -341,8 +485,8 @@ class GameExporter:
                     new_lines.append(line)
 
                     if i + 1 < len(lines):
-                        content_match = re.match(r'^\s+(\w+)\s+"(.*)"', lines[i + 1])
-                        narration_match = re.match(r'^\s+"(.*)"', lines[i + 1])
+                        content_match = _SAY_CONTENT_RE.match(lines[i + 1])
+                        narration_match = _SAY_NARRATION_RE.match(lines[i + 1])
 
                         # old/new 是 strings 块的行，绝不能当对话发言处理
                         if content_match and content_match.group(1) not in ('old', 'new'):
@@ -542,6 +686,74 @@ class GameExporter:
                 continue
             return path, lines, start + anchor
         return None
+
+    def _repair_legacy_prefix_wraps(self, export_dir: Path, log) -> None:
+        """还原旧版包装 bug 写入的 f_("...") 等坏包装（详见常量区注释）。
+
+        只对导出副本动手，不改工作副本；模式极窄（前缀字母 + _( + 单行
+        字面量 + 紧邻右括号），误伤面可忽略。有残留（多行/三引号）时
+        输出警告行号提示人工处理。
+        """
+        fixed = 0
+        leftovers = []
+        for path in export_dir.rglob('*.rpy'):
+            if 'tl' in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            if not _LEGACY_WRAP_FIND_RE.search(text):
+                continue
+            new_text, n = _LEGACY_WRAP_FIX_RE.subn(r'\1\2', text)
+            for i, line in enumerate(new_text.split('\n'), 1):
+                if _LEGACY_WRAP_FIND_RE.search(line):
+                    leftovers.append((path, i, line.strip()[:80]))
+            if n:
+                path.write_text(new_text, encoding='utf-8')
+                fixed += n
+        if fixed:
+            log(f'已还原 {fixed} 处旧版前缀字符串坏包装（f_("...") 等，'
+                '运行时会 NameError）')
+        for path, line_no, line in leftovers:
+            log(f'警告: {path.relative_to(export_dir)}:{line_no} '
+                f'疑似多行前缀坏包装未自动还原: {line}')
+
+    def _apply_marked_wraps(self, export_dir: Path, log) -> None:
+        """在导出副本上应用 wrap 路径的 _() 包裹
+
+        源码只读原则：标记阶段不改工作副本，包裹推迟到此（导出副本
+        一次性应用）。wrap 行的译文条目早已由 zz 表合成入库（regen
+        覆盖全部 marked 行），_() 查找与 strings 表共用存储，无需
+        SDK 重新提取。行号漂移由 relocate_wrap_candidates 同文件
+        重定位（重定位成功回写库内坐标）。无法定位的行跳过——zz
+        条目无害残留，该处显示英文。
+        """
+        from embedded_strings import (apply_wrapping,
+                                      relocate_wrap_candidates,
+                                      resolve_source_root)
+
+        rows = self.db.get_marked_embedded()
+        if not rows:
+            return
+        # 导出副本结构与工作副本一致：export_dir/game/ 为游戏根
+        source_root = resolve_source_root(export_dir / 'game')
+        candidates, moved_ids, lost_ids = relocate_wrap_candidates(
+            rows, str(source_root))
+        for row_id, line, col in moved_ids:
+            self.db.update_embedded_position(row_id, line, col)
+        wrapped, skipped, _ok = apply_wrapping(candidates)
+        if wrapped:
+            log(f'已在导出副本应用 {wrapped} 处 _() 包裹'
+                f'（wrap 路径内嵌标记）')
+        if moved_ids:
+            log(f'  其中 {len(moved_ids)} 处因行号漂移已重定位')
+        if skipped or lost_ids:
+            log(f'警告: {skipped + len(lost_ids)} 处包裹定位失败'
+                '（源码可能已更新，请重新扫描内嵌文本）；'
+                '对应位置将保持英文')
+        # 编译校验失败时 healer 依赖行号匹配定位失败处，
+        # skipped/lost 的行号可能已漂移——healer 侧另有文本匹配兜底
 
     def _pick_kept_decompiled(self, export_dir: Path,
                               decompiled_rels: list) -> list:

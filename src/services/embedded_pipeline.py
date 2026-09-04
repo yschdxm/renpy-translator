@@ -1,7 +1,11 @@
 """内嵌文本提取管线服务（从 text_panel 抽取，无 UI 依赖）
 
 流程：扫描 → 合并持久化 → AI 预筛（只判未决）→ [人工确认/灰区复核] →
-应用选择（strings 表 / _() 包裹分流）→ 入库。
+应用选择（统一标记 + strings 表重生成；_() 包裹推迟到导出副本应用）。
+
+源码只读原则：标记动作对游戏源码零写入。wrap 路径的译文条目与 table
+路径一样经 zz 表合成（strings 表与 _() 共用 old/new 存储），实际包裹
+由 GameExporter._apply_marked_wraps 在导出副本上做（含位置漂移重定位）。
 
 粒度化 API，NiceGUI 面板与 FastAPI 任务共用同一实现：
     pipe = EmbeddedPipeline(db, translator, project_dir, sdk_path, logger)
@@ -10,11 +14,10 @@
     # ... 人工确认（UI/任务 ask）；复核 → pipe.recheck_grayzone(rows) ...
     result = await pipe.apply_selection(rows, chosen_rows, stage=lambda text: ...)
 
-失败哲学：不降级——无翻译器/无 SDK/AI 失败均抛异常，由调用方响亮呈现。
+失败哲学：不降级——无翻译器/AI 失败均抛异常，由调用方响亮呈现。
 """
 import asyncio
 import re
-import time
 from pathlib import Path
 
 from database import ProjectDatabase
@@ -357,19 +360,19 @@ class EmbeddedPipeline:
                'ai_keep': rec['ai_keep'], 'ai_reason': rec['ai_reason']}
         return await self.refine_single(row)
 
-    # ---- 步骤 4~6: 应用选择（strings 表 / _() 包裹分流）----
+    # ---- 步骤 4~6: 应用选择（统一标记；_() 包裹推迟到导出副本）----
 
     async def apply_selection(self, rows, chosen_rows, stage=None,
                               cancel_event=None) -> dict:
         """应用人工选择。stage(text) 报告阶段。
-        cancel_event: 可选 threading.Event，传给 SDK 子进程以便中止。
 
-        分流：apply_path='table'（默认）的行写入 zz_embedded.rpy 翻译表
-        （零源码改动，不经 SDK）；'wrap' 的行包 _() 后走 SDK 重生成模板
-        （仅 wrap 行非空才需要 SDK）。
+        源码只读：两种路径统一标记 + 全量重生成 zz 翻译表
+        （table/wrap 行的译文条目都在此合成）。wrap 行的实际 `_()`
+        包裹由 GameExporter 在导出副本上应用（regen 已按全部 marked
+        行写入条目），本步骤不需要 SDK，且对游戏源码零写入。
         Returns: {'tabled': int, 'wrapped': int, 'skipped': int, 'inserted': int}
+        （wrapped 恒 0：包裹不再发生于此，保留键仅为兼容调用方/前端）
         """
-        from embedded_strings import apply_wrapping
         from services.embedded_table import regen_embedded_table
         loop = asyncio.get_event_loop()
 
@@ -380,102 +383,19 @@ class EmbeddedPipeline:
         if not chosen_rows:
             return {'tabled': 0, 'wrapped': 0, 'skipped': 0, 'inserted': 0}
 
-        def _path_of(r):
-            return r.get('apply_path') or r['candidate'].apply_path or 'table'
-
-        wrap_rows = [r for r in chosen_rows if _path_of(r) == 'wrap']
-        table_rows = [r for r in chosen_rows if _path_of(r) != 'wrap']
         chosen_ids = {r['id'] for r in chosen_rows}
-        inserted = 0
 
-        # ---- table 路径：写翻译表（零源码改动，不经 SDK） ----
-        if table_rows:
-            _stage('正在写入内嵌翻译表...')
-            await loop.run_in_executor(
-                None, self.db.set_embedded_status,
-                [r['id'] for r in table_rows], 'marked')
-            inserted += await loop.run_in_executor(
-                None, regen_embedded_table, self.db, self.game_root,
-                self.logger)
-            self.logger.info(
-                f'内嵌翻译表: {len(table_rows)} 条已写入 zz_embedded.rpy',
-                panel='ui')
-
-        # ---- wrap 路径：包 _() → SDK 重生成 → 合并入库 ----
-        wrapped = skipped = 0
-        if wrap_rows:
-            chosen = [r['candidate'] for r in wrap_rows]
-            _stage('正在标记源码...')
-            wrapped, skipped, ok_pos = await loop.run_in_executor(
-                None, apply_wrapping, chosen)
-            self.logger.info(
-                f'内嵌文本标记: {wrapped} 成功, {skipped} 跳过'
-                f'（跳过的保留在待复核，下轮可重试）', panel='ui')
-            # 只有实际包裹成功的才标 marked：位置校验失败（源码被改动/读取
-            # 失败）的若也标 marked，源码未变却退出复核列表，静默漏翻
-            marked_ids = [
-                r['id'] for r in wrap_rows
-                if (r['candidate'].file, r['candidate'].line,
-                    r['candidate'].col_start) in ok_pos]
-            await loop.run_in_executor(
-                None, self.db.set_embedded_status, marked_ids, 'marked')
-
-            # SDK 重新生成模板
-            if not self.sdk_path:
-                raise RuntimeError(
-                    f"已标记 {wrapped} 条，但未配置 Ren'Py SDK 路径，无法重新生成模板")
-
-            _stage('正在重新生成翻译模板...')
-            from sdk_manager import SDKManager
-
-            def _regen():
-                sdk = SDKManager()
-                sdk.sdk_path = Path(self.sdk_path)
-                # renpy.exe 在 Windows 上偶发访问冲突崩溃（0xC0000005，与负载/杀软
-                # 扫描相关的间歇性崩溃），延迟重试数次
-                for attempt in range(1, 6):
-                    result = sdk.generate_translations(
-                        str(self.game_root), 'chinese',
-                        cancel_event=cancel_event)
-                    if result['success'] or result.get('cancelled'):
-                        return result
-                    self.logger.warning(
-                        f'SDK 生成模板第 {attempt} 次失败: {result["message"]}',
-                        panel='ui')
-                    time.sleep(2)
-                return result
-
-            sdk_result = await loop.run_in_executor(None, _regen)
-            if sdk_result.get('cancelled'):
-                from ai_screener import ScreeningCancelled
-                raise ScreeningCancelled('SDK 重新生成模板已取消')
-            if not sdk_result['success']:
-                self.logger.error(
-                    f'SDK 重新生成模板失败: {sdk_result["message"]}', panel='ui')
-                raise RuntimeError(
-                    f'SDK 重新生成失败: {sdk_result["message"]}')
-
-            # 合并入库
-            _stage('正在合并新字符串入库...')
-            from tl_parser import parse_translation_files
-            tl_dir = self.game_root / 'game' / 'tl' / 'chinese'
-            tl_result = await loop.run_in_executor(
-                None, parse_translation_files, tl_dir, str(self.game_root),
-                self.logger)
-
-            # 把提取阶段的出处写进新字符串的 context_hint
-            # （候选 text 已反转义，tl old 文本含字面 \n，两种形式都建映射）
-            hint_map = {}
-            for c in chosen:
-                hint_map[c.text] = c.hint
-                hint_map[c.text.replace('\n', '\\n').replace('"', '\\"')] = c.hint
-            for it in tl_result.get('ui_texts', []):
-                if it['original_text'] in hint_map:
-                    it['context_hint'] = hint_map[it['original_text']]
-
-            inserted += await loop.run_in_executor(
-                None, self.db.insert_ui_texts_new_only,
-                tl_result.get('ui_texts', []))
+        # ---- 统一标记 + strings 表重生成（table/wrap 同路） ----
+        _stage('正在写入内嵌翻译表...')
+        await loop.run_in_executor(
+            None, self.db.set_embedded_status,
+            list(chosen_ids), 'marked')
+        inserted = await loop.run_in_executor(
+            None, regen_embedded_table, self.db, self.game_root,
+            self.logger)
+        self.logger.info(
+            f'内嵌翻译表: {len(chosen_rows)} 条已写入 zz_embedded.rpy',
+            panel='ui')
 
         # 未选行照旧标 skipped
         await loop.run_in_executor(
@@ -483,7 +403,7 @@ class EmbeddedPipeline:
             [r['id'] for r in rows if r['id'] not in chosen_ids], 'skipped')
 
         self.logger.info(
-            f'内嵌文本提取完成: 入表 {len(table_rows)}, 标记 {wrapped}, '
+            f'内嵌文本提取完成: 入表 {len(chosen_rows)}, '
             f'新增 {inserted} 条', panel='ui')
-        return {'tabled': len(table_rows), 'wrapped': wrapped,
-                'skipped': skipped, 'inserted': inserted}
+        return {'tabled': len(chosen_rows), 'wrapped': 0,
+                'skipped': 0, 'inserted': inserted}

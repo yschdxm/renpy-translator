@@ -142,10 +142,10 @@ class EmbeddedRepo:
 
     @_auto_reconnect
     def get_marked_embedded(self) -> list:
-        """已标记且走 _() 包裹路径的内嵌候选（导出校验失败时定位需拆除的包裹）
+        """已标记且走 _() 包裹路径的内嵌候选（导出时应用包裹 / 校验失败定位）
 
         apply_path='table' 的行没有源码标记可寻（条目活在 tl 翻译表里），
-        其消费方（unwrap/rewrap/导出定位）都是 _() 标记定位逻辑，必须排除。
+        其消费方（导出 wrap 应用/校验失败定位）都是 _() 标记定位逻辑，必须排除。
         """
         rows = self._conn.execute(
             "SELECT id, rel_file, line, col_start, raw, text, kind, hint "
@@ -155,8 +155,22 @@ class EmbeddedRepo:
         return [dict(r) for r in rows]
 
     @_auto_reconnect
+    def get_all_marked_embedded(self) -> list:
+        """全部已标记候选（table + wrap 两条路径）
+
+        strings 表与 _() 共用 old/new 存储，wrap 行的译文条目同样
+        走 zz 表合成——regen_embedded_table 按全部 marked 行重写。
+        """
+        rows = self._conn.execute(
+            "SELECT id, rel_file, line, col_start, raw, text, kind, hint "
+            "FROM embedded_candidates WHERE status = 'marked'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @_auto_reconnect
     def get_table_marked_embedded(self) -> list:
-        """已标记且走 strings 表路径的内嵌候选（zz_embedded.rpy 重生成用）"""
+        """已标记且走 strings 表路径的内嵌候选（兼容保留；
+        regen 用 get_all_marked_embedded 覆盖 wrap 行）"""
         rows = self._conn.execute(
             "SELECT id, rel_file, line, col_start, raw, text, kind, hint "
             "FROM embedded_candidates WHERE status = 'marked' "

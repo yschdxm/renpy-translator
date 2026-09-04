@@ -62,31 +62,38 @@ def existing_tl_olds(tl_dir: Path) -> set:
 
 
 def collect_table_entries(rows: list, source_root: Path,
-                          existing_olds: set) -> list:
-    """从 table 路径的 marked 行收集可写条目：
+                          existing_olds: set) -> tuple:
+    """从 marked 行收集可写条目：
     - 源码仍存在（raw 字面量 verbatim 仍在原文件里；消失的不写——
       文本回归后下次 regen 自动恢复）
-    - 不在现有 old 集合（重复 old 是 Ren'Py 硬错误）
+    - 不在现有 old 集合（重复 old 是 Ren'Py 硬错误；已存在的不写——
+      现有条目提供同一译文）
     - 按入库形态去重（表是全局精确查找，同一文本一条即可）
+
+    返回 (entries, vanished, duped)：vanish/duped 仅用于日志区分
     """
     entries = []
     seen = set(existing_olds)
+    vanished = duped = 0
     for r in rows:
         path = Path(source_root) / r['rel_file']
         try:
             content = path.read_text(encoding='utf-8', errors='ignore')
         except OSError:
+            vanished += 1
             continue
         if r['raw'] not in content:
+            vanished += 1
             continue
         db_form = to_db_form(r['text'])
         if db_form in seen:
+            duped += 1
             continue
         seen.add(db_form)
         entries.append({'text': r['text'], 'db_form': db_form,
                         'file': r['rel_file'], 'line': r['line'],
                         'hint': r.get('hint', '')})
-    return entries
+    return entries, vanished, duped
 
 
 def write_strings_table(tl_dir: Path, entries: list) -> Path:
@@ -108,21 +115,26 @@ def write_strings_table(tl_dir: Path, entries: list) -> Path:
 
 
 def regen_embedded_table(db, game_root: Path, logger=None) -> int:
-    """按库里全部 table 路径 marked 行重生成 ZZ 翻译表并入库新条目
+    """按库里全部 marked 行重生成 ZZ 翻译表并入库新条目
 
     apply_selection 与项目更新共用：全量重写（消失文本自然淘汰，
     行保持 marked 不写文件；文本回归后下次自动恢复）。
-    返回新入库的 ui_texts 条数。
+    table 与 wrap 两条路径的译文条目统一在此合成——strings 表与
+    _() 共用 old/new 存储，wrap 行（片段类必须 _() 的）经导出时
+    包裹消费这些条目。返回新入库的 ui_texts 条数。
     """
     from tl_parser import parse_translation_files
     game_root = Path(game_root)
     source_root = resolve_source_root(game_root)
     tl_dir = game_root / 'game' / 'tl' / 'chinese'
 
-    rows = db.get_table_marked_embedded()
-    entries = collect_table_entries(rows, source_root,
-                                    existing_tl_olds(tl_dir))
-    vanished = len(rows) - len(entries)
+    rows = db.get_all_marked_embedded()
+    entries, vanished, duped = collect_table_entries(
+        rows, source_root, existing_tl_olds(tl_dir))
+    if duped and logger:
+        logger.info(
+            f'内嵌翻译表: {duped} 条文本已有现有 old 条目（译文由其提供，'
+            '不写重复条目）', panel='ui')
     if vanished > 0 and logger:
         logger.warning(
             f'内嵌翻译表: {vanished} 条已标记文本在新源码中未找到'

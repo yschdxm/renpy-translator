@@ -268,6 +268,9 @@ class Base:
             self._migrate_columns()
             # 迁移：拆除 characters.display_name 的 UNIQUE 约束
             self._migrate_characters_unique()
+            # 迁移：旧库 marked 行的 apply_path=''（语义=table，但
+            # get_table_marked_embedded 查不到，导致这类标记从未生效）
+            self._migrate_embedded_apply_path()
             self._conn.commit()
 
     def _migrate_columns(self):
@@ -288,6 +291,18 @@ class Base:
             existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+
+    def _migrate_embedded_apply_path(self):
+        """旧库 marked 行的 apply_path='' 归一为 'table'
+
+        apply_selection 的 _path_of 本就默认 '' → table，但
+        get_table_marked_embedded 只查 apply_path='table'，'' 行
+        的译文条目因此从未生成。归一后 get_marked_embedded
+        （apply_path != 'table'）即 wrap-only。"""
+        self._conn.execute(
+            "UPDATE embedded_candidates SET apply_path='table' "
+            "WHERE status='marked' AND (apply_path IS NULL OR apply_path='')"
+        )
 
     def _migrate_characters_unique(self):
         """拆除旧库 characters.display_name 的 UNIQUE 约束

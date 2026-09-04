@@ -91,17 +91,22 @@ def _parse_dialogue_blocks(lines, tl_file, game_path, dialogues, ui_texts):
             if not comment_text:
                 continue
             # 说话人可以是带点表达式（如 mc.name "..."，Lab Rats 2 主角
-            # 台词全用这种形式，占其台词量两成），不能只认 \w+；台词串
-            # 到第一个未转义引号截止——行尾参数（say 变体如
-            # "..." (what_color="#8c8")）里的引号不能混进译文原文
-            char_match = re.match(r'^([\w.]+)\s+"((?:[^"\\]|\\.)*)"', comment_text)
+            # 台词全用这种形式，占其台词量两成）、字符串字面量
+            # （"Janitor" "..."，动态角色名）或下标（the_group[0]），
+            # 不能只认 \w+；台词串到第一个未转义引号截止——行尾参数
+            # （say 变体如 "..." (what_color="#8c8")）里的引号不能混进
+            # 译文原文
+            char_match = re.match(
+                r'^(?:"((?:[^"\\]|\\.)*)"|([\w.\[\]]+))\s+'
+                r'"((?:[^"\\]|\\.)*)"', comment_text)
             narration_match = re.match(r'^"((?:[^"\\]|\\.)*)"', comment_text)
             if char_match:
-                # 归一为根标识符：mc.name / the_person.title（属性求值为
-                # 说话名）的说话人本体都是根变量，角色表与头像、中文名
-                # 映射都按纯标识符匹配
-                character = char_match.group(1).split('.')[0]
-                text = char_match.group(2).replace('\\"', '"')
+                # 归一：mc.name / the_person.title（属性求值为说话名）与
+                # the_group[0]（下标）的说话人本体都是根变量；引号说话人
+                # 去掉引号。角色表与头像、中文名映射都按纯标识符匹配
+                character = (char_match.group(1)
+                             or char_match.group(2).split('.')[0].split('[')[0])
+                text = char_match.group(3).replace('\\"', '"')
             elif narration_match:
                 character = ''
                 text = narration_match.group(1).replace('\\"', '"')

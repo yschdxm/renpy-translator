@@ -99,12 +99,14 @@ def test_collect_filters(tmp_path):
         {'rel_file': 'a.rpy', 'raw': '"Hello there"', 'text': 'Hello there',
          'line': 2, 'hint': '界面'},
     ]
-    entries = et.collect_table_entries(rows, source_root, set())
+    entries, vanished, duped = et.collect_table_entries(rows, source_root, set())
     assert len(entries) == 1
+    assert vanished == 1 and duped == 1
     assert entries[0]['text'] == 'Hello there'
     # 已在现有 old 集合的也不收
-    entries = et.collect_table_entries(rows[:1], source_root, {'Hello there'})
-    assert entries == []
+    entries, vanished, duped = et.collect_table_entries(
+        rows[:1], source_root, {'Hello there'})
+    assert entries == [] and duped == 1
 
 
 # ---- regen 端到端（DB + 文件 + 导出填充闭环） ----
@@ -160,6 +162,93 @@ def test_regen_vanished_text_not_written(tmp_path):
     assert not zz.exists()
     marked = db.get_table_marked_embedded()
     assert len(marked) == 1  # 行保持 marked（文本回归后自动恢复）
+    db.close()
+
+
+# ---- 源码只读化：wrap 行同样走 zz 合成条目 ----
+
+def _db_with_wrap_row(tmp_path, text='Hello there', raw='"Hello there"'):
+    """wrap 路径行（raw 须真实存在于 a.rpy 源码，collect 会校验）"""
+    db = ProjectDatabase(str(tmp_path / 'p.db'))
+    c = Candidate(
+        file='game/game/a.rpy', rel_file='a.rpy', line=2,
+        col_start=10, col_end=10 + len(raw), raw=raw, text=text,
+        kind='screen', hint='拼接片段', confidence='low')
+    rid = db.merge_embedded_candidates([c])[0]['id']
+    db.update_embedded_ai(rid, 1, '拼接片段', False, 'a.rpy:2', 'wrap',
+                          'refine')
+    db.set_embedded_status([rid], 'marked')
+    return db, rid
+
+
+def test_regen_includes_wrap_rows(tmp_path):
+    """源码只读化：wrap 路径行的译文条目与 table 行一样由 zz 表合成——
+    _() 查找与 strings 表共用存储，导出时包裹的 _() 查这些条目"""
+    root = _mk_project(tmp_path)
+    db, _rid = _db_with_wrap_row(tmp_path)
+    inserted = et.regen_embedded_table(db, root)
+    assert inserted == 1
+    zz = root / 'game' / 'tl' / 'chinese' / et.ZZ_NAME
+    content = zz.read_text(encoding='utf-8')
+    assert 'old "Hello there"' in content
+    # 源码未被写入 _()（工作副本保持原样）
+    src = (root / 'game' / 'a.rpy').read_text(encoding='utf-8')
+    assert '_("Hello there")' not in src
+    db.close()
+
+
+def test_apply_path_empty_migration(tmp_path):
+    """旧库 marked 行 apply_path='' 连接时归一为 'table'（
+    语义本就=table，但 get_table_marked_embedded 查不到，导致标记从未生效）"""
+    db = _db_with_table_row(tmp_path)
+    # 模拟旧库：清回 ''
+    db._conn.execute(
+        "UPDATE embedded_candidates SET apply_path='' WHERE status='marked'")
+    db._conn.commit()
+    db.close()
+    db = ProjectDatabase(str(tmp_path / 'p.db'))
+    db.connect()  # 触发迁移
+    row = db.get_table_marked_embedded()
+    assert len(row) == 1
+    assert db.get_marked_embedded() == []  # wrap-only 语义
+    db.close()
+
+
+def test_apply_selection_wrap_no_source_change_no_sdk(tmp_path):
+    """源码只读化：wrap 行标记不再需要 SDK、不触碰源码；
+    wrapped 恒 0（包裹推迟到导出副本）"""
+    import asyncio
+    from logger import TranslationLogger
+    from services.embedded_pipeline import EmbeddedPipeline
+
+    root = _mk_project(tmp_path)
+    db, rid = _db_with_wrap_row(tmp_path)
+    rec = db.get_embedded_candidate(rid)
+    c = Candidate(
+        file=str(root / 'game' / rec['rel_file']), rel_file=rec['rel_file'],
+        line=rec['line'], col_start=rec['col_start'],
+        col_end=rec['col_start'] + len(rec['raw']), raw=rec['raw'],
+        text=rec['text'], kind=rec['kind'], hint=rec['hint'],
+        confidence=rec['confidence'], apply_path='wrap')
+    rows = [{'id': rid, 'candidate': c, 'ai_keep': 1, 'apply_path': 'wrap'}]
+
+    src_before = (root / 'game' / 'a.rpy').read_text(encoding='utf-8')
+    pipe = object.__new__(EmbeddedPipeline)
+    pipe.db = db
+    pipe.game_root = root
+    pipe.sdk_path = None   # 无 SDK 也必须成功
+    pipe.logger = TranslationLogger()
+    result = asyncio.get_event_loop().run_until_complete(
+        pipe.apply_selection(rows, rows))
+
+    assert result['wrapped'] == 0
+    assert result['tabled'] == 1
+    # 工作副本零改动
+    assert (root / 'game' / 'a.rpy').read_text(encoding='utf-8') == src_before
+    # zz 表含该 wrap 行的合成条目
+    zz = (root / 'game' / 'tl' / 'chinese' / et.ZZ_NAME).read_text(
+        encoding='utf-8')
+    assert 'old "Hello there"' in zz
     db.close()
 
 
