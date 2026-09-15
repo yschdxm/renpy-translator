@@ -105,7 +105,7 @@ def test_export_apply_wraps(tmp_path):
     logs = []
     _exporter(tmp_path, db)._apply_marked_wraps(out, logs.append)
     text = (sub / 'x.rpy').read_text(encoding='utf-8')
-    assert '_("Format frag")' in text
+    assert '__("Format frag")' in text
     row = db.get_embedded_candidate(rid)
     assert (row['line'], row['col_start']) == (2, 20)  # 未漂移不回写
     assert any('已在导出副本应用' in l for l in logs)
@@ -119,7 +119,7 @@ def test_export_apply_wraps_relocates_and_writes_back(tmp_path):
     logs = []
     _exporter(tmp_path, db)._apply_marked_wraps(out, logs.append)
     text = (sub / 'x.rpy').read_text(encoding='utf-8')
-    assert '_("Format frag")' in text
+    assert '__("Format frag")' in text
     row = db.get_embedded_candidate(rid)
     assert (row['line'], row['col_start']) == (2, 20)  # 已回写
     assert any('重定位' in l for l in logs)

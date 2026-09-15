@@ -76,12 +76,16 @@ _MAX_TRACE_DEPTH = 2
 
 def decide_apply_path(c) -> str:
     """应用路径决策（静态为主、精审建议为辅）：
+    - fstring 候选（kind='fstring'）→ 'fstring'：模板化改写在扫描期
+      已由 AST 形态判定，AI 的 table/wrap 选择不适用
     - 拼接/格式化用途（static_fragment）→ wrap：渲染时字符串已变形，
       strings 表 old/new 整串匹配查不中，必须在数据层包 _()
     - 其余默认 table：零源码改动，逻辑值保持原文，渲染时才替换——
       双重用途字符串在表路径下天然安全
     - 静态证据不足时精审 AI 可凭证据覆盖（submit_verdicts 的 apply 字段）
     """
+    if getattr(c, 'kind', '') == 'fstring':
+        return 'fstring'
     if getattr(c, 'static_fragment', False):
         return 'wrap'
     ai_apply = getattr(c, 'ai_apply', '')
@@ -299,6 +303,10 @@ class UsageAnalyzer:
             return 'format', None
         if prefix_r.endswith('+') or suffix_l.startswith('+'):
             return 'fragment', None
+        # list.append/extend/insert("...")：容器成员经 join/遍历组合后显示
+        # （LR2 的 trait_tags.append 链），与 + 拼接同归片段类
+        if re.search(r'\.(?:append|extend|insert)\s*\($', prefix_r):
+            return 'fragment', None
 
         # -- 赋值点（可能触发变量追踪） --
         m = _ASSIGN_PREFIX_RE.match(line[:start])
@@ -322,21 +330,29 @@ class UsageAnalyzer:
             return False, False, True, False
         visited = visited | {name}
 
-        assign_re = re.compile(
-            r'^\s*(?:(?:define|default)\s+|\$\s*)?' + re.escape(name)
-            + r'\s*=[^=]')
-        word_re = re.compile(r'(?<![\w.])' + re.escape(name) + r'\b')
+        try:
+            assign_re = re.compile(
+                r'^\s*(?:(?:define|default)\s+|\$\s*)?' + re.escape(name)
+                + r'\s*=[^=]')
+            word_re = re.compile(r'(?<![\w.])' + re.escape(name) + r'\b')
+        except re.error:
+            return False, False, True, False
         assign_count = 0
         usages = []
         for rel, lines in self.files.items():
             for line_no, line in enumerate(lines, 1):
                 if line.strip().startswith('#'):
                     continue
-                if assign_re.match(line):
-                    assign_count += 1
-                    continue
-                if word_re.search(line):
-                    usages.append((rel, line_no, line))
+                try:
+                    if assign_re.match(line):
+                        assign_count += 1
+                        continue
+                    if word_re.search(line):
+                        usages.append((rel, line_no, line))
+                except RuntimeError:
+                    # sre 内部状态错误（服务器并发环境下的非确定性故障，
+                    # 输入无关、本地不可复现）——保守 unknown 交 AI
+                    return False, False, True, False
         if assign_count > 1 or not usages:
             # 重绑/条件赋值去向不定；赋值后去向全无（注释/跨文件拼接等）
             return False, False, True, False

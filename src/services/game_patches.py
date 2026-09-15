@@ -27,15 +27,17 @@ class GamePatch:
 PATCHES: list = [
     # Lab Rats 2（Reformulate）：ClimaxController 把显示串当返回值给
     # 调用方与裸英文比较（the_choice == "Cum inside her" 等 92 个调用
-    # 点）。改成显示时现译：菜单选项显示译文，返回值保持英文——
-    # 显示与逻辑职责分离。英文环境下 _(x) == x，原生行为不变。
+    # 点）。__() 立即翻译仅用于菜单 caption（带倍数后缀的拼合串显示层
+    # 查表必不中）；返回值走 value 槽保持英文原文——显示与逻辑分离。
+    # 注意 _() 是恒等函数（翻译留给显示层），这里必须用 __()。
     GamePatch(
-        name='ClimaxController 显示时现译',
+        name='ClimaxController 显示名立即翻译',
         rel_file='major_game_classes/game_logic/ClimaxController_ren.py',
         anchor='            display_name = climax_option[0]\n',
         replacement=(
-            '            display_name = _(climax_option[0])'
-            '  # 翻译补丁：显示时现译，返回值保持英文供逻辑比较\n'),
+            '            display_name = __(climax_option[0])'
+            '  # 翻译补丁：__() 立即翻译用于菜单显示；返回值走 value 槽'
+            '（climax_option[0] 原文），逻辑比较不受影响\n'),
     ),
     # Lab Rats 2：角色创建界面的占位符默认值。原版赋值与清空判断
     # 两侧一个是 _() 一个不是，翻译后比较恒假、占位符不清空。
@@ -61,6 +63,23 @@ PATCHES: list = [
         rel_file='people/Ellie/IT_Project_Screen.rpy',
         anchor='                    if proj_desc != "Unassigned!":',
         replacement='                    if proj_desc != _("Unassigned!"):'),
+    # Lab Rats 2：地图瓦片房间名先断行再显示——"Living Room" 断成
+    # "Living\nRoom" 后 strings 表精确匹配不上（"Kitchen" 无空格所以能译）。
+    # 先翻译再断行（必须 __() 立即翻译——_() 是恒等函数）；
+    # 英文环境 __() 原样返回，中文名本来无空格不需要断行。
+    GamePatch(
+        name='地图瓦片房间名先翻译再断行',
+        rel_file='map/map_code_ren.py',
+        anchor='    info.append(Text(location_name.replace(" ", "\\n", 2), substitute = True).get_all_text())',
+        replacement='    info.append(Text(__(location_name).replace(" ", "\\n", 2), substitute = True).get_all_text())'),
+    # Lab Rats 2：HUD 人名标题（Stephanie W. 形态）——person.name + " "
+    # 拼接后显示，整串查表必不中；__() 立即翻译仅用于此显示组合点
+    # （person.name 作为逻辑键的其他用途不受影响；英文环境恒等）。
+    GamePatch(
+        name='HUD 人名标题组合点现译',
+        rel_file='helper_functions/convert_to_string_ren.py',
+        anchor='    person_title = person.name + " "',
+        replacement='    person_title = __(person.name) + " "'),
 ]
 
 

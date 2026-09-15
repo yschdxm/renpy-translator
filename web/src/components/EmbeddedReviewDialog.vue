@@ -227,7 +227,7 @@ function truncate(s: string, n: number): string {
     <div style="font-size: 12px; color: #e8a33d; margin-bottom: 8px">
       ✓/✗ 为级联判定结论（规则=静态分析确定，AI=模型多票判定），已判定的条目默认冻结不再重筛；
       ⚠ 表示该字符串另有比较/键名/资源用途。「复核灰区」只针对判定与证据冲突的条目做锚定纠错。最终以你的勾选为准。<br>
-      「表」= 写入翻译表（不改源码，逻辑比较仍用原文）；「包」= 源码包 _()（拼接/格式化用途只能这样）。
+      「表」= 写入翻译表（不改源码，逻辑比较仍用原文）；「包」= 源码包 _()（拼接/格式化用途只能这样）；「模板」= f-string 改写为静态模板（导出时替换）。
       define 期求值的数据在游戏中途切换语言不会更新（开局选中文或重启后正常）。
     </div>
 
@@ -247,9 +247,9 @@ function truncate(s: string, n: number): string {
           >⚠</n-tag>
           <n-tag
             v-if="r.ai_keep === 1 && r.apply_path" size="tiny" :bordered="false"
-            :type="r.apply_path === 'wrap' ? 'info' : 'default'"
-            :title="r.apply_path === 'wrap' ? '源码包 _()（拼接/格式化用途）' : '写入翻译表（不改源码）'"
-          >{{ r.apply_path === 'wrap' ? '包' : '表' }}</n-tag>
+            :type="r.apply_path === 'wrap' ? 'info' : (r.apply_path === 'fstring' ? 'warning' : 'default')"
+            :title="r.apply_path === 'wrap' ? '源码包 _()（拼接/格式化用途）' : (r.apply_path === 'fstring' ? 'f-string 模板化改写（导出时替换为静态模板）' : '写入翻译表（不改源码）')"
+          >{{ r.apply_path === 'wrap' ? '包' : (r.apply_path === 'fstring' ? '模板' : '表') }}</n-tag>
           <n-tag
             v-if="r.ai_keep !== -1" size="tiny"
             :type="r.ai_keep ? 'success' : 'error'" :bordered="false"

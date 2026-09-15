@@ -26,7 +26,7 @@ class EmbeddedRepo:
         rows = self._conn.execute(
             "SELECT * FROM embedded_candidates"
         ).fetchall()
-        existing = {(r["rel_file"], r["line"], r["raw"]): r for r in rows}
+        existing = {(r["rel_file"], r["line"], r["raw"]): dict(r) for r in rows}
 
         now = datetime.now().isoformat()
         result = []
@@ -37,6 +37,14 @@ class EmbeddedRepo:
                 if row and row['status'] == 'marked':
                     continue  # 已标记（含 table 路径重现的）：不再返回
                 if row:
+                    # 模板形态演进（如插值补 !t）：raw 未变则 text 更新是
+                    # 机械改写（判定不受影响），不同步会让旧模板与新导出
+                    # 改写失配（运行模板带 !t、zz 旧条目不带→查不中）
+                    if row.get('text') != c.text:
+                        self._conn.execute(
+                            "UPDATE embedded_candidates SET text=?, "
+                            "updated_at=? WHERE id=?",
+                            (c.text, now, row['id']))
                     result.append({
                         'id': row['id'], 'candidate': c,
                         'ai_keep': row['ai_keep'], 'ai_reason': row['ai_reason'],
@@ -141,17 +149,26 @@ class EmbeddedRepo:
         self._conn.commit()
 
     @_auto_reconnect
-    def get_marked_embedded(self) -> list:
-        """已标记且走 _() 包裹路径的内嵌候选（导出时应用包裹 / 校验失败定位）
+    def get_marked_embedded(self, apply_path: str = None) -> list:
+        """已标记且需在导出副本做源码变换的内嵌候选
 
-        apply_path='table' 的行没有源码标记可寻（条目活在 tl 翻译表里），
-        其消费方（导出 wrap 应用/校验失败定位）都是 _() 标记定位逻辑，必须排除。
+        apply_path='table' 的行没有源码变换（条目活在 tl 翻译表里），
+        必须排除。apply_path 参数可进一步收窄：
+        - 'wrap'：仅 _() 包裹（导出 wrap 应用）
+        - 'fstring'：仅 f-string 模板化改写（导出变换）
+        - None（默认）：全部非 table（healer 定位/keep-list——wrap 与
+          fstring 都是导出副本的源码变换消费方）
         """
-        rows = self._conn.execute(
-            "SELECT id, rel_file, line, col_start, raw, text, kind, hint "
-            "FROM embedded_candidates WHERE status = 'marked' "
-            "AND (apply_path IS NULL OR apply_path != 'table')"
-        ).fetchall()
+        sql = ("SELECT id, rel_file, line, col_start, raw, text, kind, hint "
+               "FROM embedded_candidates WHERE status = 'marked' "
+               "AND (apply_path IS NULL OR apply_path != 'table')")
+        if apply_path:
+            sql = ("SELECT id, rel_file, line, col_start, raw, text, kind, hint "
+                   "FROM embedded_candidates WHERE status = 'marked' "
+                   "AND apply_path = ?")
+            rows = self._conn.execute(sql, (apply_path,)).fetchall()
+        else:
+            rows = self._conn.execute(sql).fetchall()
         return [dict(r) for r in rows]
 
     @_auto_reconnect

@@ -74,14 +74,23 @@ class EmbeddedPipeline:
     async def scan_and_merge(self) -> list:
         """扫描源码候选并合并入库（恢复历史 AI 判定/状态）。
 
+        两路扫描：常规内嵌字符串（未包 _() 的可显示字面量）+ 含插值的
+        f-string（AST 模板化，kind='fstring'，模板与插值分离）+
+        _ren.py 模块显示字符串（ast 定向，Goal/SerumTrait/kwarg/字符串函数）。
         Returns: 待确认行列表 [{id, ai_keep, ai_reason, status, candidate}, ...]
         空列表 = 无候选或全部已处理。
         """
         from embedded_strings import find_candidates
+        from fstring_strings import find_fstring_candidates
+        from renpy_module_strings import find_module_string_candidates
         loop = asyncio.get_event_loop()
 
         candidates = await loop.run_in_executor(
             None, find_candidates, str(self.game_root))
+        candidates += await loop.run_in_executor(
+            None, find_fstring_candidates, str(self.game_root))
+        candidates += await loop.run_in_executor(
+            None, find_module_string_candidates, str(self.game_root))
         if not candidates:
             return []
 

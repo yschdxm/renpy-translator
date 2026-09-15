@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from markup_check import add_tflag
+
 _EXCLUDE_DIRS = {'renpy', 'lib', 'saves', 'cache', 'tl', 'audio', 'sound',
                  'images', 'image', 'fonts', 'font', 'video', 'movies'}
 
@@ -49,6 +51,10 @@ _KWARG_STR_RE = re.compile(
 # 屏幕名/资源路径，不提取）
 _NOTIFY_STR_RE = re.compile(
     r'\bNotify\(\s*("(?:[^"\\]|\\.)*?"|\'(?:[^\'\\]|\\.)*?\')')
+
+# 括号屏幕表达式：textbutton/text/label/tooltip 后跟 ( ——
+# 表达式内的字符串字面量（条件选择/拼接）也是显示文本
+_SCREEN_PAREN_RE = re.compile(r'\b(?:textbutton|text|label|tooltip)\s*\(')
 
 # python 显示调用点（字符串是第一参数）：hint 与置信度增强用
 _DISPLAY_CALL_RE = re.compile(
@@ -118,10 +124,15 @@ class Candidate:
 
 
 def _unescape(s: str) -> str:
-    """Ren'Py/Python 字符串反转义"""
-    return (s.replace('\\"', '"').replace("\\'", "'")
-             .replace('\\n', '\n').replace('\\t', '\t')
-             .replace('\\\\', '\\'))
+    """Ren'Py/Python 字符串反转义（含 \\uXXXX/\\xXX——
+    不处理会被路径过滤误杀，如 "Vandenberg\\u00A0Ltd. Lobby"）"""
+    s = (s.replace('\\"', '"').replace("\\'", "'")
+          .replace('\\n', '\n').replace('\\t', '\t'))
+    s = re.sub(r'\\u[0-9a-fA-F]{4}',
+               lambda m: chr(int(m.group(0)[2:], 16)), s)
+    s = re.sub(r'\\x[0-9a-fA-F]{2}',
+               lambda m: chr(int(m.group(0)[2:], 16)), s)
+    return s.replace('\\\\', '\\')
 
 
 def relocate_wrap_candidates(rows: list, source_root: str) -> tuple:
@@ -208,7 +219,10 @@ def _is_noise(text: str, kind: str) -> bool:
     if re.fullmatch(r'#[0-9a-fA-F]{3,8}', stripped):
         return True
     # 路径样：含路径分隔符或以资源扩展名结尾
-    if '/' in stripped or '\\' in stripped:
+    # （先剥 {/size}{/color} 等 Ren'Py 标签——闭合标签带 /，
+    # 含闭合标签的界面文本会被误判为路径而漏提取）
+    no_tags = re.sub(r'\{[^}]*\}', '', stripped)
+    if '/' in no_tags or '\\' in no_tags:
         return True
     if any(stripped.lower().endswith(ext) for ext in _RESOURCE_EXTS):
         return True
@@ -318,7 +332,7 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
                     # 字符串参数（渲染时被 kwarg 引用，是常见漏提取点）
                     for km in _KWARG_STR_RE.finditer(raw_line):
                         kw_literal = km.group(2)
-                        kw_text = _unescape(kw_literal[1:-1])
+                        kw_text = add_tflag(_unescape(kw_literal[1:-1]))
                         if _is_noise(kw_text, 'screen'):
                             continue
                         out.append(Candidate(
@@ -345,7 +359,7 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
         # ---- A 类：屏幕语言裸字符串 ----
         for m in _SCREEN_STRING_RE.finditer(raw_line):
             raw_literal = m.group(2)
-            text = _unescape(raw_literal[1:-1])
+            text = add_tflag(_unescape(raw_literal[1:-1]))
             if _is_noise(text, 'screen'):
                 continue
             kind_name = {'textbutton': '按钮', 'text': '界面文本',
@@ -358,6 +372,30 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
                 confidence=_confidence(text, 'screen'),
             ))
 
+        # ---- A 类补充：括号屏幕表达式里的字符串 ----
+        # textbutton ("None!" if not x else "Theoretical Research") —
+        # A 类正则要求字面量紧跟关键字，括号表达式内的漏提
+        if _SCREEN_PAREN_RE.search(raw_line):
+            for m in _PY_STRING_RE.finditer(raw_line):
+                # 跳过 _SCREEN_STRING_RE 已覆盖的位置（避免重复）
+                if any(sm.start(2) == m.start()
+                       for sm in _SCREEN_STRING_RE.finditer(raw_line)):
+                    continue
+                # 已包 _() 跳过
+                if raw_line[max(0, m.start() - 3):m.start()].endswith('_('):
+                    continue
+                raw_literal = m.group(0)
+                text = add_tflag(_unescape(raw_literal[1:-1]))
+                if _is_noise(text, 'screen'):
+                    continue
+                out.append(Candidate(
+                    file=file_path, rel_file=rel_file, line=line_no,
+                    col_start=m.start(), col_end=m.end(),
+                    raw=raw_literal, text=text, kind='screen',
+                    hint=make_hint('按钮表达式'),
+                    confidence=_confidence(text, 'screen'),
+                ))
+
         # ---- screen 作用域内的 Notify("...") 动作串 ----
         if scope_kind == 'screen':
             for m in _NOTIFY_STR_RE.finditer(raw_line):
@@ -365,7 +403,7 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
                 if raw_line[max(0, m.start(1) - 3):m.start(1)].endswith('_('):
                     continue
                 raw_literal = m.group(1)
-                text = _unescape(raw_literal[1:-1])
+                text = add_tflag(_unescape(raw_literal[1:-1]))
                 if _is_noise(text, 'screen'):
                     continue
                 out.append(Candidate(
@@ -418,7 +456,7 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
                 if raw_line[max(0, tm.start() - 3):tm.start()].endswith('_('):
                     continue
                 raw_literal = tm.group(0)
-                text = _unescape(raw_literal[3:-3])
+                text = add_tflag(_unescape(raw_literal[3:-3]))
                 if _is_noise(text, 'python'):
                     continue
                 out.append(Candidate(
@@ -469,7 +507,7 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
                         if prev.endswith('\\') or prev.endswith(('"', "'")):
                             continue
                 quote = raw_literal[0]
-                text = _unescape(raw_literal[1:-1])
+                text = add_tflag(_unescape(raw_literal[1:-1]))
                 if _is_noise(text, 'python'):
                     continue
                 # 显示调用点（renpy.notify("...") 等第一参数）：
@@ -498,7 +536,13 @@ def _scan_file(file_path: str, rel_file: str, content: str, out: list):
 
 
 def apply_wrapping(candidates: list) -> tuple:
-    """把候选字符串在原位置包成 _(...)
+    """把候选字符串在原位置包成 __(...)
+
+    __() = translate_string（立即翻译）：_() 是恒等函数（翻译留给显示
+    层整串查找）——wrap 路径的候选全是拼接/格式化片段，拼好的整串在
+    显示层必然查不中，必须在数据层用 __() 现译。
+    注意：define/default 期的 __() 会把英文烤进默认值（语言设置可能
+    未就位）——片段类候选几乎全在运行时位置，可接受。
 
     按文件分组后从文件末尾向开头替换（保持列偏移不失效）；
     替换前校验目标位置确实是期望的字面量（源码被改动过时跳过）。
@@ -532,7 +576,7 @@ def apply_wrapping(candidates: list) -> tuple:
             if line[c.col_start:c.col_end] != c.raw:
                 skipped += 1
                 continue
-            lines[idx] = line[:c.col_start] + '_(' + c.raw + ')' + line[c.col_end:]
+            lines[idx] = line[:c.col_start] + '__(' + c.raw + ')' + line[c.col_end:]
             wrapped += 1
             ok_positions.add((c.file, c.line, c.col_start))
             changed = True
@@ -577,9 +621,15 @@ def unwrap_candidates(candidates: list) -> tuple:
                 skipped += 1
                 continue
             line = lines[idx]
-            end = c.col_start + 2 + len(c.raw)  # _( + raw
-            if (line[c.col_start:c.col_start + 2] != '_('
-                    or line[c.col_start + 2:end] != c.raw
+            # 兼容两代包裹：_()（旧）与 __()（现；__ = translate_string）
+            prefix_len = 2
+            if line[c.col_start:c.col_start + 3] == '__(':
+                prefix_len = 3
+            elif line[c.col_start:c.col_start + 2] != '_(':
+                skipped += 1
+                continue
+            end = c.col_start + prefix_len + len(c.raw)
+            if (line[c.col_start + prefix_len:end] != c.raw
                     or line[end:end + 1] != ')'):
                 skipped += 1
                 continue

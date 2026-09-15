@@ -59,10 +59,15 @@ def escape_translation(text: str, percent: str = 'say') -> str:
     - 裸 % → %%（Ren'Py 对台词/菜单选项做 % 格式化，裸 % 会 ValueError）
       percent='say'：台词，仅保留 %% 与 %(name)s 变量
       percent='string'：UI 字符串，额外保留 strftime/%s 等代码格式符
+      percent='none'：不转义 %——.format 模板专用（{1:+.0%} 的 % 是格式
+      规格不是文本，双写会把 .format 炸掉）
     - 双引号 → \\"
     译文里已有的 \\n（反斜杠+n 两字符）、%%、%(name)s 变量不受影响。
     """
     text = text.replace('\r', '').replace('\n', '\\n')
+
+    if percent == 'none':
+        return text.replace('"', '\\"')
 
     # % 转义：先保护合法占位，再把剩余裸 % 变 %%，最后还原
     protect_re = _SAY_PROTECT_RE if percent == 'say' else _STRING_PROTECT_RE
@@ -324,7 +329,10 @@ class GameExporter:
             log('游戏文件复制完成')
 
             self._repair_legacy_prefix_wraps(export_dir, log)
+            self._apply_ttag_literals(export_dir, log)
             self._apply_marked_wraps(export_dir, log)
+            self._transform_fstrings(export_dir, log)
+            self._sweep_ttag(export_dir, log)
             from services.game_patches import apply_game_patches
             apply_game_patches(export_dir, log)
 
@@ -385,6 +393,11 @@ class GameExporter:
                                           f'正在填充字符串翻译... ({c}/{t})'))
                 log(f'字符串翻译: {u_count} 条')
 
+                tip_count = self._add_tooltip_title_entries(
+                    tl_dir, translation_dict)
+                if tip_count:
+                    log(f'菜单 tooltip 拆分条目: {tip_count} 条')
+
                 # 导出闸门汇总：破坏插值/标签的译文保留英文原文，
                 # 宁可显示英文也不让游戏渲染时报错
                 if self._blocked:
@@ -402,6 +415,9 @@ class GameExporter:
 
             # 默认以中文启动（rpyc-only 游戏没有切换按钮也无需手动切换）
             self._set_default_language(export_dir, log)
+
+            # 运行时助手（__rt 安全立即翻译等，f-string 变换的实参依赖）
+            self._write_rt_helpers(export_dir, log)
 
             # 添加中文字体
             progress(0.95, '正在添加中文字体支持...')
@@ -531,9 +547,68 @@ class GameExporter:
 
         return self._rewrite_tl_files(tl_dir, _handle, progress_cb)
 
+    _TOOLTIP_MARK = ' (tooltip)'
+
+    def _add_tooltip_title_entries(self, tl_dir: Path,
+                                   translation_dict: dict) -> int:
+        """为含 ' (tooltip)' 的菜单 caption 派生拆分条目（标题/tooltip 各一）
+
+        LR2 的 MenuItem 在运行时把 caption 在 ' (tooltip)' 处拆成标题与
+        tooltip 两部分显示——strings 表的整串条目对拆分后的部分串必然
+        查不中（"10% Extra" 这类子文本）。为每个含标记的已译条目派生
+        两条部分条目（译文同步拆分），追加进 zz_embedded.rpy
+        （导出副本，全量重写安全）。
+        """
+        from services.embedded_table import ZZ_NAME
+
+        zz = tl_dir / ZZ_NAME
+        # 收集全部 tl 文件（含 zz）的现有 old，避免写出重复条目
+        olds = set()
+        for rpy in tl_dir.rglob('*.rpy'):
+            try:
+                text = rpy.read_text(encoding='utf-8', errors='ignore')
+            except OSError:
+                continue
+            olds.update(re.findall(r'^\s+old "(.*)"', text, re.M))
+
+        additions = []
+        seen = set(olds)
+        for orig, trans in translation_dict.items():
+            if self._TOOLTIP_MARK not in orig or not trans:
+                continue
+            title_o, tip_o = orig.split(self._TOOLTIP_MARK, 1)
+            if self._TOOLTIP_MARK not in trans:
+                continue   # 译文丢了标记（闸门会拦），派生无意义
+            title_t, tip_t = trans.split(self._TOOLTIP_MARK, 1)
+            for part_o, part_t in ((title_o, title_t), (tip_o, tip_t)):
+                if not part_o or not part_t:
+                    continue
+                if part_o in seen:
+                    continue
+                seen.add(part_o)
+                additions.append((part_o, part_t))
+
+        if not additions:
+            return 0
+        parts = []
+        if not zz.exists():
+            parts.append('translate chinese strings:\n')
+        for part_o, part_t in additions:
+            # translation_dict 的 key/value 是入库形态（\n 字面、\ 双写、
+            # 引号不转义）——写文件形态只需补引号转义。
+            # 不做 % 转义：拆分条目只经 LR2 自定义菜单的 textbutton/!t
+            # 显示（Text 直显，不走菜单选项的 % 格式化），%% 会原样显示
+            o_file = part_o.replace('"', '\\"')
+            t_file = part_t.replace('"', '\\"')
+            parts.append(f'\n    # (tooltip) 拆分派生\n'
+                         f'    old "{o_file}"\n'
+                         f'    new "{t_file}"\n')
+        with open(zz, 'a', encoding='utf-8') as f:
+            f.write('\n'.join(parts) + '\n')
+        return len(additions)
+
     def _fill_strings(self, tl_dir: Path, translation_dict: dict, progress_cb=None) -> int:
         """填充字符串翻译，progress_cb(已处理文件数, 总文件数) 回报进度"""
-
         def _handle(lines):
             filled = 0
             new_lines = []
@@ -556,7 +631,22 @@ class GameExporter:
                                         (old_text, '；'.join(probs)))
                                     new_lines.append(lines[i + 1])
                                 else:
-                                    escaped = escape_translation(translated, percent='string')
+                                    # .format 模板（含 {N} 占位）不做 % 转义：
+                                    # {1:+.0%} 的 % 是格式规格，双写会把
+                                    # .format 炸掉（生产事故）
+                                    pct = ('none' if re.search(r'\{\d', old_text)
+                                           else 'string')
+                                    # ' (disabled)' 是游戏逻辑标记
+                                    # （MenuItem 靠它判敏感），绝不可译：
+                                    # 译文换了中文括注就恢复英文标记
+                                    if (old_text.endswith(' (disabled)')
+                                            and not translated.endswith(
+                                                ' (disabled)')):
+                                        translated = re.sub(
+                                            r'\s*[（(][^）)]*[）)]\s*$', '',
+                                            translated).rstrip() + ' (disabled)'
+                                    escaped = escape_translation(
+                                        translated, percent=pct)
                                     new_lines.append(f'    new "{escaped}"')
                                     filled += 1
                             else:
@@ -733,7 +823,7 @@ class GameExporter:
                                       relocate_wrap_candidates,
                                       resolve_source_root)
 
-        rows = self.db.get_marked_embedded()
+        rows = self.db.get_marked_embedded(apply_path='wrap')
         if not rows:
             return
         # 导出副本结构与工作副本一致：export_dir/game/ 为游戏根
@@ -754,6 +844,218 @@ class GameExporter:
                 '对应位置将保持英文')
         # 编译校验失败时 healer 依赖行号匹配定位失败处，
         # skipped/lost 的行号可能已漂移——healer 侧另有文本匹配兜底
+
+    def _transform_fstrings(self, export_dir: Path, log) -> None:
+        """在导出副本上把已标记的 f-string 改写为模板翻译形态
+
+        与 wrap 应用同一批：源码只读原则下 f-string 的模板化改写
+        （_("...{0}...").format(...) / _("...[var]...")）只在导出副本
+        发生；模板译文条目早已由 zz 表合成入库。行号漂移同文件重定位
+        并回写库坐标；定位/派生失败跳过不阻断（该处保持英文）。
+        """
+        from embedded_strings import resolve_source_root
+        from fstring_strings import transform_fstring_literals
+
+        rows = self.db.get_marked_embedded(apply_path='fstring')
+        if not rows:
+            return
+        source_root = resolve_source_root(export_dir / 'game')
+        done, moved_ids, lost_ids = transform_fstring_literals(
+            rows, str(source_root))
+        for row_id, line, col in moved_ids:
+            self.db.update_embedded_position(row_id, line, col)
+        if done:
+            log(f'已改写 {done} 处 f-string 为模板翻译形态'
+                f'（_{"(...)"} 包裹静态模板）')
+        if moved_ids:
+            log(f'  其中 {len(moved_ids)} 处因行号漂移已重定位')
+        if lost_ids:
+            log(f'警告: {len(lost_ids)} 处 f-string 改写定位/派生失败'
+                '（源码可能已更新，请重新扫描内嵌文本）；'
+                '对应位置将保持英文')
+
+    def _apply_ttag_literals(self, export_dir: Path, log) -> None:
+        """含插值的已标记 table 行：源码字面量的插值补 !t（值通道翻译）
+
+        Ren'Py 替换式"先译模板、后插值"——[x] 的值原样插入，[x!t] 的
+        值先过 strings 表。zz 条目（regen 从行 text 生成）已带 !t，
+        字面量必须同步改写才查得中。定位纪律与 wrap 应用一致
+        （位置校验/同文件重定位/回写坐标/失败跳过告警）。
+
+        必须在 _sweep_ttag 之前运行：先按 raw（无 !t）定位已标记行，
+        再由幂等的清扫兜底未标记位置。
+        """
+        from embedded_strings import resolve_source_root
+        from markup_check import add_tflag, extract_interps
+
+        rows = [r for r in self.db.get_table_marked_embedded()
+                if extract_interps(r['text'])]
+        if not rows:
+            return
+        source_root = resolve_source_root(export_dir / 'game')
+
+        # 逐行定位（raw 校验 → 同文件重定位），再按文件倒序改写
+        file_lines: dict = {}
+        located = []
+        lost = 0
+        for r in rows:
+            rel = r['rel_file']
+            if rel not in file_lines:
+                try:
+                    file_lines[rel] = (source_root / rel).read_text(
+                        encoding='utf-8').split('\n')
+                except OSError:
+                    file_lines[rel] = None
+            lines = file_lines[rel]
+            if lines is None:
+                lost += 1
+                continue
+            idx = r['line'] - 1
+            hits = []
+            if (0 <= idx < len(lines)
+                    and lines[idx][r['col_start']:r['col_start'] + len(r['raw'])]
+                    == r['raw']):
+                hits.append((r['line'], r['col_start']))
+            else:
+                for ln, line in enumerate(lines, 1):
+                    start = 0
+                    while True:
+                        col = line.find(r['raw'], start)
+                        if col < 0:
+                            break
+                        hits.append((ln, col))
+                        start = col + 1
+            if not hits:
+                lost += 1
+                continue
+            if len(hits) > 1:
+                hits.sort(key=lambda h: abs(h[0] - r['line']))
+            ln, col = hits[0]
+            located.append((r, ln, col))
+            if (ln, col) != (r['line'], r['col_start']):
+                self.db.update_embedded_position(r['id'], ln, col)
+
+        by_file: dict = {}
+        for item in located:
+            by_file.setdefault(item[0]['rel_file'], []).append(item)
+        done = 0
+        for rel, items in by_file.items():
+            lines = file_lines[rel]
+            changed = False
+            for r, ln, col in sorted(items, key=lambda x: (x[1], x[2]),
+                                     reverse=True):
+                idx = ln - 1
+                line = lines[idx]
+                if line[col:col + len(r['raw'])] != r['raw']:
+                    lost += 1
+                    continue
+                new_raw = add_tflag(r['raw'])
+                if new_raw != r['raw']:
+                    lines[idx] = line[:col] + new_raw + line[col + len(r['raw']):]
+                    done += 1
+                    changed = True
+            if changed:
+                (source_root / rel).write_text('\n'.join(lines),
+                                               encoding='utf-8')
+        if done:
+            log(f'已为 {done} 处已标记界面文本的插值补 !t（值通道翻译）')
+        if lost:
+            log(f'警告: {lost} 处 !t 改写定位失败（该处值将保持英文）')
+
+    # 值通道清扫的两类字面量：
+    # 1) text/textbutton/label/tooltip 属性行的字符串（含纯插值模板
+    #    "[item.title!i]"——从未成候选、无 zz 条目，!t 是唯一通道）
+    # 2) _() 包裹的字符串（其 old 条目在下面同步补 !t）
+    # 关键字必须是屏幕语句：前不可为标识符字符/点（tooltip.append 是方法
+    # 调用不是属性行），后不可为点。
+    _TTAG_PROP_RE = re.compile(
+        r'(?<![\w.])(?:textbutton|text|label|tooltip)\b(?!\s*\.)')
+
+    def _sweep_ttag(self, export_dir: Path, log) -> None:
+        """导出副本全量值通道清扫：剩余插值统一补 !t
+
+        两部分，全部幂等（add_tflag 跳过已含 t 的插值）：
+        - 屏幕属性行/_() 包裹的源码字面量
+        - 全部 tl 文件 strings 块的 old 行（SDK 模板里的原生 _() 条目）
+        zz 条目在 regen 时已带 !t，此处自然跳过。
+        """
+        from embedded_strings import _PY_STRING_RE, _string_prefix
+        from markup_check import add_tflag
+
+        fixed_src = 0
+        game_root = export_dir / 'game'
+        for rpy in game_root.rglob('*.rpy'):
+            if 'tl' in rpy.parts:
+                continue
+            try:
+                lines = rpy.read_text(encoding='utf-8',
+                                      errors='ignore').split('\n')
+            except OSError:
+                continue
+            changed = False
+            for i, line in enumerate(lines):
+                is_prop = bool(self._TTAG_PROP_RE.search(line))
+                if not is_prop and '_(' not in line:
+                    continue
+                # 注意：finditer 绑定的是原字符串——改写后位置会漂移，
+                # 单行多字面量时用「逐次从偏移 0 起找一个改一个」的循环
+                while True:
+                    edited = False
+                    for m in _PY_STRING_RE.finditer(line):
+                        # 带前缀字面量：含 { 的 f-string 跳过（{} 里是 Python
+                        # 表达式，下标会被 add_tflag 改成非法语法——由
+                        # _transform_fstrings 专门处理）；不含 { 的
+                        # f-string（如 f"[obedience_label]: [...]"，只有
+                        # Ren'Py 插值）安全，照常补 !t
+                        if _string_prefix(line, m.start()) \
+                                and '{' in m.group(0):
+                            continue
+                        if not is_prop:
+                            # _() 规则：字面量必须紧跟 _( 之后——但不能是
+                            # __(（f-string 变换已写好的立即翻译输出，
+                            # 再补 !t 会把 [{0}] 改成 [{0}!t] 二次破坏）
+                            prefix = line[max(0, m.start() - 3):m.start()]
+                            if (not prefix.endswith('_(')
+                                    or prefix.endswith('__(')):
+                                continue
+                        new_lit = add_tflag(m.group(0))
+                        if new_lit != m.group(0):
+                            line = line[:m.start()] + new_lit + line[m.end():]
+                            fixed_src += 1
+                            changed = True
+                            edited = True
+                            break
+                    if not edited:
+                        break
+                if changed:
+                    lines[i] = line
+            if changed:
+                rpy.write_text('\n'.join(lines), encoding='utf-8')
+
+        fixed_tl = 0
+        tl_dir = game_root / 'tl' / 'chinese'
+        if tl_dir.is_dir():
+            for rpy in tl_dir.rglob('*.rpy'):
+                try:
+                    lines = rpy.read_text(encoding='utf-8',
+                                          errors='ignore').split('\n')
+                except OSError:
+                    continue
+                changed = False
+                for i, line in enumerate(lines):
+                    if not re.match(r'^\s+old\s+"', line):
+                        continue
+                    new_line = add_tflag(line)
+                    if new_line != line:
+                        lines[i] = new_line
+                        fixed_tl += 1
+                        changed = True
+                if changed:
+                    rpy.write_text('\n'.join(lines), encoding='utf-8')
+
+        if fixed_src or fixed_tl:
+            log(f'值通道清扫: 源码插值补 !t {fixed_src} 处, '
+                f'模板 old 条目补 !t {fixed_tl} 处')
 
     def _pick_kept_decompiled(self, export_dir: Path,
                               decompiled_rels: list) -> list:
@@ -867,6 +1169,28 @@ class GameExporter:
             f.write(block)
 
         log(f'已设置默认中文启动（追加到 {target.name}）')
+
+    def _write_rt_helpers(self, export_dir: Path, log) -> None:
+        """写运行时助手文件（tl/chinese/zz_rt_helpers.rpy，每次全量重写）
+
+        rt_translate(s)：安全立即翻译。__() 直调 translate_string，内部
+        re.sub 收到 float/int 即 TypeError（显示层替换式会先 str()，直调
+        必须自带防护）——f-string 变换的实参用它。
+        注意命名不能以下划线开头：屏幕代码里 `_name` 会被 Ren'Py 改编成
+        屏幕局部名（_m1_screenname__name）而 NameError。
+        init python 在 tl 文件里不受语言门控（只有 translate 块受门控），
+        任何语言下都可用。
+        """
+        tl_dir = export_dir / 'game' / 'tl' / 'chinese'
+        tl_dir.mkdir(parents=True, exist_ok=True)
+        content = (
+            '# 导出工具运行时助手（自动生成，每次导出全量重写）\n'
+            'init -10 python:\n'
+            '    def rt_translate(s):\n'
+            '        return __(s) if isinstance(s, str) else s\n'
+        )
+        (tl_dir / 'zz_rt_helpers.rpy').write_text(content, encoding='utf-8')
+        log('已写入运行时助手（zz_rt_helpers.rpy）')
 
     @staticmethod
     def _require_user_fonts() -> list:

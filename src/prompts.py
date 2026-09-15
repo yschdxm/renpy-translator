@@ -13,6 +13,8 @@ from typing import List
 _CODE_MARKUP_HEADER = '代码标记规则（以下内容直接保留原样，不翻译、不删除、不修改）：'
 _CODE_MARKUP_BRACKET = '- 方括号内容：[变量名]'
 _CODE_MARKUP_BRACE = '- 花括号内容：{标签}'
+_CODE_MARKUP_FORMAT = ('- 格式占位符：{0}、{1} 等带数字的花括号（f-string 模板）；'
+                       '{{ 与 }} 是转义的字面花括号，必须保持双写')
 _CODE_MARKUP_DOLLAR = '- 美元符内容：$变量'
 _CODE_MARKUP_PERCENT = '- 格式化占位符：%s、%d、%% 等'
 
@@ -32,6 +34,7 @@ def _code_markup_rules(with_examples: bool) -> str:
         _CODE_MARKUP_HEADER,
         _CODE_MARKUP_BRACKET,
         _CODE_MARKUP_BRACE,
+        _CODE_MARKUP_FORMAT,
         _CODE_MARKUP_DOLLAR,
         _CODE_MARKUP_PERCENT,
     ])

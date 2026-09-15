@@ -63,6 +63,78 @@ def extract_interps(text: str) -> set:
     return out
 
 
+def add_tflag(text: str) -> str:
+    """给文本里每个最外层插值补 !t 旗标（值通道翻译）
+
+    Ren'Py 替换式"先译模板、后插值"——[x] 的值原样插入；[x!t] 的值
+    先过 strings 表。已有旗标追加到旗标链（[x!i] → [x!it]，官方文档：
+    旗标顺序无关）；已含 t 的幂等跳过（[x!t]/[x!tq] 不重复）。
+    栈式扫描、嵌套感知（[d[_return][0]] → [d[_return][0]!t]）；
+    [[ 字面转义不动；未闭合的尾部不动。
+
+    跳过带格式规格的插值（[x:.1f] 等）：!t 把值变成字符串后
+    format(str, '.1f') 必炸，且格式规格值本就是数字无可译内容。
+    """
+    t = _strip_escapes(text)
+    depth = 0
+    start = -1
+    # 自后向前插入，保持前部偏移有效
+    inserts = []   # (位置, 结束位置, 替换片段)
+    for i, ch in enumerate(t):
+        if ch == '[':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == ']' and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                expr = t[start + 1:i]
+                stripped = expr.strip()
+                if stripped:
+                    repl_expr = _tflag_position(stripped)
+                    if repl_expr is not None:
+                        # 保留插值内容原有的首尾空白
+                        lead = expr[:len(expr) - len(expr.lstrip())]
+                        trail = expr[len(expr.rstrip()):]
+                        inserts.append((start, i, lead + repl_expr + trail))
+                start = -1
+    if not inserts:
+        return text
+    for pos, end, repl in reversed(inserts):
+        t = t[:pos + 1] + repl + t[end:]
+    return t.replace('\x00', '[[').replace('\x01', '{{')
+
+
+def _tflag_position(expr: str):
+    """判定插值可否补 !t：可补返回补好旗标的表达式，不可补返回 None
+
+    不可补：带顶层格式规格（[x:.1f]——!t 字符串化后 format 必炸）；
+    旗标链已含 t；含裸 !（如 != 比较——Ren'Py 按 ! 切旗标，这种
+    表达式本身就无法安全追加）。
+    可补：无旗标（→ expr!t）/ 有旗标无 t（→ expr + 't'，追加链尾）。
+    """
+    # 顶层 ':'（不在 []/() 内）= 格式规格起点
+    d = 0
+    for ch in expr:
+        if ch in '[(':
+            d += 1
+        elif ch in '])':
+            d -= 1
+        elif ch == ':' and d == 0:
+            return None
+    # 花括号内容（[{0}] 是"括号包格式占位"的字面文本——.format 后才轮到
+    # 它，不是 Ren'Py 插值；加 !t 会把显示值当变量 eval 而 NameError）
+    if '{' in expr or '}' in expr:
+        return None
+    if '!' not in expr:
+        return expr + '!t'
+    # 旗标链从顶层首个 !字母 起（!= 比较里的 ! 后跟 =，不算旗标）
+    for m in re.finditer(r'!([a-zA-Z])', expr):
+        flags = expr[m.end() - 1:]
+        if re.fullmatch(r'[a-z]+', flags):
+            return expr + 't' if 't' not in flags else None
+    return None
+
 def extract_tags(text: str) -> set:
     """提取文本标签集合；{#...} 是注释标签（渲染丢弃、翻译查找时剥掉），
     不参与比较"""
