@@ -113,6 +113,16 @@ const searchInput = ref('')
 const search = ref('')
 const fileFilter = ref<string | null>(null)
 const showUnresolved = ref(true)
+/** 引擎渲染（实验）：Ren'Py 沙盒渲染场景缩略图，localStorage 持久化 */
+const engineRender = ref(false)
+try {
+  engineRender.value = localStorage.getItem('sg_engine_render') === '1'
+} catch { /* 私密模式等只读环境 */ }
+watch(engineRender, (v) => {
+  try {
+    localStorage.setItem('sg_engine_render', v ? '1' : '0')
+  } catch { /* 同上 */ }
+})
 /** 已展开的场景 id 集合（默认全收起，只有入口可见） */
 const expanded = ref(new Set<string>())
 /** 展开操作后要聚焦的节点 */
@@ -138,7 +148,8 @@ async function load() {
 async function build(incremental: boolean) {
   try {
     const d = await api.post<{ job_id: string }>(
-      '/api/current/graph/story/build', { incremental })
+      '/api/current/graph/story/build',
+      { incremental, engine_render: engineRender.value })
     jobsStore.track(d.job_id)
   } catch (e) {
     toastError(message, e)
@@ -1141,6 +1152,10 @@ function speakersOfFull(s: ApiScene) {
                     @click="build(true)">
             增量更新
           </n-button>
+          <n-space size="small" align="center">
+            <n-switch v-model:value="engineRender" size="small" />
+            <n-text depth="3" style="font-size: 12px">引擎渲染（实验）</n-text>
+          </n-space>
         </n-space>
       </n-space>
     </n-card>

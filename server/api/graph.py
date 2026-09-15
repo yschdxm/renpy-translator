@@ -55,6 +55,7 @@ async def get_story(state: AppState = Depends(require_project)):
 
 class StoryBuildIn(BaseModel):
     incremental: bool = False
+    engine_render: bool = False
 
 
 @router.post('/story/build')
@@ -65,6 +66,7 @@ async def build_story(req: StoryBuildIn = None,
     cache_dir = _cache_dir(state)
     translator = state.translator  # 无模型时 AI 场景标题阶段自动跳过
     incremental = bool(req and req.incremental)
+    engine_render = bool(req and req.engine_render)
 
     async def body(job):
         def _build():
@@ -73,7 +75,7 @@ async def build_story(req: StoryBuildIn = None,
                 state.db, str(game_root), str(cache_dir),
                 translator=translator,
                 progress=job.emit_progress, cancel_event=job.cancel_event,
-                incremental=incremental)
+                incremental=incremental, engine_render=engine_render)
         # 构建是纯 CPU/IO 同步流程，放线程池跑
         result = await state.run_sync(_build)
         job.check_cancelled()

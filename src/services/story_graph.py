@@ -42,11 +42,14 @@ def build_story_graph(db, game_root: str, cache_dir: str,
                       translator=None,
                       progress: Callable[[float, str], None] = None,
                       cancel_event: threading.Event = None,
-                      incremental: bool = False) -> dict:
+                      incremental: bool = False,
+                      engine_render: bool = False) -> dict:
     """构建剧情图（label 级 + 场景级）并入库，返回统计
 
     incremental=False（默认，重建语义）：所有场景重新做 AI 标题分析；
-    incremental=True（独立的增量功能）：已有标题保留，只分析新场景
+    incremental=True（独立的增量功能）：已有标题保留，只分析新场景。
+    engine_render=True（实验）：场景缩略图用 Ren'Py 引擎沙盒渲染
+    （真 ATL/分层/程序化角色），失败回退 Pillow 合成器
     """
     source_root = resolve_source_root(Path(game_root))
 
@@ -94,6 +97,7 @@ def build_story_graph(db, game_root: str, cache_dir: str,
         manifest = {}
     new_manifest = {}
     reused = 0
+    sandbox_entries = []  # 引擎渲染模式待渲染项 (label, ops, first, last, init, key)
     for i, label in enumerate(order):
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError('剧情图构建已取消')
@@ -107,6 +111,8 @@ def build_story_graph(db, game_root: str, cache_dir: str,
         if n.scene_ops or init is not None:
             key = thumb_key(n.scene_ops, n.first_dlg_line,
                             n.last_dlg_line, init)
+            if engine_render:
+                key += ':E'
             hit = manifest.get(label)
             if (hit and hit.get('key') == key
                     and all((cache / f).exists()
@@ -114,18 +120,62 @@ def build_story_graph(db, game_root: str, cache_dir: str,
                 names = hit['files']
                 fin = state_after(n.scene_ops, init)
                 reused += 1
+                final_states[label] = fin
+                new_manifest[label] = hit
+                if names:
+                    n.thumb_file = names[0]
+                    n.thumb_files = names
+            elif engine_render:
+                # 引擎模式：状态机照算（传播需要），渲染统一走沙盒
+                fin = state_after(n.scene_ops, init)
+                final_states[label] = fin
+                sandbox_entries.append(
+                    (label, n.scene_ops, n.first_dlg_line,
+                     n.last_dlg_line, init, key))
             else:
                 names, fin = compose_scene_candidates(
                     resolver, n.scene_ops, n.first_dlg_line,
                     n.last_dlg_line, str(cache), n.label, initial_state=init)
-            final_states[label] = fin
-            new_manifest[label] = {'key': key, 'files': names}
-            if names:
-                n.thumb_file = names[0]
-                n.thumb_files = names
+                final_states[label] = fin
+                new_manifest[label] = {'key': key, 'files': names}
+                if names:
+                    n.thumb_file = names[0]
+                    n.thumb_files = names
         if i % 20 == 0 and progress:
             progress(0.10 + 0.50 * i / total,
                      f'合成场景缩略图 {i}/{total}（复用 {reused}）')
+
+    # ---- 引擎渲染（实验）：Ren'Py 沙盒整批渲染；失败回退 Pillow ----
+    if engine_render and sandbox_entries:
+        if progress:
+            progress(0.30, f'引擎渲染沙盒启动（{len(sandbox_entries)} 个 label）')
+        thumbs_map = {}
+        try:
+            from render_sandbox import build_jobs, harvest, run_sandbox
+            jobs = build_jobs([(lb, ops, f, la, init)
+                               for lb, ops, f, la, init, _ in
+                               sandbox_entries])
+            results = run_sandbox(str(source_root), jobs)
+            thumbs_map = harvest(results, str(cache))
+        except Exception as e:
+            print(f'[渲染沙盒] 启动/运行失败，回退 Pillow 合成器: {e}')
+            thumbs_map = None
+        for lb, ops, f, la, init, key in sandbox_entries:
+            n = node_by[lb]
+            if thumbs_map is None:
+                # 回退：Pillow 合成（key 带 :E 不污染 Pillow 缓存）
+                names, _ = compose_scene_candidates(
+                    resolver, ops, f, la, str(cache), lb,
+                    initial_state=init)
+            else:
+                names = thumbs_map.get(lb, [])
+            new_manifest[lb] = {'key': key, 'files': names}
+            if names:
+                n.thumb_file = names[0]
+                n.thumb_files = names
+        if progress:
+            progress(0.60, '引擎渲染完成')
+
     try:
         manifest_path.write_text(json.dumps(new_manifest),
                                  encoding='utf-8')

@@ -25,10 +25,12 @@ _unescape = RenpyParser._unescape_renpy
 class SceneOp:
     """一条场景语句快照（行号用于定位"首次对话时的画面状态"）"""
     line: int
-    op: str                    # scene | show | hide
+    op: str                    # scene | show | hide | exec
     images: list               # 图像名组件，如 ['bg', 'room']
     at: list = field(default_factory=list)  # show 的 at 位置/transform 名
     dynamic: bool = False      # 含 expression，静态不可解析
+    code: str = ''             # op=exec 时的 python 语句（引擎沙盒回放用，
+                               # 如 the_person.draw_person(...)）
 
 
 @dataclass
@@ -98,6 +100,10 @@ _ROOM_DEF_RE = re.compile(
     r'(\w+)\s*=\s*Room\s*\(\s*_?\(?\s*["\'][^"\']*["\']\s*\)?'
     r'\s*,\s*_?\(?\s*["\'][^"\']*["\']\s*\)?\s*,\s*["\']([^"\']+)["\']')
 _CHANGE_LOC_RE = re.compile(r'\.change_location\s*\(\s*(\w+)')
+# exec 白名单：引擎沙盒里原样回放的 python 语句（程序化角色绘制，
+# 如 LR2 的 the_person = jennifer / the_person.draw_person(position=...)）
+_EXEC_WHITELIST_RE = re.compile(
+    r'^\$\s*(the_person\s*=\s*\w+|\w+\.draw_person\s*\().*$')
 # 注册池：构造器参数里恰好是 label 名的字符串（沙盒游戏的
 # Action("名称", 需求, "effect_label") / Crisis(...) 事件注册，
 # 含 xxx_list.append(Action(...)) 形式），供 .effect 派发展开；
@@ -428,22 +434,36 @@ class FlowParser:
                 continue
 
             # ---- 跳转/调用 ----
-            # $ xxx.change_location(room)：地点系统切背景 → scene 快照
+            # exec 白名单（程序化角色绘制，沙盒回放）
+            if _EXEC_WHITELIST_RE.match(stripped):
+                node.scene_ops.append(
+                    SceneOp(idx, 'exec', [], [],
+                            code=stripped.lstrip('$').strip()))
+                touch_option('other')
+                if indent <= body_indent:
+                    last_base_stmt = 'other'
+                continue
+            # $ xxx.change_location(room)：地点系统切背景 → scene 快照；
+            # code 存原文行（沙盒 exec 后 mc.location 才有光照等运行时状态）
             cm = _CHANGE_LOC_RE.search(stripped)
             if cm and cm.group(1) in self._rooms:
                 node.scene_ops.append(
-                    SceneOp(idx, 'scene', [self._rooms[cm.group(1)]], []))
+                    SceneOp(idx, 'scene', [self._rooms[cm.group(1)]], [],
+                            code=stripped.lstrip('$').strip()))
                 touch_option('other')
                 if indent <= body_indent:
                     last_base_stmt = 'other'
                 continue
             # $ renpy.show("tag", what = xxx("Name"), ...)：Python 式背景
-            # 引用（沙盒游戏常见），提取 what 里的图名作为 show 快照
+            # 引用（沙盒游戏常见）。show 快照给 Pillow 合成器；原文行同时存
+            # code——引擎沙盒里按原文 exec 是高保真路径（bg_manager 这类
+            # 自建显示器的图像名静态不可解析）
             if _RENPY_SHOW_RE.match(stripped):
                 wm = _SHOW_WHAT_RE.search(stripped)
                 if wm:
                     node.scene_ops.append(
-                        SceneOp(idx, 'show', [wm.group(1)], []))
+                        SceneOp(idx, 'show', [wm.group(1)], [],
+                                code=stripped.lstrip('$').strip()))
                 touch_option('other')
                 if indent <= body_indent:
                     last_base_stmt = 'other'
@@ -503,7 +523,11 @@ class FlowParser:
             m = _SHOW_RE.match(stripped)
             if m:
                 images, at, dynamic = _parse_image_spec(m.group(1))
-                node.scene_ops.append(SceneOp(idx, 'show', images, at, dynamic))
+                # show screen 是界面调用不是图像（show screen overlay_scr
+                # 这类进快照会让引擎渲染出红字报错）
+                if not images or images[0] != 'screen':
+                    node.scene_ops.append(
+                        SceneOp(idx, 'show', images, at, dynamic))
                 touch_option('other')
                 if indent <= body_indent:
                     last_base_stmt = 'other'
@@ -511,7 +535,9 @@ class FlowParser:
             m = _HIDE_RE.match(stripped)
             if m:
                 images, _, dynamic = _parse_image_spec(m.group(1))
-                node.scene_ops.append(SceneOp(idx, 'hide', images, [], dynamic))
+                if not images or images[0] != 'screen':
+                    node.scene_ops.append(
+                        SceneOp(idx, 'hide', images, [], dynamic))
                 touch_option('other')
                 if indent <= body_indent:
                     last_base_stmt = 'other'
