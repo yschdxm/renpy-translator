@@ -53,12 +53,18 @@ async def get_story(state: AppState = Depends(require_project)):
     return {**graph, 'stats': stats, 'characters': char_map}
 
 
+class StoryBuildIn(BaseModel):
+    incremental: bool = False
+
+
 @router.post('/story/build')
-async def build_story(state: AppState = Depends(require_project)):
+async def build_story(req: StoryBuildIn = None,
+                      state: AppState = Depends(require_project)):
     game_root = (state.project_manager.project_dir(state.current_project)
                  / 'game')
     cache_dir = _cache_dir(state)
     translator = state.translator  # 无模型时 AI 场景标题阶段自动跳过
+    incremental = bool(req and req.incremental)
 
     async def body(job):
         def _build():
@@ -66,15 +72,18 @@ async def build_story(state: AppState = Depends(require_project)):
             return build_story_graph(
                 state.db, str(game_root), str(cache_dir),
                 translator=translator,
-                progress=job.emit_progress, cancel_event=job.cancel_event)
+                progress=job.emit_progress, cancel_event=job.cancel_event,
+                incremental=incremental)
         # 构建是纯 CPU/IO 同步流程，放线程池跑
         result = await state.run_sync(_build)
         job.check_cancelled()
         job.emit_progress(1.0, '完成')
         return result
 
-    job = state.jobs.create('graph.story-build', '构建剧情图', {}, body,
-                            exclusive=True)
+    job = state.jobs.create(
+        'graph.story-build',
+        '增量更新剧情图' if incremental else '构建剧情图', {}, body,
+        exclusive=True)
     return {'job_id': job.id}
 
 
@@ -82,6 +91,10 @@ async def build_story(state: AppState = Depends(require_project)):
 async def get_scenes(state: AppState = Depends(require_project)):
     graph = await state.db_call(state.db.get_story_scenes)
     stats = await state.db_call(state.db.story_graph_stats)
+    # 用户手动选择的缩略图覆盖自动选择（读时应用，重建保留）
+    prefs = await state.db_call(state.db.get_all_scene_thumb_prefs)
+    for s in graph['scenes']:
+        s['thumb_file'] = prefs.get(s['scene_id'], s['thumb_file'])
     # speaker 变量 → 展示信息（显示名/中文名/有无立绘），前端免二次请求
     characters = await state.db_call(state.db.get_characters)
     avatars = await state.db_call(state.db.get_char_avatars)
@@ -154,7 +167,7 @@ def _serve(base: Path, rel: str, what: str):
 async def get_relations(state: AppState = Depends(require_project)):
     characters = await state.db_call(state.db.get_characters)
     relations = await state.db_call(state.db.get_relations)
-    avatars = await state.db_call(state.db.get_char_avatars)
+    avatar_data = await state.db_call(state.db.get_char_avatar_candidates)
     rows = [{
         'key': c['variable'] or c['display_name'],
         'variable': c['variable'] or '',
@@ -162,9 +175,46 @@ async def get_relations(state: AppState = Depends(require_project)):
         'cn_name': c['cn_name'] or '',
         'lines': c['lines_count'],
         'faction': c.get('faction', '') or '',
-        'has_avatar': (c['variable'] or '') in avatars,
+        'has_avatar': bool(
+            avatar_data.get(c['variable'] or '', {}).get('path')),
+        'avatar_path': avatar_data.get(
+            c['variable'] or '', {}).get('path', ''),
+        'avatar_candidates': avatar_data.get(
+            c['variable'] or '', {}).get('candidates', []),
     } for c in characters if not c['is_placeholder']]
     return {'characters': rows, 'relations': relations}
+
+
+class AvatarPrefIn(BaseModel):
+    variable: str
+    path: str = ''
+
+
+@router.post('/relations/avatar_pref')
+async def set_avatar_pref(req: AvatarPrefIn,
+                          state: AppState = Depends(require_project)):
+    """设置/清除（path 为空）角色头像偏好（读时应用，重建保留）"""
+    if req.path:
+        _safe_file(_source_root(state), req.path, '立绘')
+    await state.db_call(state.db.set_char_avatar_pref,
+                        req.variable, req.path)
+    return {'ok': True}
+
+
+class ThumbPrefIn(BaseModel):
+    scene_id: str
+    file: str = ''
+
+
+@router.post('/story/thumb_pref')
+async def set_thumb_pref(req: ThumbPrefIn,
+                         state: AppState = Depends(require_project)):
+    """设置/清除（file 为空）场景缩略图偏好（读时应用，重建保留）"""
+    if req.file:
+        _safe_file(_cache_dir(state), req.file, '缩略图')
+    await state.db_call(state.db.set_scene_thumb_pref,
+                        req.scene_id, req.file)
+    return {'ok': True}
 
 
 @router.post('/relations/build')
@@ -217,27 +267,36 @@ async def delete_relation(rel_id: int,
 
 
 @router.get('/avatar/{key}')
-async def char_avatar(key: str, state: AppState = Depends(require_project)):
-    avatars = await state.db_call(state.db.get_char_avatars)
-    rel = avatars.get(key)
+async def char_avatar(key: str, path: str = '',
+                      state: AppState = Depends(require_project)):
+    rel = path
+    if not rel:
+        data = await state.db_call(state.db.get_char_avatar_candidates)
+        rel = data.get(key, {}).get('path', '')
     if not rel:
         raise ApiError(404, 'NOT_FOUND', '该角色没有立绘')
     return _serve(_source_root(state), rel, '立绘')
 
 
 @router.get('/avatar_circle/{key}')
-async def char_avatar_circle(key: str, ring: str = '',
+async def char_avatar_circle(key: str, ring: str = '', path: str = '',
                              state: AppState = Depends(require_project)):
     """圆形头像：取立绘顶部方形区域（与前端 object-fit:cover;object-position:top
     一致），圆形蒙版，可选 ring=颜色 的内描边（阵营色），256x256 PNG。
-    结果缓存到 graph_cache/circles/，源文件更新才重做"""
-    avatars = await state.db_call(state.db.get_char_avatars)
-    rel = avatars.get(key)
+    path 指定候选立绘（手动更换预览）；结果缓存到 graph_cache/circles/，
+    源文件更新才重做。缓存名含源路径哈希——更换立绘偏好后不会命中旧缓存"""
+    rel = path
+    if not rel:
+        data = await state.db_call(state.db.get_char_avatar_candidates)
+        rel = data.get(key, {}).get('path', '')
     if not rel:
         raise ApiError(404, 'NOT_FOUND', '该角色没有立绘')
     src = _safe_file(_source_root(state), rel, '立绘')
     ring = ring if ring.startswith('#') and len(ring) in (4, 7) else ''
     suffix = f'_{ring.lstrip("#")}' if ring else ''
+    import zlib
+    # 源路径进缓存名（不同候选/偏好各一份，换头像即时生效）
+    suffix += f'_{zlib.crc32(rel.encode()) % 99991:05d}'
     out_dir = _cache_dir(state) / 'circles'
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f'{key}{suffix}_256.png'

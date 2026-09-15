@@ -259,3 +259,128 @@ def test_code_keywords_not_speakers(tmp_path):
     r = FlowParser(str(tmp_path)).parse()
     node = r['nodes'][0]
     assert node.speakers == ['e']
+
+
+# ---- 事件袋动态跳转的静态恢复 ----
+
+def test_event_bag_resolution(tmp_path):
+    (tmp_path / 'a.rpy').write_text(
+        'label start:\n'
+        '    $ bag.append("ev_a")\n'
+        '    $ bag.append("ev_b")\n'
+        '    jump next_day\n'
+        '\n'
+        'label next_day:\n'
+        '    if bag:\n'
+        '        $ ev = bag.pop()\n'
+        '        $ renpy.jump(ev)\n'
+        '\n'
+        'label ev_a:\n'
+        '    return\n'
+        '\n'
+        'label ev_b:\n'
+        '    return\n',
+        encoding='utf-8')
+    r = FlowParser(str(tmp_path)).parse()
+    targets = {e.target for e in _edges(r, 'next_day') if e.target}
+    assert {'ev_a', 'ev_b'} <= targets
+
+
+def test_computed_name_prefix_expansion(tmp_path):
+    (tmp_path / 'a.rpy').write_text(
+        'label start:\n'
+        '    $ renpy.jump("day_" + str(n))\n'
+        '\n'
+        'label day_0:\n'
+        '    return\n'
+        '\n'
+        'label day_1:\n'
+        '    return\n',
+        encoding='utf-8')
+    r = FlowParser(str(tmp_path)).parse()
+    targets = {e.target for e in _edges(r, 'start') if e.target}
+    assert targets == {'day_0', 'day_1'}
+
+
+def test_screen_navigation_edges(tmp_path):
+    (tmp_path / 'a.rpy').write_text(
+        'label start:\n'
+        '    call screen hall_map\n'
+        '\n'
+        'label room:\n'
+        '    return\n'
+        '\n'
+        'label door:\n'
+        '    return\n'
+        '\n'
+        'screen hall_map:\n'
+        '    imagemap:\n'
+        '        hotspot (0,0,10,10) action [Jump("room")]\n'
+        '    imagebutton:\n'
+        '        action Jump("door")\n',
+        encoding='utf-8')
+    r = FlowParser(str(tmp_path)).parse()
+    targets = {e.target for e in _edges(r, 'start') if e.target}
+    assert targets == {'room', 'door'}
+
+
+def test_indirect_call_screen(tmp_path):
+    (tmp_path / 'a.rpy').write_text(
+        'label start:\n'
+        '    $ nav = "main_map"\n'
+        '    $ renpy.call_screen(nav)\n'
+        '\n'
+        'label hub:\n'
+        '    return\n'
+        '\n'
+        'screen main_map:\n'
+        '    textbutton "Go" action Jump("hub")\n',
+        encoding='utf-8')
+    r = FlowParser(str(tmp_path)).parse()
+    targets = {e.target for e in _edges(r, 'start') if e.target}
+    assert targets == {'hub'}
+
+
+def test_setvar_screen_registry(tmp_path):
+    # nav_screen 由界面动作跨 label 设置：派发处按注册表展开
+    (tmp_path / 'a.rpy').write_text(
+        'label start:\n'
+        '    jump hub_dispatch\n'
+        '\n'
+        'label hub_dispatch:\n'
+        '    $ renpy.call_screen(nav_screen)\n'
+        '\n'
+        'label room:\n'
+        '    return\n'
+        '\n'
+        'screen map_a:\n'
+        '    textbutton "x" action [SetVariable("nav_screen", "map_b"),\n'
+        '                            Jump("room")]\n'
+        '\n'
+        'screen map_b:\n'
+        '    textbutton "y" action Jump("room")\n',
+        encoding='utf-8')
+    r = FlowParser(str(tmp_path)).parse()
+    targets = {e.target for e in _edges(r, 'hub_dispatch') if e.target}
+    assert 'room' in targets
+
+
+def test_show_screen_ambient_filtered(tmp_path):
+    # HUD 类界面被 >30 个 label show → 环境屏幕，不产生边；
+    # 内容界面（少数 label）保留
+    parts = ['screen hud:', '    textbutton "m" action Jump("sys")', '']
+    parts += ['screen wait_panel:',
+              '    textbutton "go" action Jump("after_wait")', '']
+    parts += ['label sys:', '    return', '']
+    parts += ['label after_wait:', '    return', '']
+    parts += ['label start:', '    jump filler_0', '']
+    for i in range(31):
+        parts += [f'label filler_{i}:', '    show screen hud',
+                  '    jump filler_0', '']
+    parts += ['label wait:', '    show screen wait_panel', '    jump wait']
+    (tmp_path / 'a.rpy').write_text('\n'.join(parts) + '\n', encoding='utf-8')
+    r = FlowParser(str(tmp_path)).parse()
+    srcs = {e.target for e in r['edges'] if e.via_screen}
+    # hud（31 个 label show）被滤除；wait_panel（1 个）保留
+    assert 'sys' not in srcs
+    assert 'after_wait' in srcs

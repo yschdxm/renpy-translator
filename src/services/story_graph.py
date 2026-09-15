@@ -16,7 +16,8 @@ from embedded_strings import resolve_source_root
 from flow_parser import FlowParser
 from renpy_parser import RenpyParser
 from scene_builder import build_scenes
-from scene_composer import ImageResolver, compose_scene
+from scene_composer import (
+    ImageResolver, compose_scene_candidates, state_after, thumb_key)
 
 _unescape = RenpyParser._unescape_renpy
 
@@ -40,8 +41,13 @@ def _translation_map(db) -> dict:
 def build_story_graph(db, game_root: str, cache_dir: str,
                       translator=None,
                       progress: Callable[[float, str], None] = None,
-                      cancel_event: threading.Event = None) -> dict:
-    """构建剧情图（label 级 + 场景级）并入库，返回统计"""
+                      cancel_event: threading.Event = None,
+                      incremental: bool = False) -> dict:
+    """构建剧情图（label 级 + 场景级）并入库，返回统计
+
+    incremental=False（默认，重建语义）：所有场景重新做 AI 标题分析；
+    incremental=True（独立的增量功能）：已有标题保留，只分析新场景
+    """
     source_root = resolve_source_root(Path(game_root))
 
     if progress:
@@ -53,25 +59,85 @@ def build_story_graph(db, game_root: str, cache_dir: str,
         progress(0.10, '构建图像索引')
     resolver = ImageResolver(str(source_root))
 
-    # 逐节点合成缩略图（10% ~ 60% 进度段）
+    # 逐节点合成缩略图候选（10% ~ 60% 进度段）：多帧出图供手动更换。
+    # 画面状态沿剧情图传播——Ren'Py 的画面跨 label 持续，没有自己
+    # scene 语句的 label 继承前驱的背景（BFS 顺序，前驱取最早访问的）
     cache = Path(cache_dir)
     total = max(len(nodes), 1)
-    for i, n in enumerate(nodes):
+    node_by = {n.label: n for n in nodes}
+    preds: dict = {}
+    adj: dict = {}
+    for e in edges:
+        if e.target is not None and e.target in node_by:
+            adj.setdefault(e.source, []).append(e.target)
+            preds.setdefault(e.target, []).append(e.source)
+    order = []
+    seen = set()
+    queue = [n.label for n in nodes if n.is_entry] or \
+        ([nodes[0].label] if nodes else [])
+    while queue:
+        cur = queue.pop(0)
+        if cur in seen:
+            continue
+        seen.add(cur)
+        order.append(cur)
+        queue.extend(t for t in adj.get(cur, []) if t not in seen)
+    order.extend(n.label for n in nodes if n.label not in seen)
+
+    final_states: dict = {}
+    # 增量缓存：label → (内容哈希, 候选文件)。哈希覆盖 ops/取点/初始
+    # 状态/合成器版本——任一变化才重渲染，重建时未变 label 零成本复用
+    manifest_path = cache / '_thumb_manifest.json'
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        manifest = {}
+    new_manifest = {}
+    reused = 0
+    for i, label in enumerate(order):
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError('剧情图构建已取消')
-        if n.scene_ops:
-            out = cache / f'{n.label}.webp'
-            if compose_scene(resolver, n.scene_ops, n.first_dlg_line,
-                             n.last_dlg_line, str(out)):
-                n.thumb_file = out.name
-        if progress and i % 20 == 0:
-            progress(0.10 + 0.50 * i / total, f'合成场景缩略图 {i}/{total}')
+        n = node_by[label]
+        # 前驱状态：BFS 序最早的前驱的最终态（近似线性流的画面继承）
+        init = None
+        for p in preds.get(label, []):
+            if p in final_states:
+                init = final_states[p]
+                break
+        if n.scene_ops or init is not None:
+            key = thumb_key(n.scene_ops, n.first_dlg_line,
+                            n.last_dlg_line, init)
+            hit = manifest.get(label)
+            if (hit and hit.get('key') == key
+                    and all((cache / f).exists()
+                            for f in hit.get('files', []))):
+                names = hit['files']
+                fin = state_after(n.scene_ops, init)
+                reused += 1
+            else:
+                names, fin = compose_scene_candidates(
+                    resolver, n.scene_ops, n.first_dlg_line,
+                    n.last_dlg_line, str(cache), n.label, initial_state=init)
+            final_states[label] = fin
+            new_manifest[label] = {'key': key, 'files': names}
+            if names:
+                n.thumb_file = names[0]
+                n.thumb_files = names
+        if i % 20 == 0 and progress:
+            progress(0.10 + 0.50 * i / total,
+                     f'合成场景缩略图 {i}/{total}（复用 {reused}）')
+    try:
+        manifest_path.write_text(json.dumps(new_manifest),
+                                 encoding='utf-8')
+    except OSError:
+        pass
 
     if progress:
         progress(0.62, '解析角色立绘')
     # 角色立绘：对 characters 表全量角色解析（speaker 必在其中，
-    # 关系图谱也复用这份映射）
+    # 关系图谱也复用这份映射）；同时收集候选变体（手动换头像用）
     avatars = {}
+    avatar_cands = {}
     char_name = {}
     for c in db.get_characters():
         if c['is_placeholder'] or not c['variable']:
@@ -82,6 +148,12 @@ def build_story_graph(db, game_root: str, cache_dir: str,
         if sprite:
             avatars[c['variable']] = sprite.relative_to(
                 source_root).as_posix()
+        cands = [
+            p.relative_to(source_root).as_posix()
+            for p in resolver.avatar_candidates(c['variable'],
+                                                c['display_name'])]
+        if cands:
+            avatar_cands[c['variable']] = cands
 
     # 译文回填到 flow 对象（label 级入库与场景聚合共用）
     if progress:
@@ -114,7 +186,7 @@ def build_story_graph(db, game_root: str, cache_dir: str,
         'expr': e.expr, 'line': e.line,
     } for e in edges]
     db.replace_story_graph(node_rows, edge_rows)
-    db.replace_char_avatars(avatars)
+    db.replace_char_avatars(avatars, avatar_cands)
 
     # ---- 场景聚合 ----
     if progress:
@@ -131,11 +203,14 @@ def build_story_graph(db, game_root: str, cache_dir: str,
         s.translated_count = translated
 
     # ---- AI 场景标题/摘要（可选阶段，无模型跳过）----
-    # 增量保留：已有标题的场景不重新生成（重建只补新场景，零重复 token 成本）
-    existing_titles = {
-        s['scene_id']: {'title': s['title'], 'summary': s['summary']}
-        for s in db.get_story_scenes()['scenes'] if s['title']
-    }
+    # 全量重建：所有场景重新分析（AI 输出非确定，重建语义=重来）；
+    # 增量模式：已有标题的场景保留，只补新场景（独立功能入口传入）
+    existing_titles = {}
+    if incremental:
+        existing_titles = {
+            s['scene_id']: {'title': s['title'], 'summary': s['summary']}
+            for s in db.get_story_scenes()['scenes'] if s['title']
+        }
     titles = dict(existing_titles)
     need_ai = [s for s in scenes if s.scene_id not in existing_titles]
     if translator is not None and need_ai:
@@ -163,6 +238,8 @@ def build_story_graph(db, game_root: str, cache_dir: str,
         'dialogue_count': s.dialogue_count,
         'translated_count': s.translated_count,
         'thumb_file': s.thumb_file,
+        'thumbs_json': json.dumps(s.thumb_candidates,
+                                  ensure_ascii=False),
         'is_entry': s.is_entry, 'is_ending': s.is_ending,
         'is_return': s.is_return,
         'file_path': s.file_path, 'line_start': s.line_start,

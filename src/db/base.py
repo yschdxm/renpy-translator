@@ -222,11 +222,23 @@ CREATE TABLE IF NOT EXISTS story_scenes (
     dialogue_count INTEGER DEFAULT 0,
     translated_count INTEGER DEFAULT 0,
     thumb_file TEXT DEFAULT '',
+    thumbs_json TEXT DEFAULT '[]',
     is_entry INTEGER DEFAULT 0,
     is_ending INTEGER DEFAULT 0,
     is_return INTEGER DEFAULT 0,
     file_path TEXT DEFAULT '',
     line_start INTEGER DEFAULT 0
+);
+
+-- 用户手动选择的缩略图/头像（重建不清除；未选择的场景无行）
+CREATE TABLE IF NOT EXISTS scene_thumbs_pref (
+    scene_id TEXT PRIMARY KEY,
+    thumb_file TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS char_avatar_pref (
+    variable TEXT PRIMARY KEY,
+    image_path TEXT DEFAULT ''
 );
 
 -- 剧情场景间边（texts_json/texts_cn_json 为选项文本列表）
@@ -287,6 +299,8 @@ class Base:
             ('char_relations', 'category', "TEXT DEFAULT 'other'"),
             ('char_relations', 'polarity', "TEXT DEFAULT ''"),
             ('characters', 'faction', "TEXT DEFAULT ''"),
+            ('story_scenes', 'thumbs_json', "TEXT DEFAULT '[]'"),
+            ('char_avatars', 'candidates_json', "TEXT DEFAULT '[]'"),
         ]:
             existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in existing:

@@ -7,7 +7,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NButton, NCard, NDrawer, NDrawerContent, NEmpty, NForm, NFormItem,
-  NInput, NModal, NPopconfirm, NSelect, NSpace, NSpin, NSwitch, NTag,
+  NInput, NModal, NPagination, NPopconfirm, NSelect, NSpace, NSpin,
+  NSwitch, NTag,
   NText, useMessage,
 } from 'naive-ui'
 import { AddOutline, PlayOutline, RefreshOutline } from '@vicons/ionicons5'
@@ -29,6 +30,8 @@ interface Character {
   lines: number
   faction: string
   has_avatar: boolean
+  avatar_path: string
+  avatar_candidates: string[]
 }
 interface Relation {
   id: number
@@ -417,7 +420,7 @@ async function renderGraph() {
         name: `${key === protagonistKey.value ? '★ ' : ''}${c.cn_name || c.display_name}`,
         x, y,
         symbol: c.has_avatar
-          ? `image:///api/current/graph/avatar_circle/${encodeURIComponent(key)}`
+          ? `image:///api/current/graph/avatar_circle/${encodeURIComponent(key)}?v=${avatarVer.value}`
           : 'circle',
         symbolSize: size * f,
         itemStyle: c.has_avatar
@@ -712,7 +715,7 @@ function onChartClick(params: any) {
   }
 }
 
-watch([showCooccur, hasGraph], renderGraph, { flush: 'post' })
+watch([data, showCooccur, hasGraph], renderGraph, { flush: 'post' })
 onMounted(load)
 onBeforeUnmount(() => {
   minimap?.dispose()
@@ -794,6 +797,52 @@ async function openCharCard(key: string) {
     cardProfile.value = r.profile
   } catch {
     cardProfile.value = null  // 未分析过档案：仅显示基础信息
+  }
+}
+
+// ---- 手动更换头像（模态框随用随调，关闭即销毁） ----
+const avatarPickerOpen = ref(false)
+const pickAvatar = ref('')
+const avatarPage = ref(1)
+/** 头像版本号：更换后自增，图上/详情头像 URL 带 v 参数破浏览器缓存 */
+const avatarVer = ref(0)
+
+function avatarCands(c: Character): string[] {
+  return c.avatar_candidates ?? []
+}
+
+const avatarTotal = computed(() =>
+  cardChar.value ? avatarCands(cardChar.value).length : 0)
+
+const pagedAvatars = computed(() => {
+  if (!cardChar.value) return []
+  const all = avatarCands(cardChar.value)
+  return all.slice((avatarPage.value - 1) * 12, avatarPage.value * 12)
+})
+
+function openAvatarPicker() {
+  const c = cardChar.value
+  if (!c) return
+  pickAvatar.value = c.avatar_path || ''
+  avatarPage.value = 1
+  avatarPickerOpen.value = true
+}
+
+async function applyAvatarPref() {
+  const c = cardChar.value
+  if (!c || !pickAvatar.value) return
+  try {
+    await api.post('/api/current/graph/relations/avatar_pref',
+                   { variable: c.variable, path: pickAvatar.value })
+    avatarPickerOpen.value = false
+    // 局部刷新：URL 版本号破缓存，只重建节点符号（布局/缩放不动）
+    c.avatar_path = pickAvatar.value
+    avatarVer.value = Date.now()
+    if (chart && rebuildNodes) {
+      chart.setOption({ series: [{ data: rebuildNodes(fitScale) }] })
+    }
+  } catch (e) {
+    toastError(message, e)
   }
 }
 
@@ -932,6 +981,7 @@ async function saveAdd() {
       <n-space align="center" justify="space-between" style="width: 100%">
         <n-space align="center">
           <n-text strong style="font-size: 15px">人物关系图谱</n-text>
+          <n-tag size="small" type="warning">实验功能</n-tag>
           <n-text v-if="data" depth="3" style="font-size: 12px">
             {{ visibleRelations.length }} / {{ data.relations.length }} 条关系
           </n-text>
@@ -995,8 +1045,13 @@ async function saveAdd() {
         <n-space vertical size="medium">
           <div style="text-align: center">
             <img v-if="cardChar.has_avatar"
-                 :src="`/api/current/graph/avatar/${encodeURIComponent(cardChar.key)}`"
+                 :src="`/api/current/graph/avatar/${encodeURIComponent(cardChar.key)}?v=${avatarVer}`"
                  class="card-avatar" :alt="cardChar.display_name" />
+            <div v-if="avatarCands(cardChar).length" style="margin-top: 8px">
+              <n-button size="tiny" @click="openAvatarPicker">
+                更换立绘
+              </n-button>
+            </div>
           </div>
           <n-space>
             <n-tag v-if="cardChar.key === protagonistKey" type="warning"
@@ -1041,6 +1096,31 @@ async function saveAdd() {
         </n-space>
       </n-drawer-content>
     </n-drawer>
+
+    <!-- 立绘候选选择（随用随调，关闭即销毁） -->
+    <n-modal v-model:show="avatarPickerOpen" preset="card" title="更换立绘"
+             style="width: 560px">
+      <div class="avatar-grid picker">
+        <img v-for="p in pagedAvatars" :key="p"
+             :src="`/api/current/graph/avatar_circle/${encodeURIComponent(cardChar?.key || '')}?path=${encodeURIComponent(p)}`"
+             loading="lazy" class="avatar-cand"
+             :class="{ active: p === pickAvatar }"
+             alt="候选"
+             @click="pickAvatar = p" />
+      </div>
+      <n-space justify="space-between" align="center" style="margin-top: 12px">
+        <n-pagination v-if="avatarTotal > 12"
+                      v-model:page="avatarPage" :page-size="12"
+                      :item-count="avatarTotal" />
+        <n-space justify="end" style="flex: 1">
+          <n-button @click="avatarPickerOpen = false">取消</n-button>
+          <n-button type="primary" :disabled="!pickAvatar"
+                    @click="applyAvatarPref">
+            确定
+          </n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
 
     <!-- 边编辑抽屉 -->
     <n-drawer v-model:show="drawerOpen" :width="340">
@@ -1177,6 +1257,25 @@ async function saveAdd() {
   object-position: top;
   border-radius: 8px;
   background: #2a2a30;
+}
+.avatar-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 6px;
+}
+.avatar-cand {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  object-position: top;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  background: #1c1c20;
+}
+.avatar-cand.active {
+  border-color: var(--gt-primary, #34d399);
 }
 .rel-row {
   display: flex;

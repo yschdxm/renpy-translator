@@ -6,8 +6,9 @@
  *  默认全部收起，点卡片右侧 + 逐级展开分支 */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  NButton, NCard, NDrawer, NDrawerContent, NEmpty, NInput, NProgress,
-  NSelect, NSpace, NSpin, NStatistic, NSwitch, NTag, NText, useMessage,
+  NButton, NCard, NDrawer, NDrawerContent, NEmpty, NInput, NPagination,
+  NModal, NProgress, NSelect, NSpace, NSpin, NStatistic, NSwitch, NTag,
+  NText, useMessage,
 } from 'naive-ui'
 import { PlayOutline, RefreshOutline } from '@vicons/ionicons5'
 import * as echarts from 'echarts'
@@ -31,6 +32,7 @@ interface ApiScene {
   translated_count: number
   tl_total: number
   thumb_file: string
+  thumbs_json: string
   is_entry: number
   is_ending: number
   is_return: number
@@ -83,12 +85,22 @@ interface NodeItem {
 }
 
 const UNRESOLVED_ID = '__unresolved__'
-const CARD_W = 202
-const CARD_H_THUMB = 196
-const CARD_H_PLAIN = 88
-/** 缩略图画幅（数据单位）：与 graph_cache 960x540 同比例 */
-const THUMB_W = 202
-const THUMB_H = 111
+const CARD_W = 192
+/** 卡片画幅与缩略图严格同比例（960:540 = 16:9），无图卡片同幅。
+ *  比例必须精确一致：缩略图等比贴合，圆角才不会因拉伸变形 */
+const THUMB_W = 192
+const THUMB_H = 108
+const CARD_H_PLAIN = THUMB_H
+/** 卡片描边/圆角（屏幕像素，恒定——不随节点数量/缩放倍率变化） */
+const CARD_BORDER = 1.5
+const CARD_BORDER_EMPH = 2.5
+/** 圆角矩形 path（192×108 viewBox）。ECharts 的 rect 符号不渲染
+ *  itemStyle.borderRadius、roundRect 符号圆角按尺寸比例过大——只能把圆角
+ *  画进路径；路径随 symbolSize 等比缩放，圆角永远保持正圆。
+ *  圆角比例 = 缩略图烘入的 26px/960 → 192 视箱上为 5.2，二者永远重合 */
+const ROUND_RECT_PATH = 'path://M5.2,0 L186.8,0 A5.2,5.2 0 0 1 192,5.2 '
+  + 'L192,102.8 A5.2,5.2 0 0 1 186.8,108 L5.2,108 A5.2,5.2 0 0 1 0,102.8 '
+  + 'L0,5.2 A5.2,5.2 0 0 1 5.2,0 Z'
 /** 展开圆点距卡片右缘的间距（数据单位） */
 const DOT_GAP = 16
 
@@ -123,10 +135,10 @@ async function load() {
   }
 }
 
-async function build() {
+async function build(incremental: boolean) {
   try {
     const d = await api.post<{ job_id: string }>(
-      '/api/current/graph/story/build')
+      '/api/current/graph/story/build', { incremental })
     jobsStore.track(d.job_id)
   } catch (e) {
     toastError(message, e)
@@ -398,42 +410,44 @@ function calibrateSizes() {
   const f = effectiveScale() / currentZoom()
   if (Math.abs(f - fitScale) / Math.max(fitScale, 1e-6) > 0.03) {
     fitScale = f
-    chart.setOption({
-      series: [{
-        data: [
-          ...nodeList.map((n) => nodeDatum(n, fitScale)),
-          ...nodeList.filter((n) => n.expandCount > 0)
-            .map((n) => dotDatum(n, fitScale)),
-          ...edgeLabelNodes,
-        ],
-      }],
-    })
+    chart.setOption({ series: [{ data: allNodeData() }] })
   }
 }
 
+/** series.data 全量组装（边框覆盖节点画在缩略图之后=上层） */
+function allNodeData(): any[] {
+  return [
+    ...nodeList.map((n) => nodeDatum(n, fitScale)),
+    ...nodeList.filter((n) => n.thumbUrl).map((n) => frameDatum(n, fitScale)),
+    ...nodeList.filter((n) => n.expandCount > 0 || n.expanded)
+      .map((n) => dotDatum(n, fitScale)),
+    ...edgeLabelNodes,
+  ]
+}
+
 /** 节点 datum（symbolSize × fitScale 后与 dagre 间距严格一致，
- *  roam zoom 时 echarts 原生按比例整体缩放，连线永不分离） */
+ *  roam zoom 时 echarts 原生按比例整体缩放，连线永不分离。
+ *  无图卡片 = 圆角 path 符号（含描边）；缩略图卡片 = image 符号 +
+ *  上层圆角描边覆盖节点（image symbol 不渲染 itemStyle 边框）。
+ *  path 符号的描边按本地像素渲染不随缩放（宽度恒定），圆角随路径
+ *  等比缩放（保持正圆且与卡片同比） */
 function nodeDatum(n: NodeItem, f: number): any {
-  const borderColor = n.unresolved ? GT.error
-    : n.isEntry ? GT.primary
-    : n.isEnding ? '#b8860b'
-    : n.progress >= 100 ? GT.primary
-    : n.progress > 0 ? GT.warning : GT.border
   return {
     id: n.id,
     name: n.unresolved ? '未决跳转' : n.title,
     x: n.x,
     y: n.y,
-    symbol: n.thumbUrl ? `image://${n.thumbUrl}` : 'roundRect',
+    symbol: n.thumbUrl ? `image://${n.thumbUrl}` : ROUND_RECT_PATH,
     symbolSize: n.thumbUrl
       ? [THUMB_W * f, THUMB_H * f]
-      : [CARD_W * f, (n.unresolved ? 40 : CARD_H_PLAIN) * 0.7 * f],
-    itemStyle: {
-      color: n.thumbUrl ? undefined : GT.card,
-      borderColor,
-      borderWidth: (n.isEntry || n.isEnding ? 2.5 : 1.5) * Math.max(f, 0.5),
-      borderRadius: 6 * f,
-    },
+      : [CARD_W * f, (n.unresolved ? THUMB_H : CARD_H_PLAIN) * f],
+    itemStyle: n.thumbUrl
+      ? undefined
+      : {
+          color: GT.card,
+          borderColor: borderColorOf(n),
+          borderWidth: borderWidthOf(n),
+        },
     label: {
       show: true,
       position: 'bottom' as const,
@@ -442,6 +456,39 @@ function nodeDatum(n: NodeItem, f: number): any {
       fontWeight: n.isEntry || n.isEnding ? 600 : 400,
       formatter: (p: any) => truncate(p.name, 18),
     },
+  }
+}
+
+function borderColorOf(n: NodeItem): string {
+  return n.unresolved ? GT.error
+    : n.isEntry ? GT.primary
+    : n.isEnding ? '#b8860b'
+    : n.progress >= 100 ? GT.primary
+    : n.progress > 0 ? GT.warning : GT.border
+}
+
+function borderWidthOf(n: NodeItem): number {
+  return n.isEntry || n.isEnding || n.unresolved
+    ? CARD_BORDER_EMPH : CARD_BORDER
+}
+
+/** 缩略图边框覆盖节点：透明填充 + 圆角描边盖在图上（上层）
+ *  （image symbol 不渲染 itemStyle 边框/圆角，只能叠加实现） */
+function frameDatum(n: NodeItem, f: number): any {
+  return {
+    id: `__frame_${n.id}`,
+    name: '',
+    x: n.x,
+    y: n.y,
+    symbol: ROUND_RECT_PATH,
+    symbolSize: [THUMB_W * f, THUMB_H * f],
+    itemStyle: {
+      color: 'rgba(0,0,0,0)',
+      borderColor: borderColorOf(n),
+      borderWidth: borderWidthOf(n),
+    },
+    silent: true,
+    emphasis: { disabled: true },
   }
 }
 
@@ -510,10 +557,13 @@ async function buildRenderData(): Promise<void> {
   for (const s of visible.values()) {
     const outEdges = (outMap.value.get(s.scene_id) ?? [])
       .filter((e) => !e.unresolved && sceneById.value.has(e.target))
+    // 展开按钮只在有可展开的新子节点时显示：回流边（call 返回/回主界面）
+    // 指向的是已可见的祖先，展开它没有新内容，不应出现 + 按钮
+    const newChildren = outEdges.filter((e) => !visible.has(e.target))
     nodes.push({
       id: s.scene_id,
       x: 0, y: 0,
-      h: s.thumb_file ? CARD_H_THUMB : CARD_H_PLAIN,
+      h: THUMB_H,
       title: s.title || s.scene_id,
       summary: s.summary,
       thumbUrl: s.thumb_file
@@ -524,7 +574,7 @@ async function buildRenderData(): Promise<void> {
       speakers: speakersOf(s),
       isEntry: !!s.is_entry,
       isEnding: !!s.is_ending,
-      expandCount: outEdges.length,
+      expandCount: newChildren.length,
       expanded: expanded.value.has(s.scene_id),
       unresolved: false,
     })
@@ -651,7 +701,7 @@ function fitTarget(): { cx: number; cy: number; s0: number } | null {
   const xs = nodeList.map((n) => n.x)
   const ys = nodeList.map((n) => n.y)
   const spanX = Math.max(...xs) - Math.min(...xs) + CARD_W + 120
-  const spanY = Math.max(...ys) - Math.min(...ys) + CARD_H_THUMB + 160
+  const spanY = Math.max(...ys) - Math.min(...ys) + THUMB_H + 160
   const rect = chart.getDom().getBoundingClientRect()
   const s0 = Math.min(
     1.2, rect.width / Math.max(spanX, 1), rect.height / Math.max(spanY, 1))
@@ -709,30 +759,37 @@ function syncMinimapView() {
 
 /** 悬浮放大的节点元素（纯 transform 倍率，与 zoom/fitScale 无关） */
 const HOT_SCALE = 1.15
-let hotEl: any = null
+let hotEls: any[] = []
+let hotCardId: string | null = null
 
-/** 设置/取消悬浮放大（只改元素 transform，不碰样式与状态机） */
+/** 设置/取消悬浮放大（只改元素 transform，不碰样式与状态机；
+ *  缩略图卡片连边框覆盖节点一起缩放） */
 function setHotNode(id: string | null) {
   const graph = (chart as any)?.getModel?.()
     ?.getSeriesByIndex(0)?.getGraph?.()
   if (!graph) return
-  let el: any = null
+  const els: any[] = []
   if (id !== null) {
     graph.eachNode((gn: any) => {
-      if (!el && String(gn.id) === id) el = gn.getGraphicEl?.() ?? null
+      const gid = String(gn.id)
+      if (gid === id || gid === `__frame_${id}`) {
+        const el = gn.getGraphicEl?.()
+        if (el) els.push(el)
+      }
     })
   }
-  if (hotEl === el) return
-  if (hotEl) {
-    hotEl.attr({
-      scaleX: hotEl.scaleX / HOT_SCALE,
-      scaleY: hotEl.scaleY / HOT_SCALE,
+  if (hotEls.length === els.length && hotCardId === id
+      && hotEls.every((e, i) => e === els[i])) return
+  for (const el of hotEls) {
+    el.attr({
+      scaleX: el.scaleX / HOT_SCALE,
+      scaleY: el.scaleY / HOT_SCALE,
     })
-    hotEl = null
   }
-  if (el) {
+  hotEls = els
+  hotCardId = id
+  for (const el of hotEls) {
     el.attr({ scaleX: el.scaleX * HOT_SCALE, scaleY: el.scaleY * HOT_SCALE })
-    hotEl = el
   }
 }
 
@@ -753,7 +810,7 @@ async function renderGraphInner() {
     chart.on('dblclick', (p: any) => {
       if (p.dataType !== 'node') return
       const n = nodeList.find((x) => x.id === p.data?.id)
-      if (n && n.expandCount > 0) toggleExpand(n.id)
+      if (n && (n.expandCount > 0 || n.expanded)) toggleExpand(n.id)
     })
     chart.on('graphroam', () => {
       syncMinimapView()
@@ -766,9 +823,15 @@ async function renderGraphInner() {
     // 这个倍率在任何缩放级别下都是恒定的 1.15×
     chart.on('mouseover', (p: any) => {
       if (p.dataType !== 'node' || !p.data?.id || p.data.nodeId) return
-      setHotNode(p.data.id)
+      const id = cardIdOf(p.data.id)
+      if (id) setHotNode(id)
     })
-    chart.on('mouseout', () => setHotNode(null))
+    chart.on('mouseout', (p: any) => {
+      // 只在离开当前悬浮卡本体时复位：同卡内 image↔边框移动会先
+      // 触发 mouseout 再触发 mouseover，复位后立即恢复，无残留
+      const id = cardIdOf(p.data?.id)
+      if (!hotCardId || id === hotCardId) setHotNode(null)
+    })
     chart.on('globalout', () => setHotNode(null))
     ;(window as any).__chart = chart
     ;(window as any).__toggleExpand = toggleExpand
@@ -817,12 +880,7 @@ async function renderGraphInner() {
       scaleLimit: { min: 0.01, max: 400 },
       // 符号随 zoom 等比缩放（默认 0.6 会让卡片尺寸与连线间距脱钩）
       nodeScaleRatio: 1,
-      data: [
-        ...nodeList.map((n) => nodeDatum(n, fitScale)),
-        ...nodeList.filter((n) => n.expandCount > 0)
-          .map((n) => dotDatum(n, fitScale)),
-        ...edgeLabelNodes,
-      ],
+      data: allNodeData(),
       links: linkList,
       edgeSymbol: ['none', 'arrow'],
       edgeSymbolSize: 7,
@@ -885,6 +943,13 @@ async function renderGraphInner() {
 }
 
 /** 点击：圆点（带 nodeId 的节点）→ 展开/收起；卡片节点 → 详情抽屉 */
+/** 命中元素 → 所属卡片 id：边框覆盖节点视为卡片本体（二者一体，
+ *  事件/悬浮/点击都归到卡片，避免分离缩放和点击失效） */
+function cardIdOf(rawId: string | undefined): string | null {
+  if (!rawId) return null
+  return rawId.startsWith('__frame_') ? rawId.slice('__frame_'.length) : rawId
+}
+
 function onChartClick(params: any) {
   if (params.dataType !== 'node') return
   const dotId = params.data?.nodeId
@@ -892,7 +957,8 @@ function onChartClick(params: any) {
     toggleExpand(dotId)
     return
   }
-  const n = nodeList.find((x) => x.id === params.data?.id)
+  const id = cardIdOf(params.data?.id)
+  const n = nodeList.find((x) => x.id === id)
   if (!n || n.unresolved) return
   openScene(n.id)
 }
@@ -968,6 +1034,62 @@ const selectedProgress = computed(() => {
   return Math.round(100 * s.translated_count / s.tl_total)
 })
 
+// ---- 手动更换缩略图（模态框随用随调，关闭即销毁） ----
+const pickerOpen = ref(false)
+const pickThumb = ref('')
+const pickPage = ref(1)
+
+function sceneThumbs(s: ApiScene): string[] {
+  return parseJson(s.thumbs_json)
+}
+
+/** 自动选择的缩略图（候选首个；无候选返回 ''） */
+function autoThumb(s: ApiScene): string {
+  return sceneThumbs(s)[0] ?? ''
+}
+
+const pickTotal = computed(() =>
+  selected.value ? sceneThumbs(selected.value).length : 0)
+
+const pagedThumbs = computed(() => {
+  if (!selected.value) return []
+  const all = sceneThumbs(selected.value)
+  return all.slice((pickPage.value - 1) * 9, pickPage.value * 9)
+})
+
+function openThumbPicker() {
+  const s = selected.value
+  if (!s) return
+  pickThumb.value = s.thumb_file
+  pickPage.value = 1
+  pickerOpen.value = true
+}
+
+async function applyThumb() {
+  const s = selected.value
+  if (!s || !pickThumb.value) return
+  await setSceneThumb(s, pickThumb.value)
+  pickerOpen.value = false
+}
+
+async function setSceneThumb(s: ApiScene, file: string) {
+  try {
+    await api.post('/api/current/graph/story/thumb_pref',
+                   { scene_id: s.scene_id, file })
+    s.thumb_file = file || autoThumb(s)  // 空 = 恢复自动
+    // 图局部刷新：只更新该节点的缩略图，不重排版（保持当前缩放/平移）
+    const n = nodeList.find((x) => x.id === s.scene_id)
+    if (n && chart) {
+      n.thumbUrl = s.thumb_file
+        ? `/api/current/graph/story/thumb/${encodeURIComponent(s.thumb_file)}`
+        : ''
+      chart.setOption({ series: [{ data: allNodeData() }] })
+    }
+  } catch (e) {
+    toastError(message, e)
+  }
+}
+
 function speakersOfFull(s: ApiScene) {
   return parseJson(s.speakers_json).map((v) => ({
     variable: v,
@@ -983,6 +1105,7 @@ function speakersOfFull(s: ApiScene) {
       <n-space align="center" justify="space-between" style="width: 100%">
         <n-space align="center">
           <n-text strong style="font-size: 15px">剧情分支图</n-text>
+          <n-tag size="small" type="warning">实验功能</n-tag>
           <template v-if="hasGraph && data">
             <n-statistic label="场景" :value="data.scenes.length" />
             <n-statistic label="结局" :value="endings.length" />
@@ -1011,8 +1134,12 @@ function speakersOfFull(s: ApiScene) {
             </n-switch>
           </template>
           <n-button size="small" :render-icon="renderIcon(RefreshOutline)"
-                    @click="build">
+                    @click="build(false)">
             {{ hasGraph ? '重新构建' : '构建剧情图' }}
+          </n-button>
+          <n-button v-if="hasGraph" size="small" quaternary
+                    @click="build(true)">
+            增量更新
           </n-button>
         </n-space>
       </n-space>
@@ -1024,7 +1151,7 @@ function speakersOfFull(s: ApiScene) {
         <n-empty description="尚未构建剧情图">
           <template #extra>
             <n-button type="primary" :render-icon="renderIcon(PlayOutline)"
-                      @click="build">
+                      @click="build(false)">
               构建剧情图
             </n-button>
           </template>
@@ -1038,9 +1165,30 @@ function speakersOfFull(s: ApiScene) {
       <n-drawer-content v-if="selected" closable
                         :title="selected.title || selected.scene_id">
         <n-space vertical size="medium">
-          <img v-if="selected.thumb_file"
-               :src="`/api/current/graph/story/thumb/${encodeURIComponent(selected.thumb_file)}`"
-               style="width: 100%; border-radius: 6px" alt="场景" />
+          <div>
+            <img v-if="selected.thumb_file"
+                 :src="`/api/current/graph/story/thumb/${encodeURIComponent(selected.thumb_file)}`"
+                 style="width: 100%; border-radius: 6px" alt="场景" />
+            <n-space justify="space-between" align="center"
+                     style="margin-top: 6px">
+              <n-text depth="2" style="font-size: 12px">
+                {{ sceneThumbs(selected).length
+                  ? `候选画面 ${sceneThumbs(selected).length} 张`
+                  : '该场景没有可解析的画面语句' }}
+              </n-text>
+              <n-space size="small">
+                <n-button v-if="selected.thumb_file !== autoThumb(selected)"
+                          quaternary size="tiny"
+                          @click="setSceneThumb(selected, '')">
+                  恢复自动
+                </n-button>
+                <n-button v-if="sceneThumbs(selected).length" size="tiny"
+                          @click="openThumbPicker">
+                  更换缩略图
+                </n-button>
+              </n-space>
+            </n-space>
+          </div>
           <n-space>
             <n-tag v-if="selected.is_entry" type="success" size="small">入口</n-tag>
             <n-tag v-if="selected.is_ending" type="warning" size="small">结局</n-tag>
@@ -1116,6 +1264,31 @@ function speakersOfFull(s: ApiScene) {
         </n-space>
       </n-drawer-content>
     </n-drawer>
+
+    <!-- 缩略图候选选择（随用随调，关闭即销毁） -->
+    <n-modal v-model:show="pickerOpen" preset="card" title="更换缩略图"
+             style="width: 760px">
+      <div class="thumb-grid picker">
+        <img v-for="f in pagedThumbs" :key="f"
+             :src="`/api/current/graph/story/thumb/${encodeURIComponent(f)}`"
+             loading="lazy" class="thumb-cand"
+             :class="{ active: f === pickThumb }"
+             alt="候选"
+             @click="pickThumb = f" />
+      </div>
+      <n-space justify="space-between" align="center" style="margin-top: 12px">
+        <n-pagination v-if="pickTotal > 9"
+                      v-model:page="pickPage" :page-size="9"
+                      :item-count="pickTotal" />
+        <n-space justify="end" style="flex: 1">
+          <n-button @click="pickerOpen = false">取消</n-button>
+          <n-button type="primary" :disabled="!pickThumb"
+                    @click="applyThumb">
+            确定
+          </n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
   </div>
 </template>
 
@@ -1153,6 +1326,24 @@ function speakersOfFull(s: ApiScene) {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 6px;
+}
+.thumb-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 6px;
+}
+.thumb-cand {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  background: #1c1c20;
+}
+.thumb-cand.active {
+  border-color: var(--gt-primary, #34d399);
 }
 .speaker {
   display: inline-flex;

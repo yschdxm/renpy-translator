@@ -49,6 +49,7 @@ class StoryNode:
     has_return: bool = False
     is_terminal: bool = False  # 出度为 0（解析完成后回填）
     thumb_file: str = ''       # 场景缩略图文件名（构建管线回填）
+    thumb_files: list = field(default_factory=list)  # 候选缩略图（构建回填）
 
 
 @dataclass
@@ -63,6 +64,9 @@ class StoryEdge:
     expr: str = ''             # 动态跳转表达式（target 为 None 时）
     implicit: bool = False     # 隐式 fall-through 边（label 体无 jump/return
                                # 结尾时流入同文件下一个 label，Ren'Py 语义）
+    via_screen: bool = False   # 源自 show screen 的界面按钮（环境屏幕被滤除，
+                               # 见 _filter_screen_edges）
+    screen: str = ''           # via_screen 边的来源 screen 名
     line: int = 0              # 语句所在行号（源文件内）
 
 
@@ -81,7 +85,24 @@ _ELSE_RE = re.compile(r'^else\s*:')
 _SCENE_RE = re.compile(r'^scene\s+(.+)$')
 _SHOW_RE = re.compile(r'^show\s+(.+)$')
 _HIDE_RE = re.compile(r'^hide\s+(.+)$')
-_RENPY_PY_RE = re.compile(r'^\$\s*renpy\.(jump|call)\s*\(\s*(.+?)\s*\)')
+_RENPY_PY_RE = re.compile(
+    r'^\$\s*renpy\.(jump|call|call_screen|show_screen)\s*\(\s*(.+?)\s*\)')
+# $ renpy.show("tag", what = bg_manager.background("Name"), ...) —— Python
+# 式 show（沙盒游戏的背景引用多走这种，不走 scene/show 语句）
+_RENPY_SHOW_RE = re.compile(r'^\$\s*renpy\.show\s*\(')
+_SHOW_WHAT_RE = re.compile(r'what\s*=\s*[^,)"]*?["\']([^"\']+)["\']')
+# 地点系统（沙盒游戏）：room 变量 = Room("id", "名称", "Bg_Name", ...)
+# 定义 + $ xxx.change_location(room 变量) 切换 → 合成 scene 快照；
+# 名称参数容忍 _(...) 翻译包裹（_("Living Room") 形式常见）
+_ROOM_DEF_RE = re.compile(
+    r'(\w+)\s*=\s*Room\s*\(\s*_?\(?\s*["\'][^"\']*["\']\s*\)?'
+    r'\s*,\s*_?\(?\s*["\'][^"\']*["\']\s*\)?\s*,\s*["\']([^"\']+)["\']')
+_CHANGE_LOC_RE = re.compile(r'\.change_location\s*\(\s*(\w+)')
+# 注册池：构造器参数里恰好是 label 名的字符串（沙盒游戏的
+# Action("名称", 需求, "effect_label") / Crisis(...) 事件注册，
+# 含 xxx_list.append(Action(...)) 形式），供 .effect 派发展开；
+# 只排除控制流/查询行（字符串最终按 label 名过滤，误收无害）
+_POOL_EXCLUDE_RE = re.compile(r'jump|call|seen_label|has_label|renpy\.')
 # 对话：角色 "..."（旁白 "..." 对 speaker 无贡献，但计入台词数）。
 # who 允许带点表达式（mc.name，Lab Rats 2 主角台词全用这种形式）与
 # 图像属性（say 变体：e happy / e @ vhappy / e -concerned，Wartribe、
@@ -115,6 +136,28 @@ _CODE_KEYWORDS = {
     'while', 'for', 'pass', 'init', 'default', 'define', 'transform',
     'screen', 'style', 'python', 'nvl', 'nvl_clear', 'nvl_narrator',
 }
+
+# 事件袋动态跳转的静态恢复：
+#   $ bag.append("label_x") / bag = ["a", "b"]  → 注册表 bag → {候选 label}
+#   $ ev = bag.pop()                            → 别名（label 作用域）ev → bag
+#   $ renpy.jump(ev) / jump expression ev       → 沿别名取袋、注册表展开为多边
+_APPEND_RE = re.compile(r'(\w+)\s*\.\s*(?:append|insert|extend)\s*\(([^)]*)')
+_BAG_LIST_RE = re.compile(r'(\w+)\s*\+?=\s*\[([^\]]*)\]')
+_STRS_RE = re.compile(r'["\'](\w+)["\']')
+# screen 动作里设置的导航变量（SetVariable("nav_screen", "xxx_navigation")）
+# ——跨 label 的 UI 状态，派发 label 处按注册表展开
+_SETVAR_RE = re.compile(
+    r'\bSetVariable\(\s*["\'](\w+)["\']\s*,\s*["\'](\w+)["\']')
+_PY_ASSIGN_RE = re.compile(r'^(?:\$\s*)?(\w+)\s*=\s*(.+?)\s*$')
+_BARE_VAR_RE = re.compile(r'^\w+$')
+_EXPR_POP_RE = re.compile(r'(\w+)\.pop')
+# screen 导航：screen 体内的 Jump("x") / Call("x") 动作 → call screen 的
+# label 连向这些目标（imagemap hotspot / imagebutton / textbutton 通用）
+_SCREEN_RE = re.compile(r'^screen\s+(\w+)')
+_JUMP_ACTION_RE = re.compile(r'\bJump\(\s*["\'](\w+)["\']\s*')
+_CALL_ACTION_RE = re.compile(r'\bCall\(\s*["\'](\w+)["\']\s*')
+_CALL_SCREEN_RE = re.compile(r'^call\s+screen\s+(\w+)')
+_SHOW_SCREEN_RE = re.compile(r'^show\s+screen\s+(\w+)')
 
 
 def _parse_image_spec(rest: str):
@@ -155,17 +198,107 @@ class FlowParser:
     """解析整个游戏源码树，产出剧情图节点与边"""
 
     def __init__(self, game_root: str):
-        # game_root 与 SourceTree 一致：game/game 存在时需由调用方下钻
-        self.tree = SourceTree(game_root)
+        # game_root 与 SourceTree 一致：game/game 存在时需由调用方下钻；
+        # include_renpy_py：事件注册/动态派发常写在 *_ren.py 里（沙盒游戏）
+        self.tree = SourceTree(game_root, include_renpy_py=True)
+        # screen 名 → 体内 Jump/Call 动作引用的 label（跨文件收集，供
+        # call screen 连边）
+        self._screens: dict = {}
+        # 地点系统：room 变量 → 背景图名（change_location 合成 scene 快照）
+        self._rooms: dict = {}
 
     def parse(self) -> dict:
         """返回 {'nodes': list[StoryNode], 'edges': list[StoryEdge]}"""
         nodes = []
         edges = []
+        regs, aliases, pool = self._collect_event_bags()
+        self._collect_screens()
+        self._collect_rooms()
         for rel in self.tree.files():
             self._parse_file(rel, nodes, edges)
-        self._postprocess(nodes, edges)
+        self._postprocess(nodes, edges, regs, aliases, pool)
         return {'nodes': nodes, 'edges': edges}
+
+    # ========== 地点系统收集 ==========
+
+    def _collect_rooms(self):
+        """room 变量 = Room("id", "名称", "Bg_Name", ...) 定义收集"""
+        for rel in self.tree.files():
+            for raw in self.tree.lines(rel):
+                m = _ROOM_DEF_RE.search(raw)
+                if m:
+                    self._rooms.setdefault(m.group(1), m.group(2))
+
+    # ========== screen 导航收集 ==========
+
+    def _collect_screens(self):
+        """先于边解析扫全项目 screen 定义（call screen 可以前向引用）"""
+        for rel in self.tree.files():
+            cur = ''
+            for raw in self.tree.lines(rel):
+                s = raw.strip()
+                if not s or s.startswith('#'):
+                    continue
+                indent = len(raw) - len(raw.lstrip())
+                if indent == 0:
+                    m = _SCREEN_RE.match(s)
+                    cur = m.group(1) if m else ''
+                    continue
+                if not cur:
+                    continue
+                for lit in _JUMP_ACTION_RE.findall(s):
+                    self._screens.setdefault(cur, set()).add(lit)
+                for lit in _CALL_ACTION_RE.findall(s):
+                    self._screens.setdefault(cur, set()).add(lit)
+
+    # ========== 事件袋收集 ==========
+
+    def _collect_event_bags(self) -> tuple[dict, list, set]:
+        """全项目扫描事件袋注册、跳转变量赋值与 Action 注册池
+
+        返回 (regs, aliases, pool)：
+        - regs: {袋名: set(字符串字面量)}——解析后只保留能对上 label 的
+        - aliases: [(file, label, line, var, rhs)]——`$ var = ...` 且右值
+          含 .pop( 或字符串字面量的赋值点；解析时按位置就近取
+        - pool: set(字符串字面量)——构造器参数中可能是 label 名的字符串
+          （Action/Crisis 等事件注册），供 `.effect` 派发展开
+        """
+        regs: dict = {}
+        aliases: list = []
+        pool: set = set()
+        for rel in self.tree.files():
+            cur_label = ''
+            for no, raw in enumerate(self.tree.lines(rel), 1):
+                s = raw.strip()
+                if not s or s.startswith('#'):
+                    continue
+                indent = len(raw) - len(raw.lstrip())
+                lm = _LABEL_RE.match(s)
+                if lm and indent == 0:
+                    cur_label = lm.group(1)
+                    continue
+                m = _APPEND_RE.search(s)
+                if m:
+                    for lit in _STRS_RE.findall(m.group(2)):
+                        regs.setdefault(m.group(1), set()).add(lit)
+                    continue
+                m = _BAG_LIST_RE.search(s)
+                if m:
+                    for lit in _STRS_RE.findall(m.group(2)):
+                        regs.setdefault(m.group(1), set()).add(lit)
+                    continue
+                for var, lit in _SETVAR_RE.findall(s):
+                    regs.setdefault(var, set()).add(lit)
+                m = _PY_ASSIGN_RE.match(s)
+                if m and cur_label and indent > 0:
+                    rhs = m.group(2)
+                    if ('.pop(' in rhs or _STRS_RE.search(rhs)
+                            or _BARE_VAR_RE.match(rhs)):
+                        aliases.append((rel, cur_label, no, m.group(1), rhs))
+                # 注册池：构造器调用参数中的字符串（非控制流/查询行）
+                if '(' in s and not _POOL_EXCLUDE_RE.search(s):
+                    pool.update(_STRS_RE.findall(s))
+        return regs, aliases, pool
 
     # ========== 单文件解析 ==========
 
@@ -182,6 +315,7 @@ class FlowParser:
         menu_seq = 0          # menu 序号（label 内唯一）
         last_base_menu = 0    # 最后一条基准 menu 的序号
         opt_records: dict = {}  # id(option ctx entry) -> {'menu_seq','last'}
+        cur_screen = ''       # 正在收集体内的 screen 名（'' = 不在 screen 里）
         mono_q = None         # 跨行 monologue 三引号块的闭合 token（None=不在块内）
 
         def close_node(end_line: int):
@@ -226,12 +360,23 @@ class FlowParser:
             while ctx and indent <= ctx[-1][0]:
                 ctx.pop()
 
+            # screen 体内（缩进 > 0）：收集 Jump/Call 动作引用的 label
+            if cur_screen and indent > 0:
+                for lit in _JUMP_ACTION_RE.findall(stripped):
+                    self._screens.setdefault(cur_screen, set()).add(lit)
+                for lit in _CALL_ACTION_RE.findall(stripped):
+                    self._screens.setdefault(cur_screen, set()).add(lit)
+                continue
+
             # 顶层（indent 0）非 label 语句：label 体结束
             if indent == 0 and not stripped.startswith('label '):
                 if node is not None:
                     close_node(idx - 1)
                 node = None
                 ctx.clear()
+                # screen 定义开始：后续缩进体内收集导航动作
+                m = _SCREEN_RE.match(stripped)
+                cur_screen = m.group(1) if m else ''
                 # 顶层语句本身无需处理（image 定义由场景合成器扫描）
                 continue
 
@@ -243,6 +388,7 @@ class FlowParser:
                                  is_entry=(m.group(1) == 'start'))
                 nodes.append(node)
                 ctx.clear()
+                cur_screen = ''
                 continue
             if node is None:
                 continue
@@ -282,6 +428,54 @@ class FlowParser:
                 continue
 
             # ---- 跳转/调用 ----
+            # $ xxx.change_location(room)：地点系统切背景 → scene 快照
+            cm = _CHANGE_LOC_RE.search(stripped)
+            if cm and cm.group(1) in self._rooms:
+                node.scene_ops.append(
+                    SceneOp(idx, 'scene', [self._rooms[cm.group(1)]], []))
+                touch_option('other')
+                if indent <= body_indent:
+                    last_base_stmt = 'other'
+                continue
+            # $ renpy.show("tag", what = xxx("Name"), ...)：Python 式背景
+            # 引用（沙盒游戏常见），提取 what 里的图名作为 show 快照
+            if _RENPY_SHOW_RE.match(stripped):
+                wm = _SHOW_WHAT_RE.search(stripped)
+                if wm:
+                    node.scene_ops.append(
+                        SceneOp(idx, 'show', [wm.group(1)], []))
+                touch_option('other')
+                if indent <= body_indent:
+                    last_base_stmt = 'other'
+                continue
+            # call screen：连向 screen 体内 Jump/Call 动作引用的 label
+            #（screen 返回后流程继续，不影响 fall-through）
+            m = _CALL_SCREEN_RE.match(stripped)
+            if m and self._screens.get(m.group(1)):
+                branch, text = FlowParser._branch_of(ctx)
+                for t in sorted(self._screens[m.group(1)]):
+                    edges.append(StoryEdge(source=node.label, target=t,
+                                           kind='jump', branch=branch,
+                                           text=text, screen=m.group(1),
+                                           line=idx))
+                touch_option('other')
+                if indent <= body_indent:
+                    last_base_stmt = 'other'
+                continue
+            # show screen：常驻界面按钮（HUD/小游戏操作盘）。边先生成，
+            # 后处理滤除环境屏幕（被海量 label show 的 HUD）
+            m = _SHOW_SCREEN_RE.match(stripped)
+            if m and self._screens.get(m.group(1)):
+                branch, text = FlowParser._branch_of(ctx)
+                for t in sorted(self._screens[m.group(1)]):
+                    edges.append(StoryEdge(source=node.label, target=t,
+                                           kind='jump', branch=branch,
+                                           text=text, via_screen=True,
+                                           screen=m.group(1), line=idx))
+                touch_option('other')
+                if indent <= body_indent:
+                    last_base_stmt = 'other'
+                continue
             edge = self._match_flow(stripped, node.label, idx, ctx)
             if edge is not None:
                 edges.append(edge)
@@ -323,6 +517,7 @@ class FlowParser:
                     last_base_stmt = 'other'
                 continue
 
+            # ---- 对话（speaker 与台词数）----
             m3 = _MONO_RE.match(stripped)
             if m3 and m3.group(1).lower() not in _CODE_KEYWORDS:
                 q = m3.group(3)
@@ -343,8 +538,6 @@ class FlowParser:
                 if indent <= body_indent:
                     last_base_stmt = 'other'
                 continue
-
-            # ---- 对话（speaker 与台词数）----
             m = _CHAR_DLG_RE.match(stripped)
             if m and m.group(1).lower() not in _CODE_KEYWORDS:
                 # 归一为根标识符：mc.name "..." 的说话人本体是 mc，
@@ -400,10 +593,23 @@ class FlowParser:
             node.first_dlg_line = line
         node.last_dlg_line = line
 
+    @staticmethod
+    def _branch_of(ctx: list) -> tuple:
+        """分支归属：最近的 menu 选项优先，其次 if 条件"""
+        branch, text = '', ''
+        for _, ckind, ctext, _ in reversed(ctx):
+            if ckind == 'option':
+                branch, text = 'menu', ctext
+                break
+            if ckind == 'cond' and not branch:
+                branch, text = 'condition', ctext
+        return branch, text
+
     def _match_flow(self, stripped: str, source: str, line: int,
                     ctx: list) -> Optional[StoryEdge]:
         """匹配 jump/call（含 expression 与 $ renpy.xxx），挂上分支上下文"""
         kind = target = expr = None
+        fn = ''
 
         m = _JUMP_EXPR_RE.match(stripped)
         if m:
@@ -423,8 +629,11 @@ class FlowParser:
         if kind is None:
             m = _RENPY_PY_RE.match(stripped)
             if m:
-                kind = m.group(1)
-                arg = m.group(2)
+                fn, arg = m.group(1), m.group(2)
+                # call_screen 语义同 call（返回后继续）；show_screen 为
+                # 常驻界面按钮（经环境屏幕过滤）
+                kind = {'jump': 'jump', 'call': 'call',
+                        'call_screen': 'call', 'show_screen': 'jump'}[fn]
                 q = re.match(r'^["\'](\w+)["\']$', arg)
                 if q:
                     target = q.group(1)
@@ -434,21 +643,18 @@ class FlowParser:
             return None
 
         # 分支归属：最近的 menu 选项优先，其次 if 条件
-        branch, text = '', ''
-        for _, ckind, ctext, _ in reversed(ctx):
-            if ckind == 'option':
-                branch, text = 'menu', ctext
-                break
-            if ckind == 'cond' and not branch:
-                branch, text = 'condition', ctext
+        branch, text = FlowParser._branch_of(ctx)
         return StoryEdge(source=source, target=target, kind=kind,
-                         branch=branch, text=text, expr=expr or '', line=line)
+                         branch=branch, text=text, expr=expr or '',
+                         via_screen=(fn == 'show_screen') if fn else False,
+                         screen=target or '', line=line)
 
     # ========== 后处理 ==========
 
-    @staticmethod
-    def _postprocess(nodes: list, edges: list):
-        """回填 terminal 标记、按 source/target/branch/text/line 去重边"""
+    def _postprocess(self, nodes: list, edges: list, regs: dict,
+                     aliases: list, pool: set):
+        """回填 terminal 标记、按 source/target/branch/text/line 去重边、
+        用事件袋注册表展开动态跳转"""
         seen = set()
         deduped = []
         for e in edges:
@@ -459,8 +665,236 @@ class FlowParser:
             deduped.append(e)
 
         known = {n.label for n in nodes}
+        FlowParser._resolve_dynamic(nodes, deduped, regs, aliases, known,
+                                    self._screens, pool)
+        FlowParser._expand_screen_targets(deduped, self._screens, known)
+        FlowParser._filter_screen_edges(deduped)
+
+
         out_labels = {e.source for e in deduped if e.target}
         for n in nodes:
             n.is_terminal = n.label not in out_labels
         # 目标指向不存在 label 的边保留（前端可标"外部/缺失"），不强行清除
         edges[:] = deduped
+
+    @staticmethod
+    def _filter_screen_edges(edges: list):
+        """screen 边的两级过滤
+
+        1. show screen（via_screen）候选边滤除"环境屏幕"：HUD 等常驻界面
+           被几乎所有 label show，全连会淹没剧情图；内容界面（小游戏
+           操作盘、事件按钮盘）只被少数 label show，保留
+        2. call screen 边折叠"hub 界面"：被 >30 个 label 调用的导航界面，
+           只保留代表调用方（行号最小）的边——可达性不变，但不会产生
+           "每个 label × 每个界面目标"的毛线团
+        """
+        by_screen: dict = {}
+        for e in edges:
+            if e.via_screen and e.target is not None:
+                by_screen.setdefault(e.screen, set()).add(e.source)
+        ambient = {s for s, labels in by_screen.items() if len(labels) > 30}
+
+        call_srcs: dict = {}
+        call_targets: dict = {}
+        for e in edges:
+            if not e.via_screen and e.screen and e.target is not None:
+                call_srcs.setdefault(e.screen, set()).add(e.source)
+                call_targets.setdefault(e.screen, set()).add(e.target)
+        # hub 界面：调用方×目标 总量大（如 20 调用方 × 364 按钮 = 7280 条
+        # 边的导航主界面）——折叠为代表调用方，保留可达性、去掉毛线团
+        hub_screens = {s for s, srcs in call_srcs.items()
+                       if len(srcs) > 1
+                       and len(srcs) * len(call_targets.get(s, ())) > 300}
+
+        # hub 边的代表调用方必须可达：hub-and-spoke 游戏里 hub 互相嵌套
+        #（事件 label 结束又回到主界面），一次性断所有 hub 会找不到任何
+        # 可达调用方——逐 hub 独立判断：只断当前 hub 的边做 BFS
+        hub_keep: dict = {}
+        for hub in hub_screens:
+            adj: dict = {}
+            for e in edges:
+                if e.target is None or (not e.via_screen
+                                        and e.screen == hub):
+                    continue
+                adj.setdefault(e.source, []).append(e.target)
+            seen = {'start'}
+            queue = ['start']
+            while queue:
+                cur = queue.pop()
+                for t in adj.get(cur, []):
+                    if t not in seen:
+                        seen.add(t)
+                        queue.append(t)
+            reach = sorted(x for x in call_srcs[hub] if x in seen)
+            # 无可达调用方（极端嵌套循环）按字母序兜底，保证目标不断连
+            hub_keep[hub] = reach[0] if reach else sorted(call_srcs[hub])[0]
+
+        kept = []
+        for e in edges:
+            if e.via_screen and e.screen in ambient:
+                continue
+            if (not e.via_screen and e.screen in hub_screens
+                    and e.source != hub_keep.get(e.screen)):
+                continue
+            kept.append(e)
+        # hub 的非代表调用方补回流边 C → 代表（语义：C 进入主界面/事件
+        # 结束后回到主界面）——没有这条边，"以 call screen 主界面结尾"
+        # 的事件链会全部出度为 0 被误判为结局
+        for hub, rep in hub_keep.items():
+            for src in call_srcs[hub]:
+                if src != rep:
+                    kept.append(StoryEdge(source=src, target=rep,
+                                          kind='jump', screen=hub))
+        edges[:] = kept
+
+    @staticmethod
+    def _resolve_dynamic(nodes: list, edges: list, regs: dict,
+                         aliases: list, known: set, screens: dict,
+                         pool: set):
+        """动态跳转（target=None 且带表达式）→ 事件袋注册展开为多边
+
+        解析链（依次尝试）：
+        1. 表达式是裸标识符 → 按所在 label 就近找 `$ VAR = 右值` 别名。
+           右值含 `袋.pop(...)` → 查袋注册表；右值是 screen 名（间接
+           call_screen 派发：`$ nav_screen = "throne_navigation"`）→ 展开为
+           该 screen 的跳转目标；否则对右值做前缀展开（`$ ev = "v_" + str(...)`）
+        2. 表达式直接含 `袋.pop(...)` → 查袋注册表
+        3. 表达式本身含字符串字面量拼接（`renpy.jump("fan_talk_" + str(x))`）
+           → 前缀展开
+        都失败才保留未决原边。别名按 (file, label, line<) 就近取，同一变量
+        在 if/else 各分支的不同赋值取并集
+        """
+        node_by = {n.label: n for n in nodes}
+        sorted_labels = sorted(known)
+
+        def bag_targets(bag: str) -> list:
+            if not bag:
+                return []
+            return sorted(t for t in regs.get(bag, ()) if t in known)
+
+        def prefix_targets(expr: str) -> list:
+            # 表达式中能匹配已知 label 的最长字面量前缀
+            best, hits = '', []
+            for p in _STRS_RE.findall(expr):
+                if not p:
+                    continue
+                m = [l for l in sorted_labels if l.startswith(p)]
+                if m and len(p) > len(best):
+                    best, hits = p, m
+            return hits[:100]
+
+        def screen_targets(rhs: str) -> list:
+            # 右值中的 screen 名 → 该 screen 内 Jump/Call 引用的 label
+            out = []
+            for lit in _STRS_RE.findall(rhs):
+                if lit in screens and lit not in known:
+                    out.extend(t for t in sorted(screens[lit])
+                               if t in known)
+            return out
+
+        def reg_targets(var: str) -> list:
+            # 变量注册表（SetVariable/screen 名/label 名混合）：label 直接
+            # 用，screen 展开为其跳转目标
+            out = []
+            for lit in sorted(regs.get(var, ())):
+                if lit in known:
+                    out.append(lit)
+                elif lit in screens:
+                    out.extend(t for t in sorted(screens[lit])
+                               if t in known)
+            return out
+
+        resolved = []
+        for e in edges:
+            if e.target is not None or not e.expr:
+                resolved.append(e)
+                continue
+            expr = e.expr.strip()
+            targets: list = []
+            if _BARE_VAR_RE.match(expr):
+                src = node_by.get(e.source)
+                cands = [a for a in aliases
+                         if a[2] < e.line and a[3] == expr
+                         and src is not None and a[0] == src.file
+                         and a[1] == e.source]
+                if not cands and src is not None:
+                    cands = [a for a in aliases
+                             if a[2] < e.line and a[3] == expr
+                             and a[0] == src.file]
+                if cands:
+                    # 并集：if/else 各分支给同一变量赋不同来源（袋/计算名/
+                    # screen 名），任一分支都可能流到本跳转
+                    seen_t: set = set()
+                    for a in cands:
+                        pm = _EXPR_POP_RE.search(a[4])
+                        sc = ''
+                        rhs = a[4]
+                        # 右值是 .pop(...) / 裸变量（直接是袋子名）都查注册表
+                        ts = bag_targets(pm.group(1) if pm else
+                                         (rhs if _BARE_VAR_RE.match(rhs)
+                                          else ''))
+                        if not ts:
+                            sts = screen_targets(a[4])
+                            if sts:
+                                sc = next(
+                                    (lit for lit in _STRS_RE.findall(a[4])
+                                     if lit in screens and lit not in known),
+                                    '')
+                                ts = sts
+                        if not ts:
+                            ts = prefix_targets(a[4])
+                        for t in ts:
+                            if t not in seen_t:
+                                seen_t.add(t)
+                                resolved.append(StoryEdge(
+                                    source=e.source, target=t,
+                                    kind=e.kind, branch=e.branch,
+                                    text=e.text, text_cn=e.text_cn,
+                                    expr=e.expr, implicit=e.implicit,
+                                    via_screen=e.via_screen,
+                                    screen=sc if e.via_screen else ''))
+                    continue
+                if expr in regs:
+                    targets = bag_targets(expr) or reg_targets(expr)
+            else:
+                pm = _EXPR_POP_RE.search(expr)
+                targets = bag_targets(pm.group(1) if pm else '') \
+                    or screen_targets(expr) or prefix_targets(expr)
+            if not targets and '.effect' in expr:
+                # 沙盒事件派发（call expression crisis.effect）：
+                # 展开为注册池（Action/Crisis 构造器里的 label 名字符串）。
+                # 沙盒游戏的池就是主体内容：按台词量排序优先保留重内容
+                targets = sorted(
+                    (t for t in pool if t in known),
+                    key=lambda t: -node_by[t].dialogue_count)[:1500]
+            if not targets:
+                resolved.append(e)
+                continue
+            for t in targets:
+                resolved.append(StoryEdge(source=e.source, target=t,
+                                          kind=e.kind, branch=e.branch,
+                                          text=e.text, text_cn=e.text_cn,
+                                          expr=e.expr, implicit=e.implicit,
+                                          via_screen=e.via_screen,
+                                          screen=e.screen, line=e.line))
+        edges[:] = resolved
+
+    @staticmethod
+    def _expand_screen_targets(edges: list, screens: dict, known: set):
+        """目标是不存在 label 但存在 screen（`renpy.call_screen("xxx")` 直写
+        screen 名）→ 展开为该 screen 内 Jump/Call 引用的 label；screen 无
+        剧情跳转则丢弃该边（纯 HUD/界面）"""
+        kept = []
+        for e in edges:
+            if (e.target is None or e.target not in screens
+                    or e.target in known):
+                kept.append(e)
+                continue
+            for t in sorted(screens[e.target]):
+                if t in known:
+                    kept.append(StoryEdge(
+                        source=e.source, target=t, kind=e.kind,
+                        branch=e.branch, text=e.text, text_cn=e.text_cn,
+                        expr=e.expr, implicit=e.implicit,
+                        via_screen=e.via_screen, screen=e.screen, line=e.line))
+        edges[:] = kept

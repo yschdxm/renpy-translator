@@ -76,13 +76,14 @@ class GraphRepo:
                 """INSERT INTO story_scenes
                    (scene_id, title, summary, labels_json, speakers_json,
                     first_text, first_text_cn, dialogue_count,
-                    translated_count, thumb_file, is_entry, is_ending,
-                    is_return, file_path, line_start)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    translated_count, thumb_file, thumbs_json, is_entry,
+                    is_ending, is_return, file_path, line_start)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [(s['scene_id'], s.get('title', ''), s.get('summary', ''),
                   s['labels_json'], s['speakers_json'], s['first_text'],
                   s['first_text_cn'], s['dialogue_count'],
                   s.get('translated_count', 0), s['thumb_file'],
+                  s.get('thumbs_json', '[]'),
                   int(s['is_entry']), int(s['is_ending']),
                   int(s['is_return']), s['file_path'], s['line_start'])
                  for s in scenes])
@@ -94,6 +95,68 @@ class GraphRepo:
                 [(e['source'], e['target'], e['texts_json'],
                   e['texts_cn_json'], e['branch'], int(e['has_call']),
                   int(e['unresolved'])) for e in edges])
+
+    # ========== 缩略图/头像候选与用户偏好 ==========
+
+    @_auto_reconnect
+    def get_scene_thumb_pref(self, scene_id: str) -> str:
+        row = self._conn.execute(
+            "SELECT thumb_file FROM scene_thumbs_pref "
+            "WHERE scene_id=?", (scene_id,)).fetchone()
+        return row['thumb_file'] if row else ''
+
+    @_auto_reconnect
+    def get_all_scene_thumb_prefs(self) -> dict:
+        rows = self._conn.execute(
+            "SELECT scene_id, thumb_file FROM scene_thumbs_pref").fetchall()
+        return {r['scene_id']: r['thumb_file'] for r in rows
+                if r['thumb_file']}
+
+    @_auto_reconnect
+    def set_scene_thumb_pref(self, scene_id: str, thumb_file: str):
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO scene_thumbs_pref (scene_id, thumb_file) "
+                "VALUES (?, ?) ON CONFLICT(scene_id) "
+                "DO UPDATE SET thumb_file=excluded.thumb_file",
+                (scene_id, thumb_file))
+
+    @_auto_reconnect
+    def get_char_avatar_pref(self, variable: str) -> str:
+        row = self._conn.execute(
+            "SELECT image_path FROM char_avatar_pref "
+            "WHERE variable=?", (variable,)).fetchone()
+        return row['image_path'] if row else ''
+
+    @_auto_reconnect
+    def set_char_avatar_pref(self, variable: str, image_path: str):
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO char_avatar_pref (variable, image_path) "
+                "VALUES (?, ?) ON CONFLICT(variable) "
+                "DO UPDATE SET image_path=excluded.image_path",
+                (variable, image_path))
+
+    @_auto_reconnect
+    def get_char_avatar_candidates(self) -> dict:
+        """{变量名: {'path': 当前生效, 'candidates': [全部候选]}}"""
+        rows = self._conn.execute(
+            "SELECT variable, image_path, candidates_json "
+            "FROM char_avatars").fetchall()
+        prefs = {r['variable']: r['image_path'] for r in self._conn.execute(
+            "SELECT variable, image_path FROM char_avatar_pref").fetchall()}
+        import json as _json
+        out = {}
+        for r in rows:
+            try:
+                cands = _json.loads(r['candidates_json'] or '[]')
+            except ValueError:
+                cands = []
+            path = prefs.get(r['variable']) or r['image_path']
+            if path and path not in cands:
+                cands = [path] + cands
+            out[r['variable']] = {'path': path, 'candidates': cands}
+        return out
 
     @_auto_reconnect
     def get_story_scenes(self) -> dict:
@@ -141,14 +204,19 @@ class GraphRepo:
     # ========== 角色立绘 ==========
 
     @_auto_reconnect
-    def replace_char_avatars(self, avatars: dict[str, str]):
-        """全量重建角色立绘映射 {变量名: 相对 source_root 的 posix 路径}"""
+    def replace_char_avatars(self, avatars: dict[str, str],
+                             candidates: dict[str, list] = None):
+        """全量重建角色立绘映射 {变量名: 相对 source_root 的 posix 路径}；
+        candidates: {变量名: [候选路径]}（手动换头像的备选）"""
         with self._transaction():
             self._conn.execute("DELETE FROM char_avatars")
+            import json as _json
             self._conn.executemany(
-                "INSERT INTO char_avatars (variable, image_path, source) "
-                "VALUES (?, ?, 'auto')",
-                [(v, p) for v, p in avatars.items() if p])
+                "INSERT INTO char_avatars (variable, image_path, source, "
+                "candidates_json) VALUES (?, ?, 'auto', ?)",
+                [(v, p, _json.dumps(
+                    (candidates or {}).get(v, []), ensure_ascii=False))
+                 for v, p in avatars.items() if p])
 
     @_auto_reconnect
     def get_char_avatars(self) -> dict[str, str]:

@@ -33,6 +33,7 @@ class Scene:
     is_entry: bool = False
     is_ending: bool = False
     is_return: bool = False       # 链尾 label 以 return 结束（被 call 的子流程返回点）
+    thumb_candidates: list = field(default_factory=list)  # 候选缩略图文件
     file_path: str = ''           # 主文件（链首 label 所在文件）
     line_start: int = 0
 
@@ -128,6 +129,9 @@ def build_scenes(nodes: list[StoryNode], edges: list[StoryEdge]) -> dict:
                 sc.first_text_cn = n.first_text_cn
             if not sc.thumb_file and n.thumb_file:
                 sc.thumb_file = n.thumb_file
+            for t in n.thumb_files:
+                if t not in sc.thumb_candidates:
+                    sc.thumb_candidates.append(t)
             if n.has_return:
                 sc.is_return = True
         return sc
@@ -237,6 +241,47 @@ def build_scenes(nodes: list[StoryNode], edges: list[StoryEdge]) -> dict:
         if src_scene == tgt_scene:
             continue
         add_edge(src_scene, tgt_scene, e)
+
+    # ---- call 回流边：被调用子流程的终结场景（含 return 且出度 0）指向
+    # 调用方场景。Ren'Py 的 call 会返回调用点继续执行——不建这条边，
+    # 所有以 return 收尾的被调用场景都会被误判为结局（数百个假结局）。
+    # 共享子流程会被多处调用：语义上返回任一调用方都成立，图上只保留
+    # 一条（BFS 序最靠前的调用方），否则边数爆炸（沙盒游戏 14 万条） ----
+    scene_out: dict[str, list[str]] = {}
+    for se in edge_map.values():
+        scene_out.setdefault(se.source, []).append(se.target)
+    has_return_label = {s.scene_id: any(
+        node_by[lb].has_return for lb in s.labels if lb in node_by)
+        for s in scenes}
+
+    call_edges = [e for e in edges if e.kind == 'call' and e.target]
+    # 调用方按 BFS 距离排序：回流边优先挂在最上游的调用方
+    call_edges.sort(key=lambda e: (bfs_order.get(e.source, 1 << 30),
+                                   e.source, e.target))
+    assigned: set = set()
+    for e in call_edges:
+        src_scene = label_to_scene.get(e.source)
+        tgt_scene = label_to_scene.get(e.target)
+        if not src_scene or not tgt_scene or src_scene == tgt_scene:
+            continue
+        # 前向走 callee 链，找终结场景（出度 0 且含 return label）
+        seen = set()
+        stack = [tgt_scene]
+        while stack and len(seen) < 3000:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            nxt = scene_out.get(cur, [])
+            if (not nxt and has_return_label.get(cur)
+                    and cur != src_scene and cur not in assigned):
+                assigned.add(cur)
+                key = (cur, src_scene)
+                if key not in edge_map:
+                    edge_map[key] = SceneEdge(source=cur,
+                                              target=src_scene,
+                                              has_call=True)
+            stack.extend(t for t in nxt if t not in seen)
 
     # ---- 结局标记：场景出度为 0 且非子流程返回点 ----
     # （入口场景无出边时同时是结局：直线到底的短故事，不与 entry 互斥）

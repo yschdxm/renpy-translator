@@ -2,8 +2,9 @@
 
 每批 25 个场景一次调用，3 线程并发（复用 ai_screener 的模式）。
 输入线索：label 链、首条台词原文、出场人物显示名、台词数、文件名。
-失败即抛错（与 ai_screener 一致：响亮失败，不做启发式降级）；
-AI 返回缺漏的场景留空标题（前端回退 scene_id），不算失败。
+容错（与翻译批一致）：整批解析失败重试 2 次 → 仍失败拆半递归 →
+单个场景仍失败则跳过（留空标题，前端回退 scene_id）——模型风控
+拒答只丢极少数场景，不再整图构建中断。
 """
 
 import json
@@ -13,6 +14,7 @@ from typing import Callable
 
 BATCH = 25
 CONCURRENCY = 3
+MAX_RETRIES = 2
 
 _PROMPT = """你是视觉小说剧情分析专家。以下是从 Ren'Py 游戏静态解析出的剧情场景（JSON 数组），每项含：
 - id: 场景标识（label 名）
@@ -57,10 +59,7 @@ def summarize_scenes(scenes: list, translator,
             'file': s.file_path,
         })
 
-    batches = [items[i:i + BATCH] for i in range(0, len(items), BATCH)]
-    results = {}
-
-    def _run_batch(batch):
+    def _call(batch):
         prompt = _PROMPT.format(
             scenes_json=json.dumps(batch, ensure_ascii=False))
         result = translator.analyze_text(
@@ -79,6 +78,27 @@ def summarize_scenes(scenes: list, translator,
             raise ValueError('场景摘要返回为空')
         return out
 
+    def _run_batch(batch) -> dict:
+        """重试 → 拆半递归 → 单场景仍失败跳过"""
+        last_err = None
+        for _ in range(MAX_RETRIES + 1):
+            try:
+                return _call(batch)
+            except Exception as e:  # 网络/解析/风控统一按可重试处理
+                last_err = e
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            out = _run_batch(batch[:mid])
+            out.update(_run_batch(batch[mid:]))
+            return out
+        # 单场景彻底失败：跳过（标题留空，前端回退 scene_id）
+        print(f'[场景摘要] 跳过场景 {batch[0]["id"]}: {last_err}')
+        return {}
+
+    batches = [items[i:i + BATCH] for i in range(0, len(items), BATCH)]
+    results = {}
+    cache_before = (translator.cache_hit_total,
+                    translator.cache_prompt_total)
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = {pool.submit(_run_batch, b): b for b in batches}
         done = 0
@@ -90,4 +110,8 @@ def summarize_scenes(scenes: list, translator,
             if progress:
                 progress(done / len(batches),
                          f'AI 场景标题 {done}/{len(batches)} 批')
+    hit, total = translator.cache_stats_delta(cache_before)
+    if total:
+        print(f'[场景摘要] prompt 缓存命中 {hit}/{total} tokens'
+              f'（{100 * hit / total:.0f}%）')
     return results
