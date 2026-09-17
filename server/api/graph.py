@@ -197,7 +197,7 @@ async def set_avatar_pref(req: AvatarPrefIn,
                           state: AppState = Depends(require_project)):
     """设置/清除（path 为空）角色头像偏好（读时应用，重建保留）"""
     if req.path:
-        _safe_file(_source_root(state), req.path, '立绘')
+        _resolve_image_path(state, req.path, '立绘')
     await state.db_call(state.db.set_char_avatar_pref,
                         req.variable, req.path)
     return {'ok': True}
@@ -268,6 +268,14 @@ async def delete_relation(rel_id: int,
     return {'ok': True}
 
 
+def _resolve_image_path(state: AppState, rel: str, what: str) -> Path:
+    """立绘路径解析：'@cache/' 前缀 = graph_cache 产物（引擎渲染头像），
+    其余为游戏源码根相对路径"""
+    if rel.startswith('@cache/'):
+        return _safe_file(_cache_dir(state), rel[len('@cache/'):], what)
+    return _safe_file(_source_root(state), rel, what)
+
+
 @router.get('/avatar/{key}')
 async def char_avatar(key: str, path: str = '',
                       state: AppState = Depends(require_project)):
@@ -277,7 +285,7 @@ async def char_avatar(key: str, path: str = '',
         rel = data.get(key, {}).get('path', '')
     if not rel:
         raise ApiError(404, 'NOT_FOUND', '该角色没有立绘')
-    return _serve(_source_root(state), rel, '立绘')
+    return FileResponse(_resolve_image_path(state, rel, '立绘'))
 
 
 @router.get('/avatar_circle/{key}')
@@ -293,7 +301,7 @@ async def char_avatar_circle(key: str, ring: str = '', path: str = '',
         rel = data.get(key, {}).get('path', '')
     if not rel:
         raise ApiError(404, 'NOT_FOUND', '该角色没有立绘')
-    src = _safe_file(_source_root(state), rel, '立绘')
+    src = _resolve_image_path(state, rel, '立绘')
     ring = ring if ring.startswith('#') and len(ring) in (4, 7) else ''
     suffix = f'_{ring.lstrip("#")}' if ring else ''
     import zlib

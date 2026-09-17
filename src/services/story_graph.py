@@ -48,8 +48,8 @@ def build_story_graph(db, game_root: str, cache_dir: str,
 
     incremental=False（默认，重建语义）：所有场景重新做 AI 标题分析；
     incremental=True（独立的增量功能）：已有标题保留，只分析新场景。
-    engine_render=True（实验）：场景缩略图用 Ren'Py 引擎沙盒渲染
-    （真 ATL/分层/程序化角色），失败回退 Pillow 合成器
+    engine_render=True（实验）：场景缩略图与立绘用 Ren'Py 引擎
+    沙盒渲染（真 ATL/分层/程序化角色），沙盒启动失败直接报错
     """
     source_root = resolve_source_root(Path(game_root))
 
@@ -145,30 +145,34 @@ def build_story_graph(db, game_root: str, cache_dir: str,
             progress(0.10 + 0.50 * i / total,
                      f'合成场景缩略图 {i}/{total}（复用 {reused}）')
 
-    # ---- 引擎渲染（实验）：Ren'Py 沙盒整批渲染；失败回退 Pillow ----
+    # ---- 引擎渲染（实验）：Ren'Py 沙盒整批渲染；启动失败直接报错
+    #（不回退 Pillow——用户选了引擎渲染就要看到引擎的结果或明确的失败）
+    engine_avatars = {}
     if engine_render and sandbox_entries:
         if progress:
             progress(0.30, f'引擎渲染沙盒启动（{len(sandbox_entries)} 个 label）')
-        thumbs_map = {}
-        try:
-            from render_sandbox import build_jobs, harvest, run_sandbox
-            jobs = build_jobs([(lb, ops, f, la, init)
-                               for lb, ops, f, la, init, _ in
-                               sandbox_entries])
-            results = run_sandbox(str(source_root), jobs)
-            thumbs_map = harvest(results, str(cache))
-        except Exception as e:
-            print(f'[渲染沙盒] 启动/运行失败，回退 Pillow 合成器: {e}')
-            thumbs_map = None
+        from render_sandbox import (
+            build_avatar_jobs, build_jobs, harvest, harvest_avatars,
+            run_sandbox)
+        jobs = build_jobs([(lb, ops, f, la, init)
+                           for lb, ops, f, la, init, _ in
+                           sandbox_entries])
+        # 立绘头像任务并入同一次沙盒运行：tag 非空走真分层立绘，
+        # 空走 draw_person（程序化角色 best-effort）
+        chars = [c for c in db.get_characters()
+                 if not c['is_placeholder'] and c['variable']]
+        for c in chars:
+            c['image_tag'] = resolver.char_image_tags.get(
+                c['variable'], '') or (
+                c['variable'] if resolver.resolve_tag_variants(
+                    c['variable']) else '')
+        jobs += build_avatar_jobs(chars)
+        results = run_sandbox(str(source_root), jobs)
+        thumbs_map = harvest(results, str(cache))
+        engine_avatars = harvest_avatars(results, str(cache))
         for lb, ops, f, la, init, key in sandbox_entries:
             n = node_by[lb]
-            if thumbs_map is None:
-                # 回退：Pillow 合成（key 带 :E 不污染 Pillow 缓存）
-                names, _ = compose_scene_candidates(
-                    resolver, ops, f, la, str(cache), lb,
-                    initial_state=init)
-            else:
-                names = thumbs_map.get(lb, [])
+            names = thumbs_map.get(lb, [])
             new_manifest[lb] = {'key': key, 'files': names}
             if names:
                 n.thumb_file = names[0]
@@ -204,6 +208,10 @@ def build_story_graph(db, game_root: str, cache_dir: str,
                                                 c['display_name'])]
         if cands:
             avatar_cands[c['variable']] = cands
+    # 引擎渲染立绘覆盖文件解析结果（引擎产物是真实渲染图，优先级最高）
+    for var, path in engine_avatars.items():
+        avatars[var] = path
+        avatar_cands[var] = [path]
 
     # 译文回填到 flow 对象（label 级入库与场景聚合共用）
     if progress:

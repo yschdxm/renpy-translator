@@ -293,6 +293,20 @@ def build_driver_script(jobs: list) -> str:
             lines.append(f"{indent}$ _sb_exec({code!r})")
 
     for job in jobs:
+        # 头像任务：纯色键控背景 + 立绘/角色绘制 → 单帧截图
+        if job.get('avatar'):
+            lines.append('    $ _sb_scene([], [], "")')
+            lines.append("    $ _sb_exec(\"renpy.show('zz_chroma', "
+                         "what=Solid('#00FF00'), layer='master')\")")
+            if job.get('code'):
+                lines.append(f"    $ _sb_exec({job['code']!r})")
+            elif job.get('images'):
+                # 头像要头部完整：顶部锚定（脚部溢出由圆形裁剪决定取舍）
+                lines.append(f"    $ _sb_show({job['images']!r}, "
+                             f"['top'], '')")
+            lines.append('    $ _sb_frame()')
+            lines.append(f"    $ _sb_shot({('avatar__' + job['name'])!r})")
+            continue
         init = job.get('init') or {}
         if init.get('bg'):
             lines.append(f"    $ _sb_scene({list(init['bg'][0])!r}, "
@@ -395,6 +409,13 @@ def run_sandbox(source_root: str, jobs: list,
     results: dict = {}
     for job in jobs:
         name = job['name']
+        if job.get('avatar'):
+            key = f'avatar:{name}'
+            files = sorted(p.name
+                           for p in out_dir.glob(f'avatar__{name}*.png'))
+            if files:
+                results[key] = files
+            continue
         files = sorted(p.name for p in out_dir.glob(f'{name}*.png')
                        if p.stem == name
                        or p.stem.startswith(f'{name}_'))
@@ -404,22 +425,84 @@ def run_sandbox(source_root: str, jobs: list,
     return results
 
 
+def build_avatar_jobs(characters: list) -> list:
+    """角色立绘头像任务
+
+    characters: [{variable, image_tag}]
+    - image_tag 非空：show 该 tag（引擎渲染真 layeredimage 分层立绘）
+    - 空：the_person.draw_person（LR2 类程序化角色，best-effort——
+      接收者不是已实例化 Person 时驱动自动跳过）
+    """
+    jobs = []
+    for c in characters:
+        var = c.get('variable') or ''
+        if not var:
+            continue
+        tag = c.get('image_tag') or ''
+        job = {'name': var, 'avatar': True}
+        if tag:
+            job['images'] = tag.split()
+        else:
+            job['code'] = (f'the_person = {var}\n'
+                           'the_person.draw_person(wipe_scene=False, '
+                           'show_person_info=False)')
+        jobs.append(job)
+    return jobs
+
+
+def harvest_avatars(results: dict, cache_dir: str) -> dict:
+    """头像截图 → 键控去背 + 裁剪 → RGBA PNG（graph_cache/avatars/），
+    返回 {variable: '@cache/avatars/<var>.png'}；键控色 #00FF00"""
+    from PIL import Image
+
+    out_dir = Path(results.get('__out_dir__', [''])[0])
+    av_dir = Path(cache_dir) / 'avatars'
+    av_dir.mkdir(parents=True, exist_ok=True)
+    out = {}
+    for label, files in results.items():
+        if not label.startswith('avatar:'):
+            continue
+        var = label[len('avatar:'):]
+        if not files:
+            continue
+        try:
+            with Image.open(out_dir / files[0]) as im:
+                im = im.convert('RGBA')
+                # 容差键控（截图经色彩管线后纯色是 (0,254,0) 而非 255）
+                im.putdata([
+                    (0, 0, 0, 0) if (g > 200 and r < 60 and b < 60)
+                    else (r, g, b, a)
+                    for r, g, b, a in im.getdata()])
+                bbox = im.getbbox()
+                if not bbox:
+                    continue
+                im = im.crop(bbox)
+                dest = av_dir / f'{var}.png'
+                im.save(dest, 'PNG')
+                out[var] = f'@cache/avatars/{var}.png'
+        except OSError:
+            continue
+    return out
+
+
 def harvest(results: dict, cache_dir: str) -> dict:
     """沙盒 PNG → 烘圆角存 webp 到 graph_cache，返回 {label: [webp 名]}；
-    顺带清理 out 目录"""
+    out 目录留给 harvest_avatars 读取，由下次 run_sandbox 开头自清"""
     import shutil
 
     from PIL import Image
 
     from scene_composer import _rounded
 
-    out_dir = Path(results.pop('__out_dir__')[0])
+    out_dir = Path(results['__out_dir__'][0])
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     from scene_composer import _mean_brightness
 
     out = {}
     for label, files in results.items():
+        if label.startswith('avatar:'):
+            continue
         frames = []  # (亮度, webp 名)
         for f in files:
             webp = f'{Path(f).stem}.webp'
@@ -435,5 +518,5 @@ def harvest(results: dict, cache_dir: str) -> dict:
             # 与 Pillow 管线同构：亮度降序（首帧为最亮，黑场帧垫底）
             frames.sort(key=lambda x: -x[0])
             out[label] = [n for _, n in frames]
-    shutil.rmtree(out_dir, ignore_errors=True)
+    # out 目录不在此清理：头像 harvest 还要读（下次 run_sandbox 开头自清）
     return out
