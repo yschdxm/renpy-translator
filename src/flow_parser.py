@@ -434,11 +434,21 @@ class FlowParser:
                 continue
 
             # ---- 跳转/调用 ----
-            # exec 白名单（程序化角色绘制，沙盒回放）
+            # exec 白名单（程序化角色绘制，沙盒回放）。draw_person 调用
+            # 注入 wipe_scene=False：默认 True 会清掉整个场景（含已渲染
+            # 的背景），缩略图合成语境下只要叠角色不要清屏
             if _EXEC_WHITELIST_RE.match(stripped):
+                code = stripped.lstrip('$').strip()
+                if '.draw_person(' in code and 'wipe_scene' not in code:
+                    paren = code.rfind(')')
+                    if paren > code.rfind('draw_person('):
+                        code = (code[:paren]
+                                + ('' if code.rfind('(') == paren - 1
+                                   else ', ')
+                                + 'wipe_scene=False, show_person_info=False'
+                                + code[paren:])
                 node.scene_ops.append(
-                    SceneOp(idx, 'exec', [], [],
-                            code=stripped.lstrip('$').strip()))
+                    SceneOp(idx, 'exec', [], [], code=code))
                 touch_option('other')
                 if indent <= body_indent:
                     last_base_stmt = 'other'

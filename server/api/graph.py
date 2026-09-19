@@ -219,11 +219,17 @@ async def set_thumb_pref(req: ThumbPrefIn,
     return {'ok': True}
 
 
+class RelationsBuildIn(BaseModel):
+    engine_render: bool = False
+
+
 @router.post('/relations/build')
-async def build_relations(state: AppState = Depends(require_project)):
+async def build_relations(req: RelationsBuildIn = None,
+                          state: AppState = Depends(require_project)):
     translator = state.translator
     if translator is None:
         raise ApiError(409, 'NO_MODEL', '请先在模型配置中设置 API')
+    engine_render = bool(req and req.engine_render)
 
     async def body(job):
         def _build():
@@ -233,12 +239,39 @@ async def build_relations(state: AppState = Depends(require_project)):
                       cancel_event=job.cancel_event)
         result = await state.run_sync(_build)
         job.check_cancelled()
+        if engine_render:
+            # 引擎立绘（实验）：关系图开关开启时同步重渲头像
+            job.emit_progress(0.9, '引擎渲染立绘')
+            await state.run_sync(_engine_avatars, state, job)
         job.emit_progress(1.0, '完成')
         return result
 
     job = state.jobs.create('graph.relations-build', '构建人物关系图谱', {},
                             body, exclusive=True)
     return {'job_id': job.id}
+
+
+def _engine_avatars(state: AppState, job):
+    """引擎渲染全部角色立绘（头像任务-only 沙盒）"""
+    from render_sandbox import (build_avatar_jobs, build_jobs,
+                                harvest_avatars, run_sandbox)
+    from scene_composer import ImageResolver
+
+    resolver = ImageResolver(str(_source_root(state)))
+    chars = [c for c in state.db.get_characters()
+             if not c['is_placeholder'] and c['variable']]
+    for c in chars:
+        c['image_tag'] = resolver.char_image_tags.get(
+            c['variable'], '') or (
+            c['variable'] if resolver.resolve_tag_variants(
+                c['variable']) else '')
+    jobs = build_avatar_jobs(chars)
+    results = run_sandbox(str(_source_root(state)), jobs, timeout=900)
+    rendered = harvest_avatars(results, str(_cache_dir(state)))
+    if rendered:
+        current = state.db.get_char_avatars()
+        current.update(rendered)
+        state.db.replace_char_avatars(current)
 
 
 class RelationIn(BaseModel):

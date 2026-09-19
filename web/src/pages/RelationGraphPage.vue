@@ -71,10 +71,22 @@ async function load() {
   }
 }
 
+/** 引擎渲染（实验）：与剧情图页共用一个偏好键——开一处两处生效 */
+const engineRender = ref(false)
+try {
+  engineRender.value = localStorage.getItem('sg_engine_render') === '1'
+} catch { /* 只读环境 */ }
+watch(engineRender, (v) => {
+  try {
+    localStorage.setItem('sg_engine_render', v ? '1' : '0')
+  } catch { /* 同上 */ }
+})
+
 async function build() {
   try {
     const d = await api.post<{ job_id: string }>(
-      '/api/current/graph/relations/build')
+      '/api/current/graph/relations/build',
+      { engine_render: engineRender.value })
     jobsStore.track(d.job_id)
   } catch (e) {
     toastError(message, e)
@@ -997,6 +1009,10 @@ async function saveAdd() {
             <template #checked>共现</template>
             <template #unchecked>共现</template>
           </n-switch>
+          <n-space size="small" align="center">
+            <n-switch v-model:value="engineRender" size="small" />
+            <n-text depth="3" style="font-size: 12px">引擎渲染（实验）</n-text>
+          </n-space>
           <n-button size="small" :render-icon="renderIcon(AddOutline)"
                     :disabled="!data?.characters.length" @click="addOpen = true">
             添加关系

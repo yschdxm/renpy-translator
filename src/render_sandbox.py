@@ -121,17 +121,36 @@ init python:
     def _sb_frame():
         renpy.ui.saybehavior(dismiss='dismiss_hard_pause')
         renpy.ui.interact(mouse='pause', type='pause', roll_forward=None,
-                          pause=0.05)
+                          pause=0.02)
+
+    def _sb_perf():
+        # 关回滚记录：store 大（LR2 几千个角色对象）时，每次交互的
+        # rollback 状态记录要序列化整棵状态树——每帧数秒；沙盒不需要回滚
+        try:
+            renpy.block_rollback()
+        except Exception:
+            pass
 
     def _sb_init_game():
-        # 1) 游戏自己的角色实例化（instantiate_* label，缺失/报错跳过）
+        # 1) 游戏自己的完整初始化链（有 initialize_game_state 的游戏：
+        # 内部会调 instantiate_*、建 mc/business——合成默认参数调用；
+        # renpy.call 靠 CallException 传播控制流，python 里直接调会被
+        # 吞掉，必须用 call_in_new_context）
+        try:
+            if renpy.game.script.has_label("initialize_game_state"):
+                renpy.call_in_new_context(
+                    "initialize_game_state", "Chris", "TestCorp", "Doe",
+                    [8, 8, 8], [3, 3, 3, 3, 3], [3, 3, 3, 3])
+        except Exception:
+            pass
+        # 2) instantiate_* label（无完整初始化链的游戏退而求其次）
         for lb in ("instantiate_roles", "instantiate_personalities",
                    "instantiate_serum_traits",
                    "instantiate_side_effect_traits",
                    "instantiate_positions", "instantiate_outfits"):
             try:
                 if renpy.game.script.has_label(lb):
-                    renpy.call(lb)
+                    renpy.call_in_new_context(lb)
             except Exception:
                 pass
         # 2) 角色工厂表：LR2 这类游戏的定义模块把工厂函数注册进 store 的
@@ -189,7 +208,8 @@ init 99 python:
 
 '''
 
-_DRIVER_FILES = ('zz_sandbox_driver.rpy',
+# 清理清单含 .rpyc：Ren'Py 会把驱动 .rpy 编译成 .rpyc 留在原地
+_DRIVER_FILES = ('zz_sandbox_driver.rpy', 'zz_sandbox_driver.rpyc',
                  'zz_sandbox_jobs.json', 'zz_sandbox_done.flag')
 
 
@@ -359,7 +379,8 @@ def run_sandbox(source_root: str, jobs: list,
     任何启动级失败抛异常（调用方回退 Pillow 合成器）
     """
     if not jobs:
-        return {}
+        # 无任务也保证 __out_dir__ 存在（harvest 统一按 key 读取）
+        return {'__out_dir__': ['']}
     exe = _sdk_exe(Path(source_root).resolve())
 
     root = Path(source_root).resolve()
@@ -494,7 +515,7 @@ def harvest(results: dict, cache_dir: str) -> dict:
 
     from scene_composer import _rounded
 
-    out_dir = Path(results['__out_dir__'][0])
+    out_dir = Path(results.get('__out_dir__', [''])[0] or '.')
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     from scene_composer import _mean_brightness

@@ -149,27 +149,39 @@ def build_story_graph(db, game_root: str, cache_dir: str,
     #（不回退 Pillow——用户选了引擎渲染就要看到引擎的结果或明确的失败）
     engine_avatars = {}
     if engine_render and sandbox_entries:
-        if progress:
-            progress(0.30, f'引擎渲染沙盒启动（{len(sandbox_entries)} 个 label）')
         from render_sandbox import (
             build_avatar_jobs, build_jobs, harvest, harvest_avatars,
             run_sandbox)
-        jobs = build_jobs([(lb, ops, f, la, init)
-                           for lb, ops, f, la, init, _ in
-                           sandbox_entries])
-        # 立绘头像任务并入同一次沙盒运行：tag 非空走真分层立绘，
-        # 空走 draw_person（程序化角色 best-effort）
-        chars = [c for c in db.get_characters()
-                 if not c['is_placeholder'] and c['variable']]
-        for c in chars:
-            c['image_tag'] = resolver.char_image_tags.get(
-                c['variable'], '') or (
-                c['variable'] if resolver.resolve_tag_variants(
-                    c['variable']) else '')
-        jobs += build_avatar_jobs(chars)
-        results = run_sandbox(str(source_root), jobs)
-        thumbs_map = harvest(results, str(cache))
-        engine_avatars = harvest_avatars(results, str(cache))
+        # 分批跑（每批 ~7s 引擎启动开销）：大图时单批会超过超时上限且
+        # 长时间无进度反馈；批间报进度
+        BATCH = 300
+        chunks = [sandbox_entries[i:i + BATCH]
+                  for i in range(0, len(sandbox_entries), BATCH)]
+        thumbs_map = {}
+        for ci, chunk in enumerate(chunks, 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError('剧情图构建已取消')
+            if progress:
+                progress(0.30 + 0.28 * (ci - 1) / len(chunks),
+                         f'引擎渲染沙盒 第 {ci}/{len(chunks)} 批'
+                         f'（{len(chunk)} 个 label）')
+            jobs = build_jobs([(lb, ops, f, la, init)
+                               for lb, ops, f, la, init, _ in chunk])
+            if ci == 1:
+                # 立绘头像任务并入首批：tag 非空走真分层立绘，
+                # 空走 draw_person（程序化角色 best-effort）
+                chars = [c for c in db.get_characters()
+                         if not c['is_placeholder'] and c['variable']]
+                for c in chars:
+                    c['image_tag'] = resolver.char_image_tags.get(
+                        c['variable'], '') or (
+                        c['variable'] if resolver.resolve_tag_variants(
+                            c['variable']) else '')
+                jobs += build_avatar_jobs(chars)
+            results = run_sandbox(str(source_root), jobs, timeout=900)
+            thumbs_map.update(harvest(results, str(cache)))
+            if ci == 1:
+                engine_avatars = harvest_avatars(results, str(cache))
         for lb, ops, f, la, init, key in sandbox_entries:
             n = node_by[lb]
             names = thumbs_map.get(lb, [])
