@@ -4,6 +4,7 @@ interface PywebviewApi {
   pick_directory(): Promise<string | null>
   pick_zip(): Promise<string | null>
   open_folder(path: string): Promise<void>
+  open_url(url: string): Promise<void>
 }
 
 declare global {
@@ -42,6 +43,14 @@ export async function pickZip(): Promise<string | null> {
 export async function openFolder(path: string): Promise<void> {
   if (!(await nativeReady())) return
   return window.pywebview!.api.open_folder(path)
+}
+
+/** 外部浏览器打开 URL：GUI 模式走原生桥（WebView2 里 window.open 不可靠），浏览器模式直接开 */
+export async function openUrl(url: string): Promise<void> {
+  if (window.pywebview) {
+    return window.pywebview.api.open_url(url)
+  }
+  window.open(url, '_blank', 'noopener')
 }
 
 export function isGui(): boolean {

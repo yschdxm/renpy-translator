@@ -2,6 +2,7 @@
 import shutil
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -18,12 +19,16 @@ class ConfigIn(BaseModel):
     api_base: str = 'https://api.openai.com/v1'
     api_key: str = ''
     model: str = 'gpt-3.5-turbo'
-    temperature: float = 0.3
+    temperature: Optional[float] = None  # None=不发参数（跟随模型默认）
     max_tokens: int = 1000
     context_lines: int = 3
     timeout: int = 30
     max_context: int = 8
     batch_lines: int = 100
+    thinking: str = 'default'  # default/enabled/disabled
+
+
+_THINKING_VALUES = ('default', 'enabled', 'disabled')
 
 
 def _validate(req: 'ConfigIn'):
@@ -31,6 +36,11 @@ def _validate(req: 'ConfigIn'):
     # 超限时 API 的 400 报错会带合法范围，保存时只拦无意义的非正值
     if req.max_tokens < 1:
         raise ApiError(400, 'BAD_MAX_TOKENS', 'max_tokens 必须为正整数')
+    if req.thinking not in _THINKING_VALUES:
+        raise ApiError(400, 'BAD_THINKING',
+                       f'thinking 取值只能是: {"/".join(_THINKING_VALUES)}')
+    if req.temperature is not None and req.temperature < 0:
+        raise ApiError(400, 'BAD_TEMPERATURE', '温度不能为负数（留空为模型默认）')
 
 
 def _mask(cfg, active_name: str = '') -> dict:
@@ -47,7 +57,7 @@ def _to_model_config(req: ConfigIn):
         model=req.model, temperature=req.temperature,
         max_tokens=req.max_tokens, context_lines=req.context_lines,
         timeout=req.timeout, max_context=req.max_context,
-        batch_lines=req.batch_lines,
+        batch_lines=req.batch_lines, thinking=req.thinking,
     )
 
 
@@ -133,6 +143,7 @@ async def test_config(req: ConfigIn, state: AppState = Depends(get_state)):
         api_base=req.api_base, api_key=api_key, model=req.model,
         temperature=req.temperature, max_tokens=req.max_tokens,
         context_lines=req.context_lines, timeout=req.timeout,
+        thinking=req.thinking,
     ))
     result = await state.run_sync(translator.test_connection)
     if not result.get('success'):

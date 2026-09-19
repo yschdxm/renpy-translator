@@ -2,7 +2,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import {
   NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputGroup, NInputNumber,
-  NModal, NPopconfirm, NSpace, NSpin, NTag, NText, useMessage,
+  NModal, NPopconfirm, NSelect, NSpace, NSpin, NTag, NText, useMessage,
 } from 'naive-ui'
 import { AddOutline, CloudDownloadOutline, FolderOpenOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
@@ -20,12 +20,13 @@ interface ModelConfig {
   api_base: string
   api_key: string
   model: string
-  temperature: number
+  temperature: number | null
   max_tokens: number
   context_lines: number
   timeout: number
   max_context: number
   batch_lines: number
+  thinking: string
   is_active?: boolean
 }
 
@@ -75,8 +76,8 @@ async function migrateDataDir() {
 
 const emptyForm = (): ModelConfig => ({
   name: '', api_base: 'https://api.openai.com/v1', api_key: '',
-  model: '', temperature: 0.3, max_tokens: 1000, context_lines: 3,
-  timeout: 30, max_context: 8, batch_lines: 100,
+  model: '', temperature: null, max_tokens: 1000, context_lines: 3,
+  timeout: 30, max_context: 8, batch_lines: 100, thinking: 'default',
 })
 
 const formVisible = ref(false)
@@ -285,7 +286,8 @@ onMounted(async () => {
           <n-input v-model:value="form.model" placeholder="如 gpt-4o / deepseek-chat" />
         </n-form-item>
         <n-form-item label="温度">
-          <n-input-number v-model:value="form.temperature" :step="0.05" />
+          <n-input-number v-model:value="form.temperature" :step="0.05" clearable
+                          placeholder="留空=模型默认（不发参数）" style="width: 100%" />
         </n-form-item>
         <n-form-item label="max_tokens">
           <n-input-number v-model:value="form.max_tokens"
@@ -303,6 +305,19 @@ onMounted(async () => {
         <n-form-item label="超时(秒)">
           <n-input-number v-model:value="form.timeout" />
         </n-form-item>
+        <n-form-item label="思考模式">
+          <n-select v-model:value="form.thinking" :options="[
+            { label: '跟随模型默认（不发参数）', value: 'default' },
+            { label: '开启', value: 'enabled' },
+            { label: '关闭', value: 'disabled' },
+          ]" />
+        </n-form-item>
+        <n-text depth="3" style="font-size: 12px; margin-top: -12px">
+          思考模式向请求体发送 thinking 参数（DeepSeek V4 / GLM / 豆包等支持；
+          DeepSeek V4 默认即思考，选「关闭」才会显式关掉）。接口不支持时
+          「测试连接」会报 400，改回默认即可。开启时请加大 max_tokens
+          （思考内容也占输出额度）。
+        </n-text>
       </n-form>
       <template #footer>
         <n-space justify="end">

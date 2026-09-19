@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NLayout, NLayoutHeader, NLayoutSider, NLayoutContent, NMenu, NModal, NSelect,
-  NTag, NButton, NDropdown, NSpace, useMessage,
+  NSwitch, NTag, NButton, NDropdown, NSpace, NText, NTooltip, useMessage,
 } from 'naive-ui'
 import type { MenuOption } from 'naive-ui'
 import { useSessionStore } from './stores/session'
@@ -12,7 +12,8 @@ import { useProjectsStore } from './stores/projects'
 import { useJobsStore, type JobView } from './stores/jobs'
 import JobProgressDialog from './components/JobProgressDialog.vue'
 import EmbeddedReviewDialog from './components/EmbeddedReviewDialog.vue'
-import { toastError } from './api/client'
+import { api, toastError } from './api/client'
+import { openUrl } from './api/native'
 
 const message = useMessage()
 const session = useSessionStore()
@@ -87,6 +88,54 @@ async function answerConfirm(job: JobView, ok: boolean) {
   }
 }
 
+// ---- 检查更新（GitHub Release） ----
+
+interface UpdateInfo {
+  current: string
+  latest: string
+  has_update: boolean
+  url: string
+  notes: string
+}
+
+const updateInfo = ref<UpdateInfo | null>(null)
+const updateVisible = ref(false)
+const checkingUpdate = ref(false)
+const autoUpdateCheck = ref(true)
+
+/** silent=true：自动检查，失败/无更新不提示；手动检查给出反馈 */
+async function checkUpdate(silent: boolean) {
+  if (checkingUpdate.value) return
+  checkingUpdate.value = true
+  try {
+    const info = await api.get<UpdateInfo>('/api/updates/check')
+    if (info.has_update) {
+      updateInfo.value = info
+      updateVisible.value = true
+    } else if (!silent) {
+      message.success(`已是最新版本（v${info.current}）`)
+    }
+  } catch (e) {
+    if (!silent) toastError(message, e)
+  } finally {
+    checkingUpdate.value = false
+  }
+}
+
+async function onAutoCheckChange(v: boolean) {
+  try {
+    await api.put('/api/updates/auto-check', { enabled: v })
+    autoUpdateCheck.value = v
+  } catch (e) {
+    toastError(message, e)  // 保存失败保持原状态
+  }
+}
+
+async function gotoDownload() {
+  if (updateInfo.value?.url) await openUrl(updateInfo.value.url)
+  updateVisible.value = false
+}
+
 // ---- 服务心跳：连续失败显示「服务已停止」遮罩（浏览器无法自动关页） ----
 const serverDown = ref(false)
 // 迁移后自动重启中：显示「正在重启」遮罩，服务恢复后整页刷新
@@ -156,6 +205,12 @@ onMounted(async () => {
   await session.refresh()
   await projectsStore.refresh()
   await jobsStore.restore()
+  // 自动检查更新：读取开关（默认开），开着则检查——失败/无更新静默
+  try {
+    const { enabled } = await api.get<{ enabled: boolean }>('/api/updates/auto-check')
+    autoUpdateCheck.value = enabled
+    if (enabled) checkUpdate(true)
+  } catch { /* 设置读取失败按默认（开）处理，不再触发检查 */ }
   // 中断任务只给一条汇总提示（不逐条弹窗；翻译类重发即自动跳过已完成部分）
   if (session.interruptedJobs > 0) {
     message.warning(
@@ -189,6 +244,18 @@ onUnmounted(() => {
       <n-tag v-if="session.currentProject && !session.hasTranslator" size="small" type="warning">
         未配置模型
       </n-tag>
+      <!-- 检查更新（GitHub Release）：开关控制启动时自动检查 -->
+      <n-button size="tiny" quaternary type="info" :loading="checkingUpdate"
+                @click="checkUpdate(false)">
+        检查更新
+      </n-button>
+      <n-tooltip trigger="hover">
+        <template #trigger>
+          <n-switch size="small" :value="autoUpdateCheck"
+                    @update:value="onAutoCheckChange" />
+        </template>
+        启动时自动检查更新（有新版本才弹窗，失败静默）
+      </n-tooltip>
       <!-- 后台任务列表：进度对话框被关闭后任务仍在跑，点列表项重开对应对话框 -->
       <span style="flex: 1" />
       <n-dropdown
@@ -240,6 +307,29 @@ onUnmounted(() => {
       </span>
       <n-button type="primary" @click="heartbeat">重新连接</n-button>
     </n-space>
+  </n-modal>
+
+  <!-- 更新可用弹窗（手动/自动检查命中；下载在 GitHub Release 页） -->
+  <n-modal v-model:show="updateVisible" preset="card" title="发现新版本" style="width: 520px">
+    <n-space vertical size="small">
+      <n-text>当前版本 v{{ updateInfo?.current }}，最新版本 {{ updateInfo?.latest }}</n-text>
+      <n-text depth="3" style="font-size: 12px">
+        前往 GitHub Release 下载最新安装包，直接安装即可沿用原路径与数据。
+      </n-text>
+      <div v-if="updateInfo?.notes">
+        <div style="font-weight: 600; margin: 8px 0 4px">更新说明</div>
+        <div style="font-size: 13px; color: #ccc; white-space: pre-line;
+                    max-height: 260px; overflow: auto">
+          {{ updateInfo.notes }}
+        </div>
+      </div>
+    </n-space>
+    <template #footer>
+      <n-space justify="end">
+        <n-button @click="updateVisible = false">稍后再说</n-button>
+        <n-button type="primary" @click="gotoDownload">前往下载</n-button>
+      </n-space>
+    </template>
   </n-modal>
 
   <!-- 全局任务进度对话框（刷新/切路由后自动重开） -->

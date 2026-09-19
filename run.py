@@ -186,6 +186,10 @@ def run_gui(port: int):
             else:
                 subprocess.Popen(['xdg-open', path])
 
+        def open_url(self, url):
+            """外部浏览器打开（更新弹窗的下载页等；浏览器模式下前端直接 window.open）"""
+            webbrowser.open(url)
+
         def close_window(self):
             """后端广播 shutdown 后，前端调用此方法关闭窗口"""
             window.destroy()
@@ -200,21 +204,36 @@ def run_gui(port: int):
         background_color='#101014',
     )
 
-    # 看门狗：服务异常死掉（崩溃/被杀）时向前端发提示事件——只提示，不关窗
-    # （正常退出服务由后端广播 shutdown，前端自行关窗，见 JsApi.close_window）
+    # 看门狗：服务异常死掉（崩溃/被杀）时向前端发提示事件；持续失联
+    # 约 60 秒后自动关窗——托盘「退出服务」的关停广播若恰逢 SSE 断线
+    # 重连会漏收，不关窗 GUI 进程就成无界面的残留进程。
+    # （正常退出服务由后端广播 shutdown，前端自行关窗，见 JsApi.close_window；
+    #  迁移重启的服务中断只有几秒，远低于 60s 阈值，不会误关）
     def _watchdog():
         time.sleep(5)  # 启动宽限
         fails = 0
+        notified = False
         while True:
             time.sleep(2)
             if _server_alive(port):
                 fails = 0
+                notified = False
             else:
                 fails += 1
-                if fails >= 3:
+                if fails >= 3 and not notified:
+                    notified = True
                     try:
                         window.evaluate_js(
                             "window.dispatchEvent(new Event('rt-server-lost'))")
+                    except Exception:
+                        pass
+                if fails >= 30:
+                    # 走 JS 桥调 close_window（与广播路径一致），
+                    # 避免在非 GUI 线程直接 destroy
+                    try:
+                        window.evaluate_js(
+                            "window.pywebview && window.pywebview.api"
+                            " && window.pywebview.api.close_window()")
                     except Exception:
                         pass
                     return
@@ -262,8 +281,13 @@ def run_tray(port: int):
 
     url = f"http://127.0.0.1:{port}"
 
+    # 托盘拉起的界面进程：正常关停由后端广播 shutdown、前端自关；
+    # 漏收广播（SSE 断线重连窗口）的残留由 quit_all 兜底终止
+    gui_procs = []
+
     def open_window(icon=None, item=None):
-        _spawn_detached(_self_cmd('gui'), 'gui.log')
+        gui_procs[:] = [p for p in gui_procs if p.poll() is None]
+        gui_procs.append(_spawn_detached(_self_cmd('gui'), 'gui.log'))
 
     def open_browser(icon=None, item=None):
         webbrowser.open(url)
@@ -273,6 +297,12 @@ def run_tray(port: int):
             stop_server(port)
         except SystemExit:
             return  # 停止超时（服务正忙）：托盘保持驻留，用户可稍后再试
+        # 兜底终止漏收关停广播的界面进程：杀进程树（terminate 只杀
+        # 单进程，WebView2 子进程不会跟着退）
+        from proc_registry import kill_tree
+        for p in gui_procs:
+            if p.poll() is None:
+                kill_tree(p)
         icon.stop()
 
     icon = pystray.Icon(

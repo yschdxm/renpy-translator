@@ -15,12 +15,16 @@ class ModelConfig:
     api_base: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-3.5-turbo"
-    temperature: float = 0.3
+    temperature: Optional[float] = None  # None=不发参数（跟随模型默认）
     max_tokens: int = 1000
     context_lines: int = 3
     timeout: int = 30
     max_context: int = 8  # 模型最大上下文（单位K）
     batch_lines: int = 100  # 批次翻译每批最大句数
+    # 思考模式：default=不发参数（跟随模型默认）；enabled/disabled=显式开/关
+    # （DeepSeek V4 / GLM / 豆包等同一形状的 thinking 参数；V4 默认即思考，
+    #  必须显式发 disabled 才能关）
+    thinking: str = 'default'
     sdk_path: str = ""  # Ren'Py SDK 路径
 
 

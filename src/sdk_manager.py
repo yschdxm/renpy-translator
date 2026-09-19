@@ -7,6 +7,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from proc_registry import track, untrack
+
 # 7.x 及更早：__init__.py 里字面量 version_tuple = (7, 4, 9, vc_version)
 _VER_TUPLE_RE = re.compile(r'version_tuple\s*=\s*\((\d+),\s*(\d+),\s*(\d+)')
 # 8.x 的 __init__.py 版本是动态计算的，改从 SDK 目录名解析
@@ -170,6 +172,9 @@ class SDKManager:
                 text=True,
                 cwd=str(self.sdk_path)
             )
+            # 注册到全局表：服务关停时兜底杀树（取消/超时路径之外，
+            # os._exit 抢在轮询循环响应前执行的话进程会变孤儿）
+            track(proc)
 
             deadline = time.monotonic() + 3600
             while proc.poll() is None:
@@ -212,6 +217,7 @@ class SDKManager:
             return {'success': False, 'message': str(e), 'output': '',
                     'returncode': -1}
         finally:
+            untrack(proc)
             if proc is not None and proc.stdout:
                 proc.stdout.close()
 

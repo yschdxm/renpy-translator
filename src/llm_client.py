@@ -101,7 +101,8 @@ class LLMClient:
         - 重试耗尽：抛出普通异常，调用方记失败并跳过该条目
         - return_message=True 时返回完整 message（用于 tool calls），否则返回 content 文本
         - api_log_callback 存在时，成功响应后将完整请求体/返回体交给回调记录
-        - temperature / max_tokens 为 None 时取 config 默认值
+        - temperature / max_tokens 为 None 时取 config 默认值；
+          temperature 解析后仍为 None 时不发该参数（跟随模型默认）
         """
         if temperature is None:
             temperature = self.config.temperature
@@ -114,10 +115,17 @@ class LLMClient:
                 kwargs = dict(
                     model=self.config.model,
                     messages=messages,
-                    temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=self.config.timeout,
                 )
+                if temperature is not None:
+                    kwargs['temperature'] = temperature
+                thinking = getattr(self.config, 'thinking', 'default')
+                if thinking in ('enabled', 'disabled'):
+                    # DeepSeek V4 / GLM / 豆包同一形状；V4 默认即思考，
+                    # 关必须显式发 disabled。不支持的接口会回 400
+                    # （致命错误直接报错，用户改回"跟随默认"即可）
+                    kwargs['extra_body'] = {'thinking': {'type': thinking}}
                 if tools:
                     kwargs['tools'] = tools
                     kwargs['tool_choice'] = tool_choice

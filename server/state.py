@@ -180,6 +180,15 @@ class AppState:
         # 先取消所有未完成任务并等其退出，再关库（否则任务收尾写库撞关库）
         for rec in self.app_db.list_jobs(active_only=True):
             self.jobs.cancel(rec['id'])
+        # 长命引擎子进程（渲染沙盒 / SDK translate 的 renpy.exe）不随
+        # 服务退出：detached 模式收尾走 os._exit，Windows 下不连带杀子
+        # 进程——主动杀进程树，顺带让卡在 communicate(timeout)/轮询里的
+        # 任务立即返回，下面的等待才收得拢
+        from proc_registry import kill_all as kill_child_procs
+        try:
+            await loop.run_in_executor(None, kill_child_procs)
+        except Exception as e:
+            self.logger.warning(f'关停清理子进程失败: {e}')
         for _ in range(100):  # 最多等 10s
             active = [self.jobs.get(r['id'])
                       for r in self.app_db.list_jobs(active_only=True)]
@@ -293,6 +302,7 @@ class AppState:
                 model=cfg.model, temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 context_lines=cfg.context_lines, timeout=cfg.timeout,
+                thinking=getattr(cfg, 'thinking', 'default'),
             ))
             translator.api_log_callback = self._on_api_log
             max_context_k = getattr(cfg, 'max_context', 8)
@@ -357,6 +367,7 @@ class AppState:
             model=cfg.model, temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
             context_lines=cfg.context_lines, timeout=cfg.timeout,
+            thinking=getattr(cfg, 'thinking', 'default'),
         )
         max_context_k = getattr(cfg, 'max_context', 8)
         max_tokens = getattr(cfg, 'max_tokens', 1000)

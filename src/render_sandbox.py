@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 from rt_home import find_resource
+from proc_registry import kill_tree, track, untrack
 
 # 入口劫持（label_overrides 在 jump/call 时查询，见 renpy/script.py）
 _REDIRECT_RPY = '''\
@@ -352,25 +353,6 @@ def build_driver_script(jobs: list) -> str:
     return '\n'.join(lines)
 
 
-def _kill_tree(proc):
-    """杀进程树（Windows taskkill /T /F；POSIX 进程组）"""
-    try:
-        if sys.platform == 'win32':
-            subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
-                           capture_output=True, timeout=10)
-        else:
-            import signal
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-
 def run_sandbox(source_root: str, jobs: list,
                 timeout: int = 1800) -> dict:
     """跑一遍渲染沙盒，返回 {label: [png 文件名（out 目录相对）]}
@@ -405,6 +387,9 @@ def run_sandbox(source_root: str, jobs: list,
         [str(exe), str(_project_dir(root))],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, cwd=str(exe.parent), errors='ignore')
+    # 注册到全局表：服务关停时兜底杀树（os._exit 不连带杀子进程，
+    # 卡在菜单里的引擎进程永不退出，communicate(timeout) 又打不断）
+    track(proc)
     out_text = ''
     try:
         out_text, _ = proc.communicate(timeout=timeout)
@@ -415,14 +400,15 @@ def run_sandbox(source_root: str, jobs: list,
     except subprocess.TimeoutExpired:
         # 超时=沙盒卡死（多半是入口被游戏菜单截住或引擎弹错窗）
         # —— 必须连进程树杀掉，错误窗口不会自己关
-        _kill_tree(proc)
+        kill_tree(proc)
         raise RuntimeError(f'渲染沙盒超时（{timeout}s），已终止进程树: '
                            f'{(out_text or "")[-400:]}')
     except BaseException:
         if proc.poll() is None:
-            _kill_tree(proc)
+            kill_tree(proc)
         raise
     finally:
+        untrack(proc)
         # 驱动文件随用随清（out 目录保留给 harvest，随后删）
         for name in _DRIVER_FILES:
             (root / name).unlink(missing_ok=True)

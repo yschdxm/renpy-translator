@@ -1,35 +1,10 @@
 """API 路由聚合"""
-from functools import lru_cache
-
 from fastapi import APIRouter
 
-from . import configs, embedded, export, glossary, graph, jobs, logs, names, projects, session, system, texts
+from . import configs, embedded, export, glossary, graph, jobs, logs, names, projects, session, system, texts, updates
+from ..version import app_version as _app_version
 
 router = APIRouter()
-
-
-@lru_cache(maxsize=1)
-def _app_version() -> str:
-    """版本号：importlib.metadata 优先（uv/pip 安装态），解析 pyproject.toml 兜底
-    （源码直接运行 / PyInstaller 冻结时 dist 元数据不可用）。
-
-    lru_cache：/health 是高频探测端点，版本号进程内不变，避免每次重复
-    importlib 查询/磁盘 IO。"""
-    try:
-        from importlib.metadata import version
-        return version('renpy-translator')
-    except Exception:
-        pass
-    try:
-        import sys
-        import tomllib
-        from pathlib import Path
-        # 冻结后仓库根不可达，以 _MEIPASS 为基准兜底找 pyproject（通常找不到→unknown）
-        base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[2]))
-        with (base / 'pyproject.toml').open('rb') as f:
-            return tomllib.load(f)['project']['version']
-    except Exception:
-        return 'unknown'
 
 
 @router.get('/health')
@@ -65,3 +40,4 @@ router.include_router(embedded.router)
 router.include_router(export.router)
 router.include_router(graph.router)
 router.include_router(system.router)
+router.include_router(updates.router)

@@ -21,7 +21,9 @@ import sys
 block_cipher = None
 
 datas = [('src', 'src'), ('web/dist', 'web/dist'),
-         ('installer/icon.png', 'assets')]
+         ('installer/icon.png', 'assets'),
+         # 版本号来源：冻结态 /api/health 与更新检查从 _MEIPASS 读它
+         ('pyproject.toml', '.')]
 # tiktoken 的编码表（cl100k_base 等）在命名空间包 tiktoken_ext 里，
 # 由 pkgutil.iter_modules 动态发现 importlib 导入，静态分析追踪不到，
 # 冻结后 "Plugins found: []"。整体收集 tiktoken_ext 即可（它随 tiktoken

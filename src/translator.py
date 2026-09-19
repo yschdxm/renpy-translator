@@ -31,10 +31,12 @@ class TranslationConfig:
     api_base: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-3.5-turbo"
-    temperature: float = 0.3
+    # 温度：None=不发参数（跟随模型默认，请求体省略 temperature）
+    temperature: Optional[float] = None
     max_tokens: int = 1000
     context_lines: int = 3
     timeout: int = 30
+    thinking: str = 'default'  # default/enabled/disabled，见 ModelConfig.thinking
 
 
 def _strip_speaker_prefix(text: str, character: str) -> str:
@@ -135,7 +137,7 @@ class AITranslator:
         self.config = config
         self._llm.update_config(config)
 
-    def chat_completion(self, messages: list, temperature: float = None,
+    def chat_completion(self, messages: list, temperature: Optional[float] = None,
                         max_tokens: int = None, tools: list = None,
                         tool_choice=None, return_message: bool = False,
                         task_type: str = ''):
@@ -145,7 +147,8 @@ class AITranslator:
             tools=tools, tool_choice=tool_choice,
             return_message=return_message, task_type=task_type)
 
-    def _call_api(self, messages: list, temperature: float, max_tokens: int,
+    def _call_api(self, messages: list, temperature: Optional[float],
+                  max_tokens: int,
                   tools: list = None, tool_choice: dict = None,
                   return_message: bool = False, task_type: str = ''):
         """兼容旧签名，委托给 LLMClient.chat_completion；
