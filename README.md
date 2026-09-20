@@ -4,7 +4,7 @@
 
 # Ren'Py 游戏翻译工具
 
-AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内嵌文本提取、一键导出成品游戏
+AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内嵌文本提取、一键导出成品游戏，附实验性剧情分支图 / 人物关系图谱
 
 [![最新版本](https://img.shields.io/github/v/release/yschdxm/renpy-translator)](https://github.com/yschdxm/renpy-translator/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -58,6 +58,35 @@ AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内�
 - 自动处理 Ren'Py 的 `%` 格式化陷阱（裸 % 转义、strftime/%(name)s 保留）
 - 反编译产生的 .rpy 自动移除，游戏运行原始 .rpyc
 
+### 剧情分支图 / 人物关系图谱（实验功能）
+
+> ⚠️ **实验功能未经完整验证，不能确保准确性**：剧情图由脚本静态解析 + AI 摘要生成，
+> 关系图由 AI 从台词推断，均可能与游戏实际剧情 / 人物关系不一致，仅供参考浏览，
+> 不参与翻译与导出主流程。
+
+- **剧情分支图**：静态解析游戏脚本还原剧情分支结构（菜单选项、跳转、调用、
+  动态跳变静态恢复），AI 为每个场景生成摘要；场景卡片带缩略图与翻译进度着色
+  （绿=全译 / 黄=部分 / 灰=未译）；支持结局跳转、搜索自动展开命中路径、
+  按文件过滤、增量更新；每个场景多帧缩略图可手动挑选
+- **人物关系图谱**：AI 通读台词推断角色关系（阵营筛选、共现边开关），
+  AI 重算保留人工添加的关系，可手动增删改；角色卡展示立绘头像与关系列表
+- **引擎渲染（实验）**：场景缩略图与角色立绘默认由 Pillow 合成（transform 静态近似）；
+  开启后改用游戏自己的 Ren'Py 引擎在沙盒中渲染——真实 ATL 动画、layeredimage
+  分层立绘、CG 渲染路径，两页共用同一开关
+
+> ⚠️ **引擎渲染是实验性中的实验性功能，不能保证正常运行**：沙盒需在后台驱动游戏
+> 引擎逐场景回放，深度定制初始化的游戏可能渲染失败或不完整（失败明确报错，
+> 不静默回退）；关闭开关即回到 Pillow 合成。
+
+### AI 模型配置
+
+- OpenAI 兼容接口（DeepSeek、GPT、Claude、OpenRouter 等均可），全局激活、
+  多配置随时切换，保存后立即生效不打断进行中的任务；「测试连接」一键验证
+- 思考模式三态开关（跟随模型默认不发参数 / 开启 / 关闭，DeepSeek V4、GLM、
+  豆包等同形 thinking 参数）；温度留空即不发参数、跟随模型默认
+- 应用内「检查更新」（GitHub Release）：手动检查有反馈，可开启启动时自动检查
+  （有新版本才弹窗，失败静默）
+
 ### 任务与状态
 - 长任务（批量翻译/建项/导出）后台执行，进度条 + 实时日志（SSE）
 - 服务重启/页面刷新自动重连回放；中断任务如实标记，翻译类重发自动跳过已完成部分
@@ -83,7 +112,9 @@ AI 翻译 + 手动校对，支持解包/反编译、人名与角色分析、内�
 
 - 便携版：数据存 exe 旁，整目录拷走即迁移
 - 安装版：默认落平台数据目录（`%APPDATA%/renpy-translator` 等），
-  安装向导与应用内「模型配置 → 数据目录」都可自定义，应用内修改自动迁移全部数据
+  安装向导与应用内「模型配置 → 数据目录」都可自定义，应用内修改自动迁移全部数据；
+  重复运行安装包会检测已安装版本——可选**原路径更新**（保留现有数据目录与全部数据）
+  或全新安装另选路径
 
 ### 反编译依赖（仅 rpyc-only 游戏）
 
@@ -131,6 +162,8 @@ uv run pytest          # tests/ 正式测试（导出愈合/批次重试/迁移�
 4. **对话翻译**：建议先完成人名与风格指南；按角色筛选、看上下文、行内精修
 5. **导出游戏**：导出页一键导出（含编译校验 + 自动修复），成品 zip 在
    `exports/<项目名>/<项目名>-translated.zip`，导出页可直接下载/在文件管理器中打开
+6. **（可选）剧情浏览**：任意阶段可构建剧情分支图 / 人物关系图谱辅助浏览剧情
+   （实验功能，未经完整验证，不能确保准确性，详见使用说明）
 
 ## 打包与发布
 
@@ -188,13 +221,13 @@ renpy-translator/
 ├── .github/workflows/         # 跨平台 CI 构建（冒烟含 health/deep 惰性依赖检查）
 ├── tests/                     # pytest 测试（导出愈合/批次重试/迁移预检）
 ├── server/                    # FastAPI 后端
-│   ├── app.py / state.py / appdb.py / deps.py / errors.py
+│   ├── app.py / state.py / appdb.py / deps.py / errors.py / version.py
 │   ├── jobs/                  # 任务系统（db 持久化 + 轮询 SSE + ask/answer + 取消/互斥）
-│   └── api/                   # REST 路由（session/projects/texts/names/embedded/export/configs/jobs/logs/system）
+│   └── api/                   # REST 路由（session/projects/texts/names/embedded/export/configs/graph/updates/jobs/logs/system）
 ├── web/                       # Vue3 + Vite + TS + Naive UI 前端
 │   └── src/{api,stores,pages,components,composables}/
 ├── src/                       # 纯逻辑核心（与 UI 无关）
-│   ├── db/                    # 项目库（base/content/character/glossary/embedded/update 六模块组合）
+│   ├── db/                    # 项目库（base/content/character/glossary/embedded/update/graph 七模块组合）
 │   ├── database.py            # db 包门面（from db import ProjectDatabase）
 │   ├── translator.py          # AI 翻译门面（批次/单条/人名/分析）
 │   ├── llm_client.py          # OpenAI 兼容客户端（重试/错误分类）
@@ -202,11 +235,15 @@ renpy-translator/
 │   ├── token_budget.py        # token 预算统一计算（批次/上下文/输出上限）
 │   ├── translation_service.py # 翻译编排（分批/上下文/落库）
 │   ├── renpy_parser.py / rpa_extractor.py / rpyc_decompiler.py / tl_parser.py
+│   ├── flow_parser.py         # 剧情流静态解析（分支/场景/动态跳变恢复，实验功能）
+│   ├── scene_builder.py / scene_composer.py   # 剧情图构建 / 场景缩略图 Pillow 合成
+│   ├── render_sandbox.py      # Ren'Py 引擎渲染沙盒（实验性中的实验性）
 │   ├── ai_screener.py         # 内嵌文本 AI 预筛（agentic tool 循环）
 │   ├── source_tree.py         # 源码树缓存（预筛/精判 IO 复用）
 │   ├── embedded_strings.py    # 内嵌文本提取/标记
 │   ├── rt_home.py             # 数据根解析
-│   ├── services/              # 业务服务层（建项/更新/导出/人名/内嵌管线 + game_pipeline 公共编排）
+│   ├── proc_registry.py       # 子进程注册表（退出统一杀进程树，防孤儿进程）
+│   ├── services/              # 业务服务层（建项/更新/导出/人名/内嵌/剧情图/关系图 + game_pipeline 公共编排）
 │   └── project_manager.py / config_manager.py / logger.py / sdk_manager.py
 └── data/  projects/  config/  fonts/  logs/  exports/  tools/   # 用户数据（不提交）
 ```
@@ -221,6 +258,9 @@ renpy-translator/
 | `characters` | 角色信息（人名+画像+台词数，变量名为主键） |
 | `glossary` | 术语表 |
 | `embedded_candidates` | 内嵌文本候选（AI 判定持久化） |
+| `story_nodes` / `story_edges` | 剧情图场景节点与跳转边（实验功能） |
+| `story_scenes` / `story_scene_edges` | 场景卡片、缩略图候选与归属（实验功能） |
+| `char_relations` / `char_avatars` | 人物关系与立绘头像（实验功能） |
 | `data/app.db: jobs/job_events/settings` | 任务/事件流/全局设置 |
 
 ## 技术栈
@@ -250,6 +290,8 @@ tools/python-embed/LICENSE.txt），仅用于冻结环境下的反编译子进�
 
 1. 请确保有游戏汉化授权
 2. 翻译前建议备份游戏文件
+3. 剧情分支图 / 人物关系图谱为实验功能，未经完整验证，不能确保准确性；其中的引擎渲染
+   是实验性中的实验性功能，不能保证正常运行，失败会明确报错、可随时关闭回到合成渲染
 
 ---
 
