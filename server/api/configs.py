@@ -36,6 +36,9 @@ def _validate(req: 'ConfigIn'):
     # 超限时 API 的 400 报错会带合法范围，保存时只拦无意义的非正值
     if req.max_tokens < 1:
         raise ApiError(400, 'BAD_MAX_TOKENS', 'max_tokens 必须为正整数')
+    if req.max_context < 1 or req.batch_lines < 1 or req.timeout < 1 or req.context_lines < 0:
+        raise ApiError(400, 'BAD_LIMITS',
+                       '上下文窗口、每批句数和超时必须为正整数，上下文行数不能为负数')
     if req.thinking not in _THINKING_VALUES:
         raise ApiError(400, 'BAD_THINKING',
                        f'thinking 取值只能是: {"/".join(_THINKING_VALUES)}')

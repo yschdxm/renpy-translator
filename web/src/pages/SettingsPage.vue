@@ -293,17 +293,30 @@ onMounted(async () => {
           <n-input-number v-model:value="form.max_tokens"
                           placeholder="单次回复的输出上限（非上下文窗口）" style="width: 100%" />
         </n-form-item>
-        <n-form-item label="上下文行数">
-          <n-input-number v-model:value="form.context_lines" />
+        <n-form-item label="参考台词行数">
+          <n-input-number v-model:value="form.context_lines" :min="0" :precision="0" />
         </n-form-item>
+        <n-text depth="3" style="display: block; margin: -12px 0 16px; font-size: 12px">
+          随待译文本附带的参考台词上限，0 为不附带。单句翻译取前后各这么多行；
+          批量只取前文、最多 8 行，窗口不足时还会减少。参考台词仅帮助模型理解剧情，不会在本次请求中修改其译文。
+        </n-text>
         <n-form-item label="上下文窗口(K)">
-          <n-input-number v-model:value="form.max_context" />
+          <n-input-number v-model:value="form.max_context" :min="1" :precision="0" />
         </n-form-item>
+        <n-text depth="3" style="display: block; margin: -12px 0 16px; font-size: 12px">
+          单次请求的总容量（1K = 1024 tokens）：提示词、人名/术语、参考台词、待译文本和模型输出共用。
+          使用 LM Studio 时按模型实际加载的上下文长度填写，例如 32768 tokens 填 32；
+          此处不会改变模型服务的加载设置。
+        </n-text>
         <n-form-item label="每批句数">
-          <n-input-number v-model:value="form.batch_lines" />
+          <n-input-number v-model:value="form.batch_lines" :min="1" :precision="0" />
         </n-form-item>
+        <n-text depth="3" style="display: block; margin: -12px 0 16px; font-size: 12px">
+          一次批量请求最多翻译多少条，不是并发数。实际批次还受窗口和输出预算限制，长句会少于此值。
+          调大可减少请求次数，但等待更久、漏译后的重试成本更高；漏译多时可调小。
+        </n-text>
         <n-form-item label="超时(秒)">
-          <n-input-number v-model:value="form.timeout" />
+          <n-input-number v-model:value="form.timeout" :min="1" :precision="0" />
         </n-form-item>
         <n-form-item label="思考模式">
           <n-select v-model:value="form.thinking" :options="[

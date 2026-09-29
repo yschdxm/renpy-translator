@@ -148,7 +148,9 @@ const columns: DataTableColumns<NameRow> = [
           value: editingText.value,
           'onUpdate:value': (v: string) => { editingText.value = v },
           onBlur: () => onCommit(r),
-          onKeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') onCommit(r) },
+          onKeydown: (e: KeyboardEvent) => {
+            if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) onCommit(r)
+          },
           autofocus: true,
           size: 'small',
         })

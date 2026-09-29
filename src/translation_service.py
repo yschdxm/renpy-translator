@@ -57,9 +57,11 @@ class TranslationService:
 
         可用 token = 模型上下文窗口 - 已占用部分（模板常量 + 术语表/角色特征实测）
         """
+        requested = max(0, self.translator.config.context_lines)
         return TokenBudget(self.max_context_k * 1024).context_line_count(
             glossary_tokens=count_tokens(glossary_text),
             profile_tokens=count_tokens(character_profile),
+            min_lines=0, max_lines=requested,
         )
 
     @property
@@ -109,33 +111,48 @@ class TranslationService:
     # ===== 批次翻译 =====
 
     def group_into_batches(self, items: list, glossary_tokens: int = 0,
-                           profile_tokens: int = 0) -> list:
+                           profile_tokens: int = 0,
+                           profile_tokens_by_character: Optional[dict[str, int]] = None) -> list:
         """按句数与 token 双重上限分组
 
         1. 每批最多 batch_lines 句（模型配置）
         2. 整体输入（含提示词）+ 估算输出（批原文 × 1.2 + 300）≤ 上下文窗口
         3. 估算输出 ≤ 模型声明 max_tokens
 
-        glossary_tokens / profile_tokens 为调用方实测的术语表与角色特征 token 数。
+        角色资料按候选批次内的不同角色累加，不能给每批扣除全项目角色资料。
+        profile_tokens 保留给固定的额外资料；角色映射中的值含段落分隔开销。
         """
-        budget = TokenBudget(self.max_context_k * 1024).batch_src_token_budget(
-            glossary_tokens=glossary_tokens,
-            profile_tokens=profile_tokens,
-            declared_max_tokens=self.max_tokens,
-        )
+        token_budget = TokenBudget(self.max_context_k * 1024)
+        profiles = profile_tokens_by_character or {}
+
+        def source_budget(profile_size):
+            return token_budget.batch_src_token_budget(
+                glossary_tokens=glossary_tokens,
+                profile_tokens=profile_size,
+                declared_max_tokens=self.max_tokens,
+            )
 
         batches, current, used = [], [], 0
+        current_chars = set()
+        current_profile_tokens = profile_tokens
         for item in items:
             char = item.get('character', '')
             # 编号 + [角色] 标记 + 格式开销
             line_tokens = count_tokens(item.get('original_text', '')) \
                 + (count_tokens(char) + 2 if char else 0) + 4
+            added_profile_tokens = profiles.get(char, 0) if char not in current_chars else 0
             if current and (len(current) >= self.batch_lines
-                            or used + line_tokens > budget):
+                            or used + line_tokens > source_budget(
+                                current_profile_tokens + added_profile_tokens)):
                 batches.append(current)
                 current, used = [], 0
+                current_chars = set()
+                current_profile_tokens = profile_tokens
+                added_profile_tokens = profiles.get(char, 0)
             current.append(item)
             used += line_tokens
+            current_chars.add(char)
+            current_profile_tokens += added_profile_tokens
         if current:
             batches.append(current)
         return batches
@@ -151,23 +168,20 @@ class TranslationService:
             cfg = await loop.run_in_executor(None, self.config_provider)
             if cfg:
                 self.max_context_k, self.max_tokens, self.batch_lines = cfg
-        glossary_text = await loop.run_in_executor(None, self._get_glossary_text)
-        glossary_tokens = count_tokens(glossary_text)
+        def prepare():
+            glossary_tokens = count_tokens(self._get_glossary_text())
+            glossary_tokens += count_tokens(self._get_style_guide())
+            profiles = {}
+            if content_type == 'dialogue':
+                chars = {it.get('character', '') for it in items if it.get('character')}
+                for char in chars:
+                    text = self._format_character_profiles([char], self.db.get_profile)
+                    profiles[char] = count_tokens(text) + 2 if text else 0
+            return self.group_into_batches(
+                items, glossary_tokens, profile_tokens_by_character=profiles)
 
-        # 对话批次需携带批内角色特征：按全部待译角色的特征汇总实测 token
-        # （逐批精确值要等分组后才知道，用全体角色汇总是其上界，稳妥不超重）
-        profile_tokens = 0
-        if content_type == 'dialogue':
-            chars = sorted({it.get('character', '') for it in items
-                            if it.get('character')})
-            if chars:
-                profiles_text = await loop.run_in_executor(
-                    None, lambda: self._format_character_profiles(
-                        chars, self.db.get_profile)
-                )
-                profile_tokens = count_tokens(profiles_text)
-
-        return self.group_into_batches(items, glossary_tokens, profile_tokens)
+        # 大项目分词与分组也放在线程池，避免准备阶段阻塞 API 事件循环。
+        return await loop.run_in_executor(None, prepare)
 
     async def translate_batch(self, items: list, content_type: str,
                               stash_on_failure: bool = True) -> dict:
@@ -255,11 +269,10 @@ class TranslationService:
                 text = translated_map.get(i)
                 if not text:
                     continue
-                if content_type == 'ui':
-                    self.db.update_ui_text(it['id'], text)
-                else:
-                    self.db.update_dialogue(it['id'], text)
-                saved[it['id']] = text
+                text = self.db.save_translation_if_unchanged(
+                    content_type, it['id'], it.get('translated_text', ''), text)
+                if text:
+                    saved[it['id']] = text
             if terms:
                 for t in terms:
                     t['term_type'] = 'other'

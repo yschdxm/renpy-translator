@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 文本翻译页（UI 字符串 / 对话共用，contentType 区分） */
-import { computed, h, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   NButton, NDataTable, NEmpty, NInput, NModal, NPagination, NSelect, NSpace,
   NText, NInputGroup, useMessage,
@@ -10,7 +10,6 @@ import { BookOutline, CodeSlashOutline, LanguageOutline, LocateOutline, RefreshO
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
 import FailedBatchesDialog from '../components/FailedBatchesDialog.vue'
-import { useInlineEdit } from '../composables/useInlineEdit'
 import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
 
@@ -44,8 +43,11 @@ const failedDialogVisible = ref(false)
 
 const isDialogue = computed(() => props.contentType === 'dialogue')
 const title = computed(() => (isDialogue.value ? '对话翻译' : '字符串翻译'))
+let loadVersion = 0
+onUnmounted(() => { loadVersion++ })
 
 async function load() {
+  const version = ++loadVersion
   loading.value = true
   try {
     const params = new URLSearchParams({
@@ -55,22 +57,24 @@ async function load() {
       sort_by: query.sort_by, sort_order: query.sort_order,
     })
     const data = await api.get<{ rows: Row[]; total: number }>(
-      `/api/current/texts/${props.contentType}?${params}`)
+      `/api/current/texts/${props.contentType}?${params}`, AbortSignal.timeout(30000))
+    if (version !== loadVersion) return
     rows.value = data.rows
     total.value = data.total
-    await loadFailedCount()
+    void loadFailedCount()
   } catch (e) {
-    toastError(message, e)
+    if (version === loadVersion) toastError(message, e)
   } finally {
-    loading.value = false
+    if (version === loadVersion) loading.value = false
   }
 }
 
 async function loadFailedCount() {
+  const version = loadVersion
   try {
     const data = await api.get<{ count: number }>(
-      `/api/current/texts/${props.contentType}/failed-batches`)
-    failedBatchCount.value = data.count
+      `/api/current/texts/${props.contentType}/failed-batches/count`, AbortSignal.timeout(30000))
+    if (version === loadVersion) failedBatchCount.value = data.count
   } catch { /* 计数失败不挡主流程 */ }
 }
 
@@ -87,28 +91,81 @@ async function loadCharacters() {
   ]
 }
 
-// ---- 行内编辑 ----
-const { editingText, isEditing, startEdit, commitEdit } = useInlineEdit<Row>(
-  (row) => row.id,
-  (row) => row.translated_text || '',
-  async (row, value) => {
-    const old = row.translated_text
-    row.translated_text = value
-    try {
-      await api.patch(`/api/current/texts/${props.contentType}/${row.id}`, {
-        translated_text: value,
-      })
-    } catch (e) {
-      row.translated_text = old  // 响亮回滚
-      throw e
-    }
-  })
-
-async function onCommit(row: Row) {
+// 独立编辑窗：输入状态不参与表格列重建，中文输入/失焦不触发保存。
+const editRow = ref<Row | null>(null)
+const editingText = ref('')
+const saving = ref(false)
+function startEdit(row: Row) {
+  editRow.value = row
+  editingText.value = row.translated_text || ''
+}
+async function saveEdit() {
+  if (!editRow.value || saving.value) return
+  saving.value = true
   try {
-    await commitEdit(row)
+    await api.patch(`/api/current/texts/${props.contentType}/${editRow.value.id}`, {
+      translated_text: editingText.value,
+    })
+    editRow.value.translated_text = editingText.value
+    editRow.value = null
+    toastOk(message, '译文已保存')
+    await load()
   } catch (e) {
     toastError(message, e)
+  } finally {
+    saving.value = false
+  }
+}
+function editKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing && e.keyCode !== 229) {
+    e.preventDefault()
+    saveEdit()
+  }
+}
+
+function searchKeydown(e: KeyboardEvent) {
+  // 确认输入法候选字时不触发搜索和表格刷新。
+  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return
+  query.page = 0
+  void load()
+}
+
+// 字面替换：当前筛选范围的全部页；预览签名防止后台翻译变化后误改。
+interface ReplacementPreview {
+  count: number
+  occurrences: number
+  digest: string
+  samples: Array<{ id: number; original_text: string; before: string; after: string }>
+}
+const replaceVisible = ref(false)
+const replaceForm = reactive({ find: '', replacement: '' })
+const replacePreview = ref<ReplacementPreview | null>(null)
+const replacing = ref(false)
+watch(() => [replaceForm.find, replaceForm.replacement, query.search,
+  query.filter_mode, query.character, props.contentType], () => { replacePreview.value = null })
+async function replaceTexts(apply = false) {
+  if (replacing.value || !replaceForm.find || (apply && !replacePreview.value)) return
+  replacing.value = true
+  const request = {
+    ...replaceForm, filter_mode: query.filter_mode,
+    search: query.search, character: query.character,
+    expected_digest: apply ? replacePreview.value!.digest : '',
+  }
+  try {
+    const data = await api.post<ReplacementPreview>(
+      `/api/current/texts/${props.contentType}/replace`, request)
+    if (apply) {
+      toastOk(message, `已替换 ${data.count} 条译文中的 ${data.occurrences} 处文字`)
+      replacePreview.value = null
+      await load()
+    } else {
+      replacePreview.value = data
+    }
+  } catch (e) {
+    replacePreview.value = null
+    toastError(message, e)
+  } finally {
+    replacing.value = false
   }
 }
 
@@ -152,6 +209,7 @@ async function translateOne(row: Row) {
 // ---- 批量翻译（任务）：终态后刷新表格与统计；有失败条目时自动打开核验对话框 ----
 async function onTranslateJobDone() {
   await load()
+  await loadFailedCount()
   if (failedBatchCount.value > 0) failedDialogVisible.value = true
 }
 
@@ -246,18 +304,8 @@ const columns = computed<DataTableColumns<Row>>(() => {
     render: (r) => h('span', { style: 'white-space: pre-wrap' }, r.original_text),
   })
   cols.push({
-    title: '译文（点击编辑）', key: 'translated_text', ellipsis: { tooltip: true },
+    title: '译文（点击编辑）', key: 'translated_text',
     render: (r) => {
-      if (isEditing(r)) {
-        return h(NInput, {
-          value: editingText.value,
-          'onUpdate:value': (v: string) => { editingText.value = v },
-          onBlur: () => onCommit(r),
-          onKeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') onCommit(r) },
-          autofocus: true,
-          size: 'small',
-        })
-      }
       return h('span', {
         style: `cursor: text; display: block; min-height: 20px; white-space: pre-wrap; ${r.translated_text ? '' : 'color: #666'}`,
         onClick: () => startEdit(r),
@@ -294,6 +342,7 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
       <h2 style="margin: 0">{{ title }}</h2>
       <n-button size="small" type="primary" :render-icon="renderIcon(LanguageOutline)" @click="translateAll">全部翻译</n-button>
       <n-button size="small" @click="translatePage">翻译本页</n-button>
+      <n-button size="small" @click="replacePreview = null; replaceVisible = true">查找并替换译文</n-button>
       <n-button
         v-if="failedBatchCount > 0" size="small" type="warning"
         :render-icon="renderIcon(WarningOutline)" @click="failedDialogVisible = true"
@@ -301,8 +350,12 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
       <n-button v-if="!isDialogue" size="small" :render-icon="renderIcon(LocateOutline)" @click="rebuildHints">重建上下文</n-button>
       <n-button v-if="!isDialogue" size="small" type="warning" :render-icon="renderIcon(CodeSlashOutline)" @click="extractEmbedded">提取内嵌文本</n-button>
       <n-button v-if="isDialogue" size="small" :render-icon="renderIcon(BookOutline)" @click="openStyleGuide">风格指南</n-button>
-      <n-button size="small" quaternary :render-icon="renderIcon(RefreshOutline)" @click="load">刷新</n-button>
+      <n-button size="small" quaternary :loading="loading" :render-icon="renderIcon(RefreshOutline)" @click="load">刷新</n-button>
     </n-space>
+
+    <n-text v-if="isDialogue" depth="3" style="display: block; margin-bottom: 10px; font-size: 12px">
+      人名和角色分析可逐步补充，不必全员完成即可翻译；建议先设定主要角色的译名，减少人名不一致。
+    </n-text>
 
     <n-space align="center" style="margin-bottom: 10px" wrap>
       <n-select
@@ -321,7 +374,7 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
       <n-input-group style="width: 280px">
         <n-input
           v-model:value="query.search" size="small" placeholder="搜索原文/译文"
-          @keydown.enter="query.page = 0; load()"
+          @keydown="searchKeydown"
         />
         <n-button size="small" @click="query.page = 0; load()">搜索</n-button>
       </n-input-group>
@@ -343,6 +396,51 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
         @update:page="(p: number) => { query.page = p - 1; load() }"
       />
     </n-space>
+
+    <n-modal :show="!!editRow" preset="card" title="编辑译文"
+             style="width: min(960px, 94vw)" :mask-closable="false" :close-on-esc="false"
+             :closable="false">
+      <n-space vertical>
+        <n-text depth="3">原文 · #{{ editRow?.id }}</n-text>
+        <div style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 25vh; overflow: auto">{{ editRow?.original_text }}</div>
+        <n-input v-model:value="editingText" type="textarea" autofocus :disabled="saving"
+                 :autosize="{ minRows: 8, maxRows: 18 }" @keydown="editKeydown" />
+        <n-text depth="3">Enter 换行，Ctrl / ⌘ + Enter 保存。保存失败时保留草稿。</n-text>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button :disabled="saving" @click="editRow = null">取消</n-button>
+          <n-button type="primary" :loading="saving" @click="saveEdit">保存</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <n-modal v-model:show="replaceVisible" preset="card" title="查找并替换译文"
+             style="width: min(960px, 94vw)" :mask-closable="false" :closable="!replacing"
+             :close-on-esc="!replacing">
+      <n-space vertical>
+        <n-text>范围：当前{{ title }}的筛选结果（所有页）。只替换译文，按字面匹配、区分大小写。</n-text>
+        <n-input v-model:value="replaceForm.find" :disabled="replacing" placeholder="查找，例如：阿米" />
+        <n-input v-model:value="replaceForm.replacement" :disabled="replacing" placeholder="替换为，例如：亚美（留空即删除匹配文字）" />
+        <n-text v-if="replacePreview">匹配 {{ replacePreview.count }} 条译文，共 {{ replacePreview.occurrences }} 处。下方预览前 30 条，请检查人名、变量和标签是否会被误改。</n-text>
+        <div v-if="replacePreview" style="max-height: 45vh; overflow: auto">
+          <div v-for="sample in replacePreview.samples" :key="sample.id"
+               style="padding: 10px 0; border-bottom: 1px solid #555; white-space: pre-wrap; overflow-wrap: anywhere">
+            <div>#{{ sample.id }} · {{ sample.original_text }}</div>
+            <div>替换前：{{ sample.before }}</div>
+            <div>替换后：{{ sample.after }}</div>
+          </div>
+        </div>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button :disabled="replacing" @click="replaceVisible = false">关闭</n-button>
+          <n-button :loading="replacing" :disabled="!replaceForm.find" @click="replaceTexts()">预览</n-button>
+          <n-button type="primary" :loading="replacing" :disabled="!replacePreview?.count"
+                    @click="replaceTexts(true)">确认替换 {{ replacePreview?.count || 0 }} 条</n-button>
+        </n-space>
+      </template>
+    </n-modal>
 
     <!-- 上下文对话框 -->
     <n-modal v-model:show="contextVisible" preset="card" title="上下文" style="width: 640px">

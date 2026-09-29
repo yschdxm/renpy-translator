@@ -75,7 +75,13 @@ watch(isTerminal, (v) => { if (v) emit('finished', props.job) })
 
       <n-alert v-if="job.cancelling && !isTerminal" type="warning" title="正在取消">
         取消请求已收到，任务将在当前条目完成后停止
-        （在飞的 API 调用需等待返回，并非卡住）。
+        （当前批次的 API 调用及其内部重试可能仍需等待）。
+      </n-alert>
+
+      <n-alert v-if="job.kind.startsWith('texts.translate')" type="info" title="停止与重试">
+        成功译文会保存。取消会停止后续批次，也会跳过任务收尾的自动补跑；
+        未译出的内容仍可在「失败条目」重试，或再次「全部翻译」继续。
+        自动重试处理请求失败、漏译和校验错误，不能保证发现所有人名误译。
       </n-alert>
 
       <n-alert v-if="job.error" type="error" title="任务失败">

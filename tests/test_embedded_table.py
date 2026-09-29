@@ -238,7 +238,7 @@ def test_apply_selection_wrap_no_source_change_no_sdk(tmp_path):
     pipe.game_root = root
     pipe.sdk_path = None   # 无 SDK 也必须成功
     pipe.logger = TranslationLogger()
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         pipe.apply_selection(rows, rows))
 
     assert result['wrapped'] == 0
@@ -283,7 +283,7 @@ def test_apply_selection_table_only_no_sdk(tmp_path):
 
     # 行先回 pending（apply 会重新标 marked）
     db.set_embedded_status([row_id], 'pending')
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         pipe.apply_selection(rows, rows))
 
     assert result['tabled'] == 1

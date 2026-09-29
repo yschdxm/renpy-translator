@@ -283,11 +283,11 @@ def run_tray(port: int):
 
     # 托盘拉起的界面进程：正常关停由后端广播 shutdown、前端自关；
     # 漏收广播（SSE 断线重连窗口）的残留由 quit_all 兜底终止
-    gui_procs = []
+    from gui_launcher import GuiLauncher
+    gui_launcher = GuiLauncher(lambda: _spawn_detached(_self_cmd('gui'), 'gui.log'))
 
     def open_window(icon=None, item=None):
-        gui_procs[:] = [p for p in gui_procs if p.poll() is None]
-        gui_procs.append(_spawn_detached(_self_cmd('gui'), 'gui.log'))
+        gui_launcher.open()
 
     def open_browser(icon=None, item=None):
         webbrowser.open(url)
@@ -300,9 +300,9 @@ def run_tray(port: int):
         # 兜底终止漏收关停广播的界面进程：杀进程树（terminate 只杀
         # 单进程，WebView2 子进程不会跟着退）
         from proc_registry import kill_tree
-        for p in gui_procs:
-            if p.poll() is None:
-                kill_tree(p)
+        p = gui_launcher.process
+        if p is not None and p.poll() is None:
+            kill_tree(p)
         icon.stop()
 
     icon = pystray.Icon(

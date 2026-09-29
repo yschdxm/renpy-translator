@@ -1,6 +1,6 @@
 """文本翻译 API：UI 字符串与对话（分页/编辑/单翻/批翻任务/上下文/风格指南/重建出处）"""
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from llm_client import FatalAPIError
 
@@ -46,6 +46,26 @@ async def list_texts(content_type: str, page: int = 0, size: int = 50,
 
 class UpdateTextIn(BaseModel):
     translated_text: str
+
+
+class ReplaceTextIn(BaseModel):
+    find: str = Field(min_length=1)
+    replacement: str = ''
+    filter_mode: str = 'all'
+    search: str = ''
+    character: str = ''
+    expected_digest: str = ''
+
+
+@router.post('/texts/{content_type}/replace')
+async def replace_texts(content_type: str, req: ReplaceTextIn,
+                        state: AppState = Depends(require_project)):
+    _check_ct(content_type)
+    try:
+        return await state.db_call(state.db.replace_translations,
+                                   content_type, **req.model_dump())
+    except ValueError as e:
+        raise ApiError(409, 'REPLACE_CONFLICT', str(e)) from e
 
 
 @router.patch('/texts/{content_type}/{item_id}')
@@ -104,22 +124,20 @@ async def translate_one(content_type: str, item_id: int,
 
 
 async def _check_dialogue_prerequisites(state: AppState):
-    """对话翻译前置：人名全部翻译 + 角色全部分析（移植 _check_prerequisites）"""
+    """返回准备情况提示；已有的人名和画像仍用于翻译，不强制全员完成。"""
+    warnings = []
     names = await state.db_call(state.db.get_char_dict_count)
     if names['untranslated'] > 0:
-        raise ApiError(
-            409, 'PREREQUISITE',
-            f'还有 {names["untranslated"]} 个人名未翻译，请先在「人名翻译」完成')
+        warnings.append(f'还有 {names["untranslated"]} 个人名未翻译，建议优先补充主要角色人名')
     chars = await state.db_call(state.db.get_characters)
     # 按行 profile_json 精确判断（无显示名角色在 name-key 字典里共享
     # 空键会互相误覆盖）；无显示名角色的展示名回退变量名
     unanalyzed = [(c['display_name'] or c['variable']) for c in chars
                   if not c['is_placeholder'] and not c['profile_json']]
     if unanalyzed:
-        raise ApiError(
-            409, 'PREREQUISITE',
-            f'还有 {len(unanalyzed)} 个角色未分析（{", ".join(unanalyzed[:5])}…），'
-            '请先在「人名翻译」完成分析')
+        warnings.append(f'还有 {len(unanalyzed)} 个角色未分析（{", ".join(unanalyzed[:5])}），'
+                        '将使用已有画像和台词上下文翻译')
+    return warnings
 
 
 def _make_translate_job(state: AppState, content_type: str, items: list):
@@ -131,6 +149,9 @@ def _make_translate_job(state: AppState, content_type: str, items: list):
     """
     async def body(job):
         service = _service(state)
+        if content_type == 'dialogue':
+            for warning in await _check_dialogue_prerequisites(state):
+                job.emit_log(warning)
         batches = await service.prepare_batches(items, content_type)
         total_items = len(items)
         scope_ids = {it['id'] for it in items}
@@ -143,12 +164,14 @@ def _make_translate_job(state: AppState, content_type: str, items: list):
             stashed += len(batch) - len(results)
             done += len(batch)
             job.emit_progress(done / total_items,
-                              f'已翻译 {done}/{total_items}（第 {i+1}/{len(batches)} 批）')
+                              f'已处理 {done}/{total_items}，成功 {done - stashed}，'
+                              f'待重试 {stashed}（第 {i+1}/{len(batches)} 批）')
 
         # 收尾自动重试：本任务范围内暂存的条目再给一轮机会。
         # stash_on_failure=False——重试成功的直接落库，仍失败的由这里
         # 重新暂存（避免同一批在表里翻倍）
-        recs = await state.db_call(state.db.list_failed_batches, content_type)
+        job.check_cancelled()
+        recs = await _prune_failed_batches(state, content_type)
         touched = {}  # batch_id -> (范围内条目, 范围外条目, 原错误摘要)
         for rec in recs:
             mine = [it for it in rec['items'] if it['id'] in scope_ids]
@@ -157,7 +180,8 @@ def _make_translate_job(state: AppState, content_type: str, items: list):
                     mine,
                     [it for it in rec['items'] if it['id'] not in scope_ids],
                     rec.get('error', ''))
-        retry_items = [it for mine, _, _ in touched.values() for it in mine]
+        retry_items = list({it['id']: it for mine, _, _ in touched.values()
+                            for it in mine}.values())
         if retry_items:
             job.emit_log(f'{len(retry_items)} 条未译出，做最后一轮自动重试...')
             # 与主流程同一套 token 预算分批：一次性塞全部会超上下文，
@@ -207,7 +231,6 @@ async def translate_all(content_type: str,
     _check_ct(content_type)
     _service(state)
     if content_type == 'dialogue':
-        await _check_dialogue_prerequisites(state)
         items = await state.db_call(state.db.get_untranslated_dialogues)
     else:
         items = await state.db_call(state.db.get_untranslated_ui_texts)
@@ -237,7 +260,6 @@ async def translate_page(content_type: str, req: TranslatePageIn,
     _check_ct(content_type)
     _service(state)
     if content_type == 'dialogue':
-        await _check_dialogue_prerequisites(state)
         rows, _ = await state.db_call(
             state.db.get_dialogues_page,
             req.page, req.size, req.filter_mode, req.character, req.search)
@@ -263,9 +285,17 @@ async def _prune_failed_batches(state: AppState, content_type: str) -> list:
     """列出暂存批次并顺手自愈：已全部译出的删除、部分译出的回写剩余条目"""
     recs = await state.db_call(state.db.list_failed_batches, content_type)
     kept = []
-    for rec in recs:
-        remaining = await state.db_call(
+    seen_ids = set()
+    # 多次取消/重跑会为同一句留下多份记录。保留最新的失败原因和候选译文，
+    # 同时让列表和手动重试只处理一次该条目。
+    for rec in reversed(recs):
+        untranslated = await state.db_call(
             state.db.filter_untranslated_items, content_type, rec['items'])
+        remaining = []
+        for item in untranslated:
+            if item['id'] not in seen_ids:
+                seen_ids.add(item['id'])
+                remaining.append(item)
         if not remaining:
             await state.db_call(state.db.delete_failed_batch, rec['id'])
         else:
@@ -274,7 +304,7 @@ async def _prune_failed_batches(state: AppState, content_type: str) -> list:
                     state.db.update_failed_batch_items, rec['id'], remaining)
             rec['items'] = remaining
             kept.append(rec)
-    return kept
+    return list(reversed(kept))
 
 
 @router.get('/texts/{content_type}/failed-batches')
@@ -296,6 +326,13 @@ async def list_failed_items(content_type: str,
                 'created_at': rec['created_at'],
             })
     return {'items': items, 'count': len(items), 'batch_count': len(recs)}
+
+
+@router.get('/texts/{content_type}/failed-batches/count')
+async def count_failed_items(content_type: str,
+                             state: AppState = Depends(require_project)):
+    _check_ct(content_type)
+    return {'count': await state.db_call(state.db.count_failed_items, content_type)}
 
 
 class RetryFailedIn(BaseModel):

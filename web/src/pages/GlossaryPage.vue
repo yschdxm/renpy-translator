@@ -152,7 +152,9 @@ const columns = computed<DataTableColumns<Row>>(() => [
           value: editingText.value,
           'onUpdate:value': (v: string) => { editingText.value = v },
           onBlur: () => onCommit(r),
-          onKeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') onCommit(r) },
+          onKeydown: (e: KeyboardEvent) => {
+            if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) onCommit(r)
+          },
           autofocus: true,
           size: 'small',
         })
@@ -220,7 +222,7 @@ watch(() => query.source, () => { query.page = 0; load() })
       <n-input-group style="width: 280px">
         <n-input
           v-model:value="query.search" size="small" placeholder="搜索原文/译文"
-          @keydown.enter="query.page = 0; load()"
+          @keydown.enter="!$event.isComposing && $event.keyCode !== 229 && (query.page = 0, load())"
         />
         <n-button size="small" @click="query.page = 0; load()">搜索</n-button>
       </n-input-group>

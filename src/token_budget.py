@@ -57,7 +57,6 @@ class TokenBudget:
     OUTPUT_RATIO = 1.2             # 输出 / 原文放大系数
     OUTPUT_FLOOR = 300             # 输出基础余量（格式开销）
     MIN_OUTPUT_TOKENS = 1000       # 窗口约束下的 max_tokens 下限
-    MIN_BATCH_SRC_TOKENS = 500     # 批次原文 token 下限（小窗口兜底）
     NAME_USAGE_RATIO = 0.6         # 人名分析安全系数（只用 60% 可用空间）
 
     def __init__(self, window_tokens: int):
@@ -74,11 +73,11 @@ class TokenBudget:
         fixed = self.BATCH_FIXED_TOKENS + glossary_tokens + profile_tokens
         window_cap = int((self.window_tokens - fixed - self.OUTPUT_FLOOR)
                          / (1 + self.OUTPUT_RATIO))
-        # 声明 cap 无条件参与 min：declared_max_tokens=0（配置错误）时
-        # 钉死在下限，与旧实现语义一致
+        # 声明 cap 无条件参与 min；空间耗尽时返回 0，不能虚构 500 token
+        # 的额度，否则新角色的资料已塞满窗口时仍会被并入现有批次。
         declared_cap = int((declared_max_tokens - self.OUTPUT_FLOOR)
                            / self.OUTPUT_RATIO)
-        return max(self.MIN_BATCH_SRC_TOKENS, min(window_cap, declared_cap))
+        return max(0, min(window_cap, declared_cap))
 
     def context_line_count(self, glossary_tokens: int = 0,
                            profile_tokens: int = 0,

@@ -355,6 +355,45 @@ async def test_service_batch_retry_then_persisted(translator, db, monkeypatch):
     assert db.count_failed_batches('dialogue') == 0
 
 
+async def test_retry_network_failure_preserves_partial_success(translator, db, monkeypatch):
+    calls = []
+
+    def call(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return _fake_message([{'id': 1, 'translation': '你好'}])
+        raise RuntimeError('模拟补译请求超时且请求级重试耗尽')
+
+    monkeypatch.setattr(translator, '_call_api', call)
+    service = TranslationService(translator, db, TranslationLogger())
+    items = db.get_all_dialogues()
+    try:
+        result = await service.translate_batch(items, 'dialogue')
+        assert result == {items[0]['id']: '你好'}
+        assert db.get_dialogue(items[0]['id'])['is_translated']
+        failed = db.list_failed_batches('dialogue')[0]['items']
+        assert len(failed) == 2 and all('补译请求失败' in it['reason'] for it in failed)
+    finally:
+        service.close()
+
+
+async def test_manual_edit_during_generation_is_preserved(translator, db, monkeypatch):
+    items = db.get_all_dialogues()
+
+    def call(*args, **kwargs):
+        db.update_dialogue(items[0]['id'], '人工修订：亚美')
+        return _ok_message(len(items))
+
+    monkeypatch.setattr(translator, '_call_api', call)
+    service = TranslationService(translator, db, TranslationLogger())
+    try:
+        result = await service.translate_batch(items, 'dialogue')
+        assert result[items[0]['id']] == '人工修订：亚美'
+        assert db.get_dialogue(items[0]['id'])['translated_text'] == '人工修订：亚美'
+    finally:
+        service.close()
+
+
 async def test_service_batch_partial_saved_and_stashed(translator, db, monkeypatch):
     """重试耗尽仍缺句：匹配的落库不受阻，未译出的逐条暂存（任务不中断）"""
     calls = []

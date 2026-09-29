@@ -81,41 +81,37 @@ class _FakeState:
 async def test_prerequisite_passes_with_empty_name(tmp_path):
     """无显示名角色不卡人名翻译前置；未分析按行 profile_json 判定"""
     from server.api.texts import _check_dialogue_prerequisites
-    from server.errors import ApiError
 
     db = _db(tmp_path)
     _insert(db, 'mc', '')
     _insert(db, 'e', 'Eileen', cn_name='艾琳')
-    # 人名翻译前置已过（mc 不算未翻译），但都未分析 → 报未分析
-    with pytest.raises(ApiError, match='未分析'):
-        await _check_dialogue_prerequisites(_FakeState(db))
+    warnings = await _check_dialogue_prerequisites(_FakeState(db))
+    assert len(warnings) == 1 and '未分析' in warnings[0]
     # 两个角色都分析完（mc 的档案按行 profile_json，不靠显示名键）→ 通过
     _set_profile(db, 'mc')
     _set_profile(db, 'e')
-    await _check_dialogue_prerequisites(_FakeState(db))  # 不抛
+    assert await _check_dialogue_prerequisites(_FakeState(db)) == []
     db.close()
 
 
-async def test_prerequisite_blocks_real_untranslated(tmp_path):
-    """有显示名未翻译的角色仍然卡前置（防回归）"""
+async def test_prerequisite_warns_real_untranslated(tmp_path):
+    """有显示名未翻译的角色给出提示，但不阻止翻译。"""
     from server.api.texts import _check_dialogue_prerequisites
-    from server.errors import ApiError
 
     db = _db(tmp_path)
     _insert(db, 'mc', '')
     _insert(db, 'e', 'Eileen')                   # 未翻译
-    with pytest.raises(ApiError, match='未翻译'):
-        await _check_dialogue_prerequisites(_FakeState(db))
+    warnings = await _check_dialogue_prerequisites(_FakeState(db))
+    assert len(warnings) == 2 and '未翻译' in warnings[0]
     db.close()
 
 
 async def test_prerequisite_empty_name_unanalyzed_shows_variable(tmp_path):
     """无显示名角色未分析时提示信息回退变量名（不是空字符串）"""
     from server.api.texts import _check_dialogue_prerequisites
-    from server.errors import ApiError
 
     db = _db(tmp_path)
     _insert(db, 'mc', '')
-    with pytest.raises(ApiError, match='mc'):
-        await _check_dialogue_prerequisites(_FakeState(db))
+    warnings = await _check_dialogue_prerequisites(_FakeState(db))
+    assert len(warnings) == 1 and 'mc' in warnings[0]
     db.close()

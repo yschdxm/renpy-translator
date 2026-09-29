@@ -534,20 +534,31 @@ class AITranslator:
         current_user_prompt = user_prompt
         current_tools = tools
         for attempt in range(1, self.MAX_RETRIES + 1):
-            message = self._call_api(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": current_user_prompt}
-                ],
-                temperature=self.config.temperature,
-                max_tokens=max_tokens,
-                tools=current_tools,
-                # 注意：不能强制指定函数（{"type": "function", ...}），
-                # deepseek 思考模式会拒绝该 tool_choice（400），auto 下模型也会可靠调用
-                tool_choice="auto",
-                return_message=True,
-                task_type=content_type,
-            )
+            try:
+                message = self._call_api(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": current_user_prompt}
+                    ],
+                    temperature=self.config.temperature,
+                    max_tokens=max_tokens,
+                    tools=current_tools,
+                    # 注意：不能强制指定函数（{"type": "function", ...}），
+                    # deepseek 思考模式会拒绝该 tool_choice（400），auto 下模型也会可靠调用
+                    tool_choice="auto",
+                    return_message=True,
+                    task_type=content_type,
+                )
+            except FatalAPIError:
+                raise
+            except Exception as exc:
+                if not merged:
+                    raise
+                # 后续补译请求失败时保留前面已经解析成功的句子，交由 service 落库。
+                for idx in range(n):
+                    if idx not in merged:
+                        suspicious_all[idx] = f'补译请求失败: {exc}'
+                break
             placed, terms, suspicious, rejected = self._parse_tool_response(
                 message, send_items)
             if send_map is not None:

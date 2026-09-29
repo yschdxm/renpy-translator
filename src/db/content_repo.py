@@ -9,6 +9,68 @@ from .base import _auto_reconnect
 class ContentRepo:
     """dialogues + ui_texts 两表的读写（两表结构高度同构）"""
 
+    @_auto_reconnect
+    def save_translation_if_unchanged(self, content_type: str, item_id: int,
+                                      expected: str, translated: str) -> str:
+        """模型等待期间人工已改文时保留人工值；检查与写入在同一锁/事务中。"""
+        if content_type not in ('dialogue', 'ui'):
+            raise ValueError('未知内容类型')
+        table = 'dialogues' if content_type == 'dialogue' else 'ui_texts'
+        with self._transaction():
+            row = self._conn.execute(
+                f'SELECT translated_text FROM {table} WHERE id=?', (item_id,)).fetchone()
+            if row is None:
+                return ''
+            current = row['translated_text'] or ''
+            if current != (expected or ''):
+                return current
+            self._conn.execute(
+                f'UPDATE {table} SET translated_text=?, is_translated=1 WHERE id=?',
+                (translated, item_id))
+            return translated
+
+    @_auto_reconnect
+    def replace_translations(self, content_type: str, find: str, replacement: str,
+                             filter_mode: str = 'all', search: str = '',
+                             character: str = '', expected_digest: str = '') -> dict:
+        """字面替换译文：预览摘要确认后单事务应用，防止覆盖预览后的修改。"""
+        import hashlib
+        import json
+
+        if content_type not in ('dialogue', 'ui') or not find:
+            raise ValueError('请选择有效类型并填写查找文字')
+        table = 'dialogues' if content_type == 'dialogue' else 'ui_texts'
+        clauses, params = ['instr(translated_text, ?) > 0'], [find]
+        if filter_mode in ('translated', 'untranslated'):
+            clauses.append('is_translated=?')
+            params.append(int(filter_mode == 'translated'))
+        if search:
+            clauses.append('(original_text LIKE ? OR translated_text LIKE ?)')
+            params.extend([f'%{search}%', f'%{search}%'])
+        if character and content_type == 'dialogue':
+            clauses.append('character=?')
+            params.append(character)
+        with self._transaction():
+            rows = self._conn.execute(
+                f"SELECT id, original_text, translated_text FROM {table} WHERE "
+                + ' AND '.join(clauses) + ' ORDER BY id', params).fetchall()
+            changes = [dict(id=r['id'], original_text=r['original_text'],
+                            before=r['translated_text'],
+                            after=r['translated_text'].replace(find, replacement))
+                       for r in rows if find != replacement]
+            digest = hashlib.sha256(json.dumps(
+                [content_type, find, replacement, filter_mode, search, character, changes],
+                ensure_ascii=False).encode()).hexdigest()
+            if expected_digest:
+                if expected_digest != digest:
+                    raise ValueError('译文或匹配范围已变化，请重新预览后替换')
+                self._conn.executemany(
+                    f'UPDATE {table} SET translated_text=? WHERE id=?',
+                    [(c['after'], c['id']) for c in changes])
+        return {'count': len(changes), 'occurrences': sum(
+                    c['before'].count(find) for c in changes),
+                'digest': digest, 'samples': changes[:30]}
+
     # ========== 对话翻译 ==========
 
     @_auto_reconnect
