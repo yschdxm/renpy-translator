@@ -26,10 +26,13 @@ jobs:
         include:
           - os: windows-latest
             artifact: renpy-translator-windows
-          - os: ubuntu-latest
+          # Linux 钉在旧 LTS 构建：AppImage 的 glibc 下限由构建系统决定，
+          # 在 22.04 上打包才能兼容 22.04+（AppImageHub 测试机就是 22.04，
+          # ubuntu-latest 产出的包要求 GLIBC_2.38，收录测试会失败）
+          - os: ubuntu-22.04
             artifact: renpy-translator-linux-amd64
             arch: amd64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             artifact: renpy-translator-linux-arm64
             arch: arm64
           - os: macos-latest
