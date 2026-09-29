@@ -35,7 +35,7 @@ async def list_markup_issues(state: AppState = Depends(require_project)):
     """标记违规条目完整清单（导出页逐条修订对话框用）"""
     from services.game_export import iter_markup_issues
     rows = await state.db_call(
-        lambda db: list(iter_markup_issues(db)))
+        lambda: list(iter_markup_issues(state.db)))
     return {'rows': rows}
 
 
