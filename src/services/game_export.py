@@ -474,6 +474,15 @@ class GameExporter:
 
     def _fill_dialogue(self, tl_dir: Path, translation_dict: dict, progress_cb=None) -> int:
         """填充对话翻译，progress_cb(已处理文件数, 总文件数) 回报进度"""
+        # 引号说话人（"Ricardo" "..." 匿名角色）的名字不在 Character()
+        # 定义里，zz_char_names.rpy 管不到——在 new 行直接替换说话人
+        # 字面量。保留原名项（cn == 原名）与未翻译项不进表，整行原样保留
+        name_map = {}
+        for c in self.db.get_characters():
+            cn = (c['cn_name'] or '').strip()
+            en = (c['display_name'] or '').strip()
+            if cn and en and cn != en:
+                name_map[en] = cn
 
         def _handle(lines):
             filled = 0
@@ -517,7 +526,14 @@ class GameExporter:
                                     new_lines.append(lines[i + 1])
                                 else:
                                     translated = escape_translation(cn)
-                                    new_lines.append(f'    {content_match.group(1)} "{translated}"')
+                                    speaker = content_match.group(1)
+                                    if speaker.startswith('"'):
+                                        lit = speaker[1:-1].replace('\\"', '"')
+                                        cn_speaker = name_map.get(lit)
+                                        if cn_speaker:
+                                            speaker = ('"' + cn_speaker.replace('"', '\\"')
+                                                       + '"')
+                                    new_lines.append(f'    {speaker} "{translated}"')
                                     filled += 1
                             else:
                                 new_lines.append(lines[i + 1])

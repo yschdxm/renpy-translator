@@ -247,6 +247,8 @@ def exporter(tmp_path):
     ex = object.__new__(GameExporter)
     ex._blocked = []
     ex._cancel_event = None
+    # _fill_dialogue 引号说话人替换需要人名表；空表即不替换
+    ex.db = type('StubDB', (), {'get_characters': lambda self: []})()
     tl = tmp_path / 'tl'
     tl.mkdir()
     (tl / 's.rpy').write_text(TL_CONTENT, encoding='utf-8')

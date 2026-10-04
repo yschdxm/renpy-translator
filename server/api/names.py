@@ -62,25 +62,39 @@ async def update_name(display_name: str, req: UpdateNameIn,
 
 class TranslateOneIn(BaseModel):
     variable: str = ''
+    # name=仅翻译人名 / analyze=仅分析 / both=翻译+分析
+    mode: str = 'both'
+
+
+_MODES = {'name', 'analyze', 'both'}
 
 
 @router.post('/{display_name}/translate')
 async def translate_one(display_name: str, req: TranslateOneIn,
                         state: AppState = Depends(require_project)):
-    """单条翻译+分析（同步；分段台词时可能较久）"""
+    """单条翻译/分析（同步；分段台词时可能较久）。mode 见 TranslateOneIn"""
+    if req.mode not in _MODES:
+        raise ApiError(400, 'BAD_MODE', f'未知 mode: {req.mode}')
     service = state.get_name_service(await _max_context_k(state))
     # 服务实例随项目会话缓存复用：清掉上次批量任务的残留状态
     # （取消标记与指向已结束 job 的 hooks），理由见 begin_single()
     service.begin_single()
     await service.translate_and_analyze(
-        display_name, variable=req.variable or None)
+        display_name, variable=req.variable or None, mode=req.mode)
     c = await state.db_call(state.db.get_character_by_name, display_name)
     profile = await state.db_call(state.db.get_profile, display_name)
     return {'cn_name': (c['cn_name'] if c else '') or '', 'profile': profile}
 
 
+class TranslateAllIn(BaseModel):
+    mode: str = 'both'
+
+
 @router.post('/translate-all')
-async def translate_all(state: AppState = Depends(require_project)):
+async def translate_all(req: TranslateAllIn = TranslateAllIn(),
+                        state: AppState = Depends(require_project)):
+    if req.mode not in _MODES:
+        raise ApiError(400, 'BAD_MODE', f'未知 mode: {req.mode}')
     service = state.get_name_service(await _max_context_k(state))
 
     async def body(job):
@@ -89,7 +103,7 @@ async def translate_all(state: AppState = Depends(require_project)):
         service.on_row_busy = lambda n: job.emit_log(f'开始: {n}')
         # 取消传播：轮询 job.cancel_event → service.stop()（服务内部
         # 分批循环会检查 _cancel；批量任务体内不能随意 raise，会被吞）
-        task = asyncio.create_task(service.translate_all())
+        task = asyncio.create_task(service.translate_all(mode=req.mode))
         while not task.done():
             if job.cancel_event.is_set():
                 service.stop()
@@ -99,9 +113,47 @@ async def translate_all(state: AppState = Depends(require_project)):
         job.emit_progress(1.0, '完成')
         return result
 
-    job = state.jobs.create('names.translate-all', '全部翻译+分析（人名）', {}, body,
+    title = {'both': '全部翻译+分析（人名）', 'name': '全部翻译（人名）',
+             'analyze': '全部分析（角色）'}[req.mode]
+    job = state.jobs.create(f'names.translate-all.{req.mode}', title, {}, body,
                             exclusive=True)
     return {'job_id': job.id}
+
+
+@router.post('/keep-original-all')
+async def keep_original_all(state: AppState = Depends(require_project)):
+    """全部保留原名：未翻译角色的中文名置为原名（人名表出现
+    原名→原名，指导对话 AI 正文保留原名；导出侧 cn==en 自动跳过）。
+    只填未翻译项，不覆盖已有译文/人工改动。"""
+    updated = await state.db_call(state.db.keep_original_names)
+    state.logger.info(f'保留原名: {updated} 个角色', panel='names')
+    return {'updated': updated}
+
+
+@router.post('/refresh-characters')
+async def refresh_characters_api(state: AppState = Depends(require_project)):
+    """重新提取角色（修复引号说话人 display_name 缺失等历史数据）。
+
+    不需要 SDK：parse_directory 扫源码 + tl 模板注释 + DB 对话。
+    insert_characters 按变量名合并，cn_name/profile 保留。
+    """
+    from pathlib import Path
+    from services.game_pipeline import refresh_characters
+    game_work_dir = Path(
+        state.project_manager.project_dir(state.current_project)) / 'game'
+    if not game_work_dir.exists():
+        raise ApiError(400, 'NO_GAME_DIR', f'项目游戏目录不存在: {game_work_dir}')
+
+    def _run():
+        dialogues = state.db.get_all_dialogues()
+        refresh_characters(game_work_dir, state.db, dialogues,
+                           reset_counts=True)
+    await state.run_sync(_run)
+    counts = await state.db_call(state.db.get_char_dict_count)
+    state.logger.info(
+        f"角色已重新提取: {counts['total']} 个，待翻译 {counts['untranslated']}",
+        panel='names')
+    return {'ok': True, **counts}
 
 
 @router.get('/{display_name}/profile')

@@ -106,6 +106,10 @@ class RenpyParser:
         self.characters: dict[str, CharacterInfo] = {}
         self.dialogue_lines: List[DialogueLine] = []
         self.ui_texts: List[DialogueLine] = []
+        # 引号说话人（"Ricardo" "..." 匿名角色）字面量集合：名字原样
+        # 显示在游戏对话框上，是可翻译的静态显示名——与 the_person 之类
+        # 泛指运行时变量区分。extract_dialogue 收集，parse_directory 返回
+        self._quoted_speakers: set = set()
 
     def extract_characters(self, content: str, file_path: str) -> List[CharacterInfo]:
         """从脚本中提取角色定义"""
@@ -185,6 +189,10 @@ class RenpyParser:
                         # 点分属性/下标取根变量（mc.name/the_group[0] ->
                         # mc/the_group），与角色表对齐
                         if char_var.startswith('"'):
+                            # 引号说话人（匿名角色）：字面量即游戏内显示名，
+                            # 收集供 refresh_characters 识别为可翻译角色
+                            self._quoted_speakers.add(
+                                char_var[1:-1].replace('\\"', '"'))
                             char_var = char_var[1:-1]
                         elif '.' in char_var or '[' in char_var:
                             char_var = char_var.split('.')[0].split('[')[0]
@@ -323,6 +331,8 @@ class RenpyParser:
         all_dialogues = []
         all_ui_texts = []
         extracted_files = 0
+        # 引号说话人集合随目录扫描重置（实例可能被多次 parse_directory 复用）
+        self._quoted_speakers = set()
 
         # 需要排除的目录（通用规则）
         # 1. Ren'Py 引擎目录
@@ -438,6 +448,9 @@ class RenpyParser:
             'characters': all_characters,
             'dialogues': all_dialogues,
             'ui_texts': all_ui_texts,
+            # 引号说话人字面量（匿名角色的游戏内显示名），
+            # refresh_characters 用它把引号角色与泛指变量区分开
+            'quoted_speakers': sorted(self._quoted_speakers),
             'total_files': len(rpy_files),
             'extracted_rpa': extracted_files,
             'decompiled_rpyc_ok': len(decompiled['success']),

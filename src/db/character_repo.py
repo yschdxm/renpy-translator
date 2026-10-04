@@ -183,6 +183,21 @@ class CharacterRepo:
         return [self._row_to_character_dict(r) for r in rows]
 
     @_auto_reconnect
+    def keep_original_names(self) -> int:
+        """全部保留原名：未翻译角色的 cn_name 置为 display_name。
+
+        人名对照表出现「Ricardo → Ricardo」，指导对话 AI 正文中也保留
+        原名；计入已翻译（不再触发未翻译警告）；导出侧 cn==en 自动跳过。
+        只填未翻译项，不覆盖已有译文/人工改动。返回更新行数。
+        """
+        cur = self._conn.execute(
+            "UPDATE characters SET cn_name=display_name "
+            "WHERE (cn_name='' OR cn_name IS NULL) "
+            "AND display_name != '' AND is_placeholder=0")
+        self._conn.commit()
+        return cur.rowcount
+
+    @_auto_reconnect
     def get_char_dict_count(self) -> dict:
         """统计角色翻译（无显示名角色没有可翻译的名字，
         不计入总数也不算未翻译——否则永远凑不齐"人名全部翻译"，

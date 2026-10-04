@@ -2,8 +2,8 @@
 /** 人名翻译页：翻译+分析融合流程 */
 import { computed, h, onMounted, ref } from 'vue'
 import {
-  NButton, NDataTable, NEmpty, NInput, NInputGroup, NModal, NSelect, NSpace,
-  NTag, NText, useMessage,
+  NButton, NDataTable, NEmpty, NInput, NInputGroup, NModal, NPopconfirm,
+  NSelect, NSpace, NTag, NText, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import { LanguageOutline, RefreshOutline } from '@vicons/ionicons5'
@@ -30,6 +30,9 @@ const rows = ref<NameRow[]>([])
 const stats = ref({ total: 0, translated: 0, analyzed: 0 })
 const loading = ref(false)
 const processing = ref<Set<string>>(new Set())
+
+// 行的唯一键：多个无显示名角色共享空 original，必须带上 variable
+const rowKey = (r: NameRow) => `${r.original}|${r.variable}`
 
 async function load() {
   loading.value = true
@@ -92,28 +95,79 @@ async function onCommit(row: NameRow) {
   }
 }
 
-async function translateOne(row: NameRow) {
-  processing.value.add(row.original)
+async function runOne(row: NameRow, mode: 'name' | 'analyze') {
+  processing.value.add(rowKey(row))
   try {
     const data = await api.post<{ cn_name: string; profile: object }>(
       `/api/current/names/${encodeURIComponent(row.original || row.variable)}/translate`,
-      { variable: row.variable })
-    row.translated = data.cn_name || row.translated
-    row.name_done = !!row.translated.trim()
-    row.analyzed = !!data.profile
+      { variable: row.variable, mode })
+    if (mode === 'name') {
+      row.translated = data.cn_name || row.translated
+      row.name_done = !!row.translated.trim()
+      toastOk(message, `${row.original} → ${data.cn_name}`)
+    } else {
+      row.analyzed = !!data.profile
+      toastOk(message, `${row.original || row.variable} 分析完成`)
+    }
     await session.refresh()
-    toastOk(message, `${row.original} → ${data.cn_name}`)
   } catch (e) {
     toastError(message, e)
   } finally {
-    processing.value.delete(row.original)
+    processing.value.delete(rowKey(row))
   }
 }
 
-async function translateAll() {
+// 保留原名：中文名=原名，人名对照表指导对话 AI 正文也保留原名
+async function keepOriginal(row: NameRow) {
+  try {
+    await api.patch(`/api/current/names/${encodeURIComponent(row.original || row.variable)}`, {
+      cn_name: row.original, variable: row.variable,
+    })
+    row.translated = row.original
+    row.name_done = true
+    await session.refresh()
+    toastOk(message, `${row.original} 已标记保留原名`)
+  } catch (e) {
+    toastError(message, e)
+  }
+}
+
+async function translateAll(mode: 'name' | 'analyze') {
   await runJob(
-    () => api.post('/api/current/names/translate-all'),
+    () => api.post('/api/current/names/translate-all', { mode }),
     () => load())
+}
+
+const keepAllLoading = ref(false)
+async function keepOriginalAll() {
+  keepAllLoading.value = true
+  try {
+    const data = await api.post<{ updated: number }>('/api/current/names/keep-original-all')
+    toastOk(message, `已保留原名: ${data.updated} 个角色`)
+    await session.refresh()
+    await load()
+  } catch (e) {
+    toastError(message, e)
+  } finally {
+    keepAllLoading.value = false
+  }
+}
+
+// 重新提取角色：修复引号说话人（"Ricardo" "..." 匿名角色）历史上
+// 被误判为泛指变量、display_name 缺失显示「无需翻译」的存量数据
+const refreshLoading = ref(false)
+async function refreshCharacters() {
+  refreshLoading.value = true
+  try {
+    await api.post('/api/current/names/refresh-characters')
+    toastOk(message, '角色已重新提取')
+    await session.refresh()
+    await load()
+  } catch (e) {
+    toastError(message, e)
+  } finally {
+    refreshLoading.value = false
+  }
 }
 
 // ---- 画像对话框 ----
@@ -171,28 +225,40 @@ const columns: DataTableColumns<NameRow> = [
     title: '翻译', key: 'name_status', width: 90,
     render: (r) => h(NTag, {
       size: 'small',
-      type: processing.value.has(r.original) ? 'warning' : r.name_done ? 'success' : 'default',
+      type: processing.value.has(rowKey(r)) ? 'warning' : r.name_done ? 'success' : 'default',
     }, () => {
       // 无显示名角色（泛指形参/玩家命名主角）没有可翻译的名字，不算待翻译
       if (!r.original) return '无需翻译'
-      return processing.value.has(r.original) ? '处理中' : r.name_done ? '完成' : '待翻译'
+      return processing.value.has(rowKey(r)) ? '处理中' : r.name_done ? '完成' : '待翻译'
     }),
   },
   {
     title: '分析', key: 'analysis_status', width: 90,
     render: (r) => h(NTag, {
       size: 'small',
-      type: processing.value.has(r.original) ? 'warning' : r.analyzed ? 'success' : 'default',
-    }, () => processing.value.has(r.original) ? '处理中' : r.analyzed ? '已完成' : '未分析'),
+      type: processing.value.has(rowKey(r)) ? 'warning' : r.analyzed ? 'success' : 'default',
+    }, () => processing.value.has(rowKey(r)) ? '处理中' : r.analyzed ? '已完成' : '未分析'),
   },
   {
-    title: '操作', key: 'actions', width: 190,
+    title: '操作', key: 'actions', width: 300,
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, {
         size: 'tiny', type: 'primary', quaternary: true,
-        loading: processing.value.has(r.original),
-        onClick: () => translateOne(r),
-      }, () => '翻译+分析'),
+        disabled: !r.original,
+        loading: processing.value.has(rowKey(r)),
+        onClick: () => runOne(r, 'name'),
+      }, () => '翻译'),
+      h(NButton, {
+        size: 'tiny', quaternary: true,
+        loading: processing.value.has(rowKey(r)),
+        onClick: () => runOne(r, 'analyze'),
+      }, () => '分析'),
+      // 保留原名：不想翻译人名时使用，正文提及也保留原名
+      h(NButton, {
+        size: 'tiny', quaternary: true,
+        disabled: !r.original || r.translated === r.original,
+        onClick: () => keepOriginal(r),
+      }, () => '保留原名'),
       h(NButton, {
         size: 'tiny', quaternary: true, disabled: !r.analyzed,
         onClick: () => viewProfile(r),
@@ -208,7 +274,15 @@ onMounted(load)
   <div>
     <n-space align="center" style="margin-bottom: 12px">
       <h2 style="margin: 0">人名翻译</h2>
-      <n-button size="small" type="primary" :render-icon="renderIcon(LanguageOutline)" @click="translateAll">全部翻译+分析</n-button>
+      <n-button size="small" type="primary" :render-icon="renderIcon(LanguageOutline)" @click="translateAll('name')">全部翻译</n-button>
+      <n-button size="small" @click="translateAll('analyze')">全部分析</n-button>
+      <n-popconfirm @positive-click="keepOriginalAll">
+        <template #trigger>
+          <n-button size="small" quaternary :loading="keepAllLoading">全部保留原名</n-button>
+        </template>
+        将所有未翻译角色的中文名设为原名（正文提及也保留原名），可随时单个改回。
+      </n-popconfirm>
+      <n-button size="small" quaternary :loading="refreshLoading" @click="refreshCharacters">重新提取角色</n-button>
       <n-button size="small" quaternary :render-icon="renderIcon(RefreshOutline)" @click="load">刷新</n-button>
       <n-text depth="3" style="font-size: 12px">
         {{ stats.total }} 人名，翻译 {{ stats.translated }}，分析 {{ stats.analyzed }}
@@ -235,7 +309,7 @@ onMounted(load)
 
     <n-data-table
       :columns="columns" :data="filteredRows" :loading="loading"
-      :row-key="(r: NameRow) => r.original + r.variable" size="small"
+      :row-key="rowKey" size="small"
       :pagination="{ pageSize: 50 }"
       :render-empty="() => h(NEmpty, { description: '暂无人名' })"
     />

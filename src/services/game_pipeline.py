@@ -10,9 +10,38 @@ run_in_executor 偏函数）调度阻塞调用，不自己拿事件循环。
 import asyncio
 import json as _json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
+
+
+# tl 模板注释行里的引号说话人：# "Ricardo" "..."（旁白注释只有一个
+# 字符串，要求两个串才不误吞）
+_TL_QUOTED_SPEAKER_RE = re.compile(
+    r'^\s*#\s+"((?:[^"\\]|\\.)*)"\s+"')
+
+
+def _scan_quoted_speakers_from_tl(game_work_dir: Path) -> set:
+    """从 tl 模板注释行捞引号说话人（补集）。
+
+    纯 rpyc 且反编译失败的游戏源码扫描为空，quoted_speakers 只能靠
+    SDK 生成的 tl 模板反推。
+    """
+    tl_root = game_work_dir / 'game' / 'tl'
+    if not tl_root.exists():
+        return set()
+    out = set()
+    for rpy in tl_root.rglob('*.rpy'):
+        try:
+            content = rpy.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            continue
+        for line in content.split('\n'):
+            m = _TL_QUOTED_SPEAKER_RE.match(line)
+            if m:
+                out.add(m.group(1).replace('\\"', '"'))
+    return out
 
 
 def _unrpyc_python_exe() -> str:
@@ -151,6 +180,13 @@ def refresh_characters(game_work_dir: Path, db, dialogues: list,
     from renpy_parser import RenpyParser
     char_result = RenpyParser().parse_directory(
         str(game_work_dir), extract_rpa=False)
+    # 引号说话人（"Ricardo" "..." 匿名角色）：字面量即游戏内显示名，
+    # 可翻译；与 the_person 式泛指运行时变量（没有可译的静态名字）
+    # 区分。比较前两侧统一转义还原（tl 注释与源码的转义形态可能不同）。
+    # tl 模板扫描作补集：纯 rpyc 反编译失败时源码扫描为空
+    quoted = {q.replace('\\"', '"')
+              for q in char_result.get('quoted_speakers') or []}
+    quoted |= _scan_quoted_speakers_from_tl(game_work_dir)
     # 具名角色：源码构造证据（Character/工厂函数），display_name 取
     # 名字字面量；动态名占位（[mc] 之类，玩家命名主角）标 is_placeholder
     characters = []
@@ -159,8 +195,9 @@ def refresh_characters(game_work_dir: Path, db, dialogues: list,
         if c.name.startswith('[') and c.name.endswith(']'):
             row["is_placeholder"] = True
         characters.append(row)
-    # 泛指说话人也全部入表（动态游戏的 the_person、路人临时变量等
-    # 运行时才绑定到具体人物，它们确实说话了）：没有静态显示名，
+    # 其余说话人也全部入表。引号说话人（匿名角色）的字面量就是游戏内
+    # 显示名，display_name 取字面量（可翻译）；泛指变量（动态游戏的
+    # the_person、路人临时变量等运行时才绑定到具体人物）没有静态显示名，
     # display_name 留空（显示层兜底变量名）。is_placeholder 是
     # [动态名] 角色的专用标记，此处不用
     named = {c['variable'] for c in characters}
@@ -168,7 +205,11 @@ def refresh_characters(game_work_dir: Path, db, dialogues: list,
         var = d.get('character', '')
         if var and var not in named:
             named.add(var)
-            characters.append({"variable": var, "display_name": ""})
+            var_norm = var.replace('\\"', '"')
+            characters.append({
+                "variable": var,
+                "display_name": var_norm if var_norm in quoted else "",
+            })
     if reset_counts:
         db.reset_character_lines_count()
     db.insert_characters(characters)

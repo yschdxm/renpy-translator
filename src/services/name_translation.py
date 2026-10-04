@@ -120,13 +120,70 @@ class NameTranslationService:
         if self.on_row_done:
             await self.on_row_done(en_name)
 
-    async def translate_and_analyze(self, en_name: str, variable: str = None):
+    def _dict_text(self) -> str:
+        """人名表 + 术语表提示词文本（同步，调用方放 executor）"""
+        glossary_text = self.db.get_glossary_for_prompt()
+        char_prompt = self.db.get_characters_for_prompt()
+        text = ""
+        if char_prompt:
+            text += char_prompt + "\n"
+        if glossary_text:
+            text += glossary_text
+        return text
+
+    async def translate_name_only(self, en_name: str, variable: str = None):
+        """仅翻译人名（不分析）。
+
+        落库必须带 variable：同名显示名的角色靠它精确定位
+        （translation_service.translate_single 的 name 保存不带
+        variable，同名会串行，不能复用）。
+        """
+        loop = asyncio.get_event_loop()
+        # 无显示名角色（泛指形参/玩家命名主角）：前端以变量名兜底
+        # 回传，这里按库中真实显示名核实
+        if en_name and variable:
+            row = next((c for c in self.db.get_characters()
+                        if c.get('variable') == variable), None)
+            if row is not None and not (row.get('display_name') or '').strip():
+                en_name = ''
+        label = en_name or (variable or '')
+        if (not en_name.strip()
+                or (en_name.startswith('[') and en_name.endswith(']'))):
+            self.logger.info(f'占位符 {label}，跳过人名翻译', panel='names')
+            return
+        await self._emit_busy(en_name)
+        try:
+            dict_text = await loop.run_in_executor(None, self._dict_text)
+            cn = await loop.run_in_executor(
+                self._executor,
+                lambda: self.translator.translate_name(
+                    en_name, glossary_text=dict_text))
+            cn = clean_name_result(cn or '')
+            if cn:
+                await loop.run_in_executor(
+                    None, lambda: self.db.update_character_cn_name(
+                        en_name, cn, variable=variable))
+                self.logger.info(f'人名: {en_name} -> {cn}', panel='names')
+        except FatalAPIError:
+            raise
+        except Exception as e:
+            self.logger.error(f'{label} 人名翻译失败: {e}', panel='names')
+        finally:
+            await self._emit_done(label)
+
+    async def translate_and_analyze(self, en_name: str, variable: str = None,
+                                    mode: str = 'both'):
         """翻译人名 + 分析角色。台词超长自动分段：
         第1段翻译人名+分析，后续段补充分析，最终合并。
 
+        mode: 'both'（翻译+分析）/ 'name'（仅翻译人名，委托
+        translate_name_only）/ 'analyze'（仅分析，不动人名）。
         variable：角色变量名（同名显示名的角色靠它精确定位）
         FatalAPIError 向上抛出以中止批量任务；其他错误记日志后返回。
         """
+        if mode == 'name':
+            await self.translate_name_only(en_name, variable)
+            return
         loop = asyncio.get_event_loop()
 
         # 无显示名角色（泛指形参/玩家命名主角，display_name 留空）：
@@ -145,7 +202,8 @@ class NameTranslationService:
         label = en_name or (variable or '')
         if is_placeholder:
             self.logger.info(f'占位符 {label}，跳过人名翻译，仅分析角色', panel='names')
-            if en_name:
+            # cn_name=原名 的标记只在带翻译的模式做（仅分析不动人名）
+            if en_name and mode != 'analyze':
                 await loop.run_in_executor(
                     None, lambda: self.db.update_character_cn_name(en_name, en_name, variable=variable)
                 )
@@ -170,11 +228,11 @@ class NameTranslationService:
             char_lines = await loop.run_in_executor(None, _load_lines)
 
             if not char_lines:
+                # 无台词角色：仅分析模式只留空档案；翻译经
+                # translate_name_only（带 variable 落库，同名不串）
                 self.logger.info(f'{label} 没有台词，仅翻译人名', panel='names')
-                if en_name:
-                    await self.translation_service.translate_single(
-                        item_id=0, content_type='name', original_text=en_name
-                    )
+                if en_name and mode != 'analyze':
+                    await self.translate_name_only(en_name, variable)
                 empty_profile = {'性格特征': '该角色没有台词', '说话风格': '无', '背景': '无'}
                 await loop.run_in_executor(
                     None, lambda: self.db.save_profile(en_name, empty_profile, variable=variable)
@@ -182,18 +240,7 @@ class NameTranslationService:
                 await self._emit_done(label)
                 return
 
-            # 获取人名词典用于参考
-            def _load_dict_text():
-                glossary_text = self.db.get_glossary_for_prompt()
-                char_prompt = self.db.get_characters_for_prompt()
-                text = ""
-                if char_prompt:
-                    text += char_prompt + "\n"
-                if glossary_text:
-                    text += glossary_text
-                return text
-
-            dict_text = await loop.run_in_executor(None, _load_dict_text)
+            dict_text = await loop.run_in_executor(None, self._dict_text)
 
             batch_size = calc_batch_size(len(char_lines), self.max_context_k)
             batches = [char_lines[i:i+batch_size] for i in range(0, len(char_lines), batch_size)]
@@ -209,13 +256,14 @@ class NameTranslationService:
                 lines_text = '\n'.join([f'"{line}"' for line in batch_lines])
 
                 if batch_idx == 0:
+                    action = '分析' if (is_placeholder or mode == 'analyze') else '翻译+分析'
                     self.logger.info(
-                        f'[{batch_idx+1}/{total_batches}] {"分析" if is_placeholder else "翻译+分析"} {label}'
+                        f'[{batch_idx+1}/{total_batches}] {action} {label}'
                         f'（{len(char_lines)}条台词，每段{batch_size}条，上下文{self.max_context_k}K）',
                         panel='names'
                     )
 
-                    if is_placeholder:
+                    if is_placeholder or mode == 'analyze':
                         prompt = self._build_analyze_only_prompt(
                             label, lines_text, batch_idx, total_batches)
                     else:
@@ -231,12 +279,12 @@ class NameTranslationService:
                     lambda p=prompt: self.translator.analyze_text(prompt=p)
                 )
 
-                if batch_idx == 0:
+                if batch_idx == 0 and mode != 'analyze':
                     cn_name = extract_name(result)
                 summaries.append(result)
 
-            # 保存人名翻译（占位符不翻译）
-            if cn_name and not is_placeholder:
+            # 保存人名翻译（占位符与仅分析模式不翻译）
+            if cn_name and not is_placeholder and mode != 'analyze':
                 await loop.run_in_executor(
                     None, lambda: self.db.update_character_cn_name(en_name, cn_name, variable=variable)
                 )
@@ -264,50 +312,66 @@ class NameTranslationService:
             self.logger.error(f'{label} 翻译+分析失败: {e}', panel='names')
             await self._emit_done(label)
 
-    async def translate_all(self) -> dict:
-        """翻译全部未翻译人名 + 补充分析全部未分析角色（顺序处理）
+    async def translate_all(self, mode: str = 'both') -> dict:
+        """批量处理角色。mode: 'both' 翻译+分析 / 'name' 仅翻译 /
+        'analyze' 仅分析。
 
         Returns: {'completed': int, 'total': int, 'stopped': bool, 'nothing': bool}
         """
         self._cancel = False
         loop = asyncio.get_event_loop()
         completed_count = 0
+        action = {'both': '翻译+分析', 'name': '翻译', 'analyze': '分析'}[mode]
 
-        chars_todo = await loop.run_in_executor(
-            None, self.db.get_untranslated_characters)
-        total = len(chars_todo)
-
-        if total == 0:
+        if mode == 'analyze':
             all_chars = await loop.run_in_executor(None, self.db.get_characters)
             # 按行 profile_json 精确判断（无显示名角色共享空显示名，
             # name-key 字典会互相误覆盖导致后者永远轮不到分析）
-            unanalyzed = [(c['display_name'], c['variable'] or None) for c in all_chars
-                          if not c['profile_json'] and not c['is_placeholder']]
-            if not unanalyzed:
+            todo = [(c['display_name'], c['variable'] or None) for c in all_chars
+                    if not c['profile_json'] and not c['is_placeholder']]
+            if not todo:
                 return {'completed': 0, 'total': 0, 'stopped': False, 'nothing': True}
-            total = len(unanalyzed)
-            self.logger.info(f'人名已全部翻译，补充分析 {total} 个角色', panel='names')
-            todo = unanalyzed
+            total = len(todo)
+            self.logger.info(f'开始分析 {total} 个角色', panel='names')
         else:
-            self.logger.info(f'开始翻译+分析 {total} 个角色', panel='names')
-            todo = [(c['display_name'], c['variable'] or None) for c in chars_todo]
+            chars_todo = await loop.run_in_executor(
+                None, self.db.get_untranslated_characters)
+            total = len(chars_todo)
+
+            if total == 0:
+                if mode == 'name':
+                    return {'completed': 0, 'total': 0, 'stopped': False,
+                            'nothing': True}
+                all_chars = await loop.run_in_executor(None, self.db.get_characters)
+                # 按行 profile_json 精确判断（无显示名角色共享空显示名，
+                # name-key 字典会互相误覆盖导致后者永远轮不到分析）
+                unanalyzed = [(c['display_name'], c['variable'] or None) for c in all_chars
+                              if not c['profile_json'] and not c['is_placeholder']]
+                if not unanalyzed:
+                    return {'completed': 0, 'total': 0, 'stopped': False, 'nothing': True}
+                total = len(unanalyzed)
+                self.logger.info(f'人名已全部翻译，补充分析 {total} 个角色', panel='names')
+                todo = unanalyzed
+            else:
+                self.logger.info(f'开始{action} {total} 个角色', panel='names')
+                todo = [(c['display_name'], c['variable'] or None) for c in chars_todo]
 
         for i, (name, var) in enumerate(todo):
             if self._cancel:
                 break
             if self.on_progress:
-                self.on_progress(i, total, f'翻译+分析: {i+1}/{total} {name}')
+                self.on_progress(i, total, f'{action}: {i+1}/{total} {name}')
             try:
-                await self.translate_and_analyze(name, variable=var)
+                await self.translate_and_analyze(name, variable=var, mode=mode)
                 completed_count += 1
             except FatalAPIError as e:
                 self.logger.error(f'API 致命错误，批量任务中止: {e}', panel='names')
                 self._cancel = True
                 raise
             except Exception as e:
-                self.logger.error(f'{name} 翻译+分析失败: {e}', panel='names')
+                self.logger.error(f'{name} {action}失败: {e}', panel='names')
 
-        self.logger.info(f'翻译+分析完成: {completed_count}/{total}', panel='names')
+        self.logger.info(f'{action}完成: {completed_count}/{total}', panel='names')
         return {'completed': completed_count, 'total': total,
                 'stopped': self._cancel, 'nothing': False}
 
