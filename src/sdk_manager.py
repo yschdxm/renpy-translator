@@ -170,6 +170,12 @@ class SDKManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                # Ren'Py 的 stdout 固定输出 UTF-8（会回显脚本内容/报错，
+                # 日文游戏的文本对 GBK 是非法序列）。不指定 encoding 时
+                # text=True 用系统区域编码，中文 Windows 上是 cp936，
+                # read() 直接 UnicodeDecodeError，且真实 SDK 输出丢失、
+                # 翻译实际成功也会被误报成失败。
+                encoding='utf-8', errors='replace',
                 cwd=str(self.sdk_path)
             )
             # 注册到全局表：服务关停时兜底杀树（取消/超时路径之外，

@@ -386,7 +386,7 @@ def run_sandbox(source_root: str, jobs: list,
     proc = subprocess.Popen(
         [str(exe), str(_project_dir(root))],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, cwd=str(exe.parent), errors='ignore')
+        text=True, encoding='utf-8', cwd=str(exe.parent), errors='ignore')
     # 注册到全局表：服务关停时兜底杀树（os._exit 不连带杀子进程，
     # 卡在菜单里的引擎进程永不退出，communicate(timeout) 又打不断）
     track(proc)
