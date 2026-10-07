@@ -5,17 +5,17 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [v0.4.3] - 2026-10-07
 
 ### 新增
 
 - 翻译文本导出：对话/UI 字符串/人名/术语可按需组合导出为
   txt/json/Excel/Word，可选导出列；翻译表格页支持「仅导出当前筛选」，
   产物存 exports/{项目名}/（多个类型合并为单文件：Excel 多 sheet、
-  Word/txt 分节、json 多键）；Excel/Word 中文宋体、西文 Times New Roman
-- 导出「翻译 Word」：仅原文、每条一行，供译者翻译后导回
+  Word/txt 分节、json 多键）；Excel/Word 中文宋体、西文 Times New Roman（36be506）
+- 导出「翻译 Word」：仅原文、每条一行，供译者翻译后导回（36be506）
 - 翻译文本导入：支持导入 JSON（按原文匹配）与翻译 Word（按行对应），
-  上传后先预览统计与样例，确认才写库
+  选择文件后直接写回并提示各类统计（36be506）
 
 ## [v0.4.2] - 2026-10-04
 
