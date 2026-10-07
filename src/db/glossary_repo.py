@@ -27,6 +27,15 @@ class GlossaryRepo:
         return {r["en_term"]: r["cn_term"] for r in rows}
 
     @_auto_reconnect
+    def get_glossary_rows(self) -> list[dict]:
+        """全量术语完整行（en/cn/类型/来源），翻译文本导出用"""
+        rows = self._conn.execute(
+            "SELECT en_term, cn_term, term_type, source "
+            "FROM glossary ORDER BY en_term"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @_auto_reconnect
     def add_glossary_term(self, en: str, cn: str, term_type: str = 'other',
                            source: str = 'manual'):
         """添加术语"""
@@ -64,6 +73,28 @@ class GlossaryRepo:
                     (en, cn, t.get("term_type", "other"),
                      t.get("source", "auto"), now)
                 )
+
+    @_auto_reconnect
+    def upsert_glossary_batch(self, pairs: list[tuple[str, str]]) -> tuple[int, int]:
+        """批量写回术语译文：已存在更新 cn_term（保留类型/来源/时间），
+        不存在插入（source='import'）。返回 (更新数, 新增数)。翻译文本导入用"""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        updated = inserted = 0
+        with self._transaction():
+            for en, cn in pairs:
+                cur = self._conn.execute(
+                    "UPDATE glossary SET cn_term=? WHERE en_term=?", (cn, en))
+                if cur.rowcount:
+                    updated += 1
+                else:
+                    self._conn.execute(
+                        """INSERT INTO glossary
+                           (en_term, cn_term, term_type, source, created_at)
+                           VALUES (?, ?, 'other', 'import', ?)""",
+                        (en, cn, now))
+                    inserted += 1
+        return updated, inserted
 
     # 排序列白名单：SQL ORDER BY 只拼接白名单内的列名，防注入
     _GLOSSARY_SORT_COLUMNS = {'en_term', 'cn_term', 'created_at', 'source'}

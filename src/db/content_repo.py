@@ -111,6 +111,25 @@ class ContentRepo:
                 [(text, id_) for id_, text in updates]
             )
 
+    @staticmethod
+    def _dialogue_where(filter_mode: str, character: str,
+                        search: str) -> tuple[str, list]:
+        """对话筛选 WHERE 组装（分页与导出全量共用）"""
+        where_clauses = []
+        params = []
+        if filter_mode == 'untranslated':
+            where_clauses.append("is_translated=0")
+        elif filter_mode == 'translated':
+            where_clauses.append("is_translated=1")
+        if character:
+            where_clauses.append("character=?")
+            params.append(character)
+        if search:
+            where_clauses.append("(original_text LIKE ? OR translated_text LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        return where_sql, params
+
     @_auto_reconnect
     def get_dialogues_page(self, page: int = 0, page_size: int = 50,
                            filter_mode: str = 'all',
@@ -119,23 +138,7 @@ class ContentRepo:
                            sort_by: str = '',
                            sort_order: str = 'asc') -> tuple[list[dict], int]:
         """分页查询对话（可选排序：sort_by 白名单外保持默认按 id）"""
-        where_clauses = []
-        params = []
-
-        if filter_mode == 'untranslated':
-            where_clauses.append("is_translated=0")
-        elif filter_mode == 'translated':
-            where_clauses.append("is_translated=1")
-
-        if character:
-            where_clauses.append("character=?")
-            params.append(character)
-
-        if search:
-            where_clauses.append("(original_text LIKE ? OR translated_text LIKE ?)")
-            params.extend([f"%{search}%", f"%{search}%"])
-
-        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        where_sql, params = self._dialogue_where(filter_mode, character, search)
 
         count_row = self._conn.execute(
             f"SELECT COUNT(*) as cnt FROM dialogues{where_sql}", params
@@ -280,6 +283,17 @@ class ContentRepo:
         return [self._row_to_dialogue_dict(row) for row in rows]
 
     @_auto_reconnect
+    def get_dialogues_filtered(self, filter_mode: str = 'all',
+                               character: str = '',
+                               search: str = '') -> list[dict]:
+        """按筛选条件取全量对话（剧情书写顺序），翻译文本导出用"""
+        where_sql, params = self._dialogue_where(filter_mode, character, search)
+        rows = self._conn.execute(
+            f"SELECT * FROM dialogues{where_sql} "
+            "ORDER BY file_path, line_number, id", params).fetchall()
+        return [self._row_to_dialogue_dict(row) for row in rows]
+
+    @_auto_reconnect
     def replace_dialogues(self, items: list[dict]) -> list[int]:
         """单事务清空并重建对话表，返回与 items 对齐的新 id 列表"""
         ids = []
@@ -391,25 +405,28 @@ class ContentRepo:
                 [(text, id_) for id_, text in updates]
             )
 
+    @staticmethod
+    def _ui_where(filter_mode: str, search: str) -> tuple[str, list]:
+        """UI 字符串筛选 WHERE 组装（分页与导出全量共用）"""
+        where_clauses = []
+        params = []
+        if filter_mode == 'untranslated':
+            where_clauses.append("is_translated=0")
+        elif filter_mode == 'translated':
+            where_clauses.append("is_translated=1")
+        if search:
+            where_clauses.append("(original_text LIKE ? OR translated_text LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        return where_sql, params
+
     @_auto_reconnect
     def get_ui_texts_page(self, page: int = 0, page_size: int = 50,
                           filter_mode: str = 'all',
                           search: str = '',
                           sort_by: str = '',
                           sort_order: str = 'asc') -> tuple[list[dict], int]:
-        where_clauses = []
-        params = []
-
-        if filter_mode == 'untranslated':
-            where_clauses.append("is_translated=0")
-        elif filter_mode == 'translated':
-            where_clauses.append("is_translated=1")
-
-        if search:
-            where_clauses.append("(original_text LIKE ? OR translated_text LIKE ?)")
-            params.extend([f"%{search}%", f"%{search}%"])
-
-        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        where_sql, params = self._ui_where(filter_mode, search)
 
         count_row = self._conn.execute(
             f"SELECT COUNT(*) as cnt FROM ui_texts{where_sql}", params
@@ -487,6 +504,16 @@ class ContentRepo:
         rows = self._conn.execute(
             "SELECT * FROM ui_texts ORDER BY file_path, line_number, id"
         ).fetchall()
+        return [self._row_to_ui_dict(row) for row in rows]
+
+    @_auto_reconnect
+    def get_ui_texts_filtered(self, filter_mode: str = 'all',
+                              search: str = '') -> list[dict]:
+        """按筛选条件取全量 UI 字符串（文件 + 行号序），翻译文本导出用"""
+        where_sql, params = self._ui_where(filter_mode, search)
+        rows = self._conn.execute(
+            f"SELECT * FROM ui_texts{where_sql} "
+            "ORDER BY file_path, line_number, id", params).fetchall()
         return [self._row_to_ui_dict(row) for row in rows]
 
     @_auto_reconnect

@@ -2,10 +2,9 @@
 import { onMounted, ref, watch } from 'vue'
 import {
   NButton, NCard, NEmpty, NInput, NInputGroup, NModal, NPopconfirm,
-  NRadioButton, NRadioGroup, NSpace, NTag, NText, NUpload,
+  NRadioButton, NRadioGroup, NSpace, NTag, NText,
   useMessage,
 } from 'naive-ui'
-import type { UploadFileInfo } from 'naive-ui'
 import { useSessionStore } from '../stores/session'
 import { useProjectsStore, type ProjectItem } from '../stores/projects'
 import { useJobsStore } from '../stores/jobs'
@@ -13,6 +12,7 @@ import { AddOutline, DownloadOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
 import { nativeReady, pickDirectory } from '../api/native'
+import FileDropSelect from '../components/FileDropSelect.vue'
 import ProgressLine from '../components/ProgressLine.vue'
 import UpdateReportDialog from '../components/UpdateReportDialog.vue'
 
@@ -53,11 +53,6 @@ function openCreate() {
   creating.value = false
   uploadPct.value = -1
   createVisible.value = true
-}
-
-function onZipChange(options: { fileList: UploadFileInfo[] }) {
-  const f = options.fileList[0]
-  createZip.value = f?.file ?? null
 }
 
 async function submitCreate() {
@@ -388,15 +383,10 @@ onMounted(async () => {
           />
           <n-button v-if="guiMode" size="small" @click="browseDir">浏览…</n-button>
         </n-input-group>
-        <n-upload
-          v-else
-          :max="1" accept=".zip"
-          :default-upload="false"
-          @change="onZipChange"
-        >
-          <n-button size="small">选择游戏 zip</n-button>
-          <span v-if="createZip" style="margin-left: 8px; font-size: 12px">{{ createZip.name }}</span>
-        </n-upload>
+        <file-drop-select
+          v-else v-model="createZip" accept=".zip"
+          placeholder="点击或拖拽选择游戏 zip"
+        />
         <div v-if="creating && uploadPct >= 0">
           <n-text depth="3" style="font-size: 12px">正在上传 zip（本地传输，大文件需等待）...</n-text>
           <progress-line :value="uploadPct" processing />
@@ -428,15 +418,10 @@ onMounted(async () => {
           />
           <n-button v-if="guiMode" size="small" @click="browseUpdateDir">浏览…</n-button>
         </n-input-group>
-        <n-upload
-          v-else
-          :max="1" accept=".zip"
-          :default-upload="false"
-          @change="(o: { fileList: UploadFileInfo[] }) => updateZip = o.fileList[0]?.file ?? null"
-        >
-          <n-button size="small">选择新版本 zip</n-button>
-          <span v-if="updateZip" style="margin-left: 8px; font-size: 12px">{{ updateZip.name }}</span>
-        </n-upload>
+        <file-drop-select
+          v-else v-model="updateZip" accept=".zip"
+          placeholder="点击或拖拽选择新版本 zip"
+        />
         <div v-if="updating && updatePct >= 0">
           <n-text depth="3" style="font-size: 12px">正在上传 zip（本地传输，大文件需等待）...</n-text>
           <progress-line :value="updatePct" processing />
@@ -456,13 +441,10 @@ onMounted(async () => {
     <n-modal v-model:show="importVisible" preset="card" title="导入项目" style="width: 480px">
       <n-space vertical>
         <n-input v-model:value="importName" placeholder="项目名称（留空则用包内名称）" />
-        <n-upload
-          :max="1" accept=".zip" :default-upload="false"
-          @change="(o: { fileList: UploadFileInfo[] }) => importZip = o.fileList[0]?.file ?? null"
-        >
-          <n-button size="small">选择项目包 zip</n-button>
-          <span v-if="importZip" style="margin-left: 8px; font-size: 12px">{{ importZip.name }}</span>
-        </n-upload>
+        <file-drop-select
+          v-model="importZip" accept=".zip"
+          placeholder="点击或拖拽选择项目包 zip"
+        />
         <div v-if="importing && importPct >= 0">
           <n-text depth="3" style="font-size: 12px">正在上传项目包...</n-text>
           <progress-line :value="importPct" processing />

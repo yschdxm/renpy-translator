@@ -6,9 +6,11 @@ import {
   NSelect, NSpace, NTag, NText, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
-import { LanguageOutline, RefreshOutline } from '@vicons/ionicons5'
+import { DownloadOutline, LanguageOutline, RefreshOutline, ShareOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
+import ExportTextsDialog from '../components/ExportTextsDialog.vue'
+import ImportTextsDialog from '../components/ImportTextsDialog.vue'
 import { useInlineEdit } from '../composables/useInlineEdit'
 import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
@@ -30,6 +32,12 @@ const rows = ref<NameRow[]>([])
 const stats = ref({ total: 0, translated: 0, analyzed: 0 })
 const loading = ref(false)
 const processing = ref<Set<string>>(new Set())
+const exportVisible = ref(false)
+const importVisible = ref(false)
+async function onImported() {
+  await load()
+  await session.refresh()
+}
 
 // 行的唯一键：多个无显示名角色共享空 original，必须带上 variable
 const rowKey = (r: NameRow) => `${r.original}|${r.variable}`
@@ -283,6 +291,8 @@ onMounted(load)
         将所有未翻译角色的中文名设为原名（正文提及也保留原名），可随时单个改回。
       </n-popconfirm>
       <n-button size="small" quaternary :loading="refreshLoading" @click="refreshCharacters">重新提取角色</n-button>
+      <n-button size="small" :render-icon="renderIcon(ShareOutline)" @click="exportVisible = true">导出</n-button>
+      <n-button size="small" :render-icon="renderIcon(DownloadOutline)" @click="importVisible = true">导入</n-button>
       <n-button size="small" quaternary :render-icon="renderIcon(RefreshOutline)" @click="load">刷新</n-button>
       <n-text depth="3" style="font-size: 12px">
         {{ stats.total }} 人名，翻译 {{ stats.translated }}，分析 {{ stats.analyzed }}
@@ -313,6 +323,12 @@ onMounted(load)
       :pagination="{ pageSize: 50 }"
       :render-empty="() => h(NEmpty, { description: '暂无人名' })"
     />
+
+    <!-- 导出翻译文本对话框 -->
+    <export-texts-dialog v-model:show="exportVisible" :preset-types="['names']" />
+
+    <!-- 导入翻译文本对话框 -->
+    <import-texts-dialog v-model:show="importVisible" :preset-types="['names']" @imported="onImported" />
 
     <n-modal v-model:show="profileVisible" preset="card"
              :title="`${profileName} - 人物特征`" style="width: 640px">

@@ -81,6 +81,15 @@ class CharacterRepo:
         return self._row_to_character_dict(row) if row else None
 
     @_auto_reconnect
+    def update_cn_names_batch(self, updates: list[tuple[int, str]]):
+        """批量按 id 更新译名（翻译文本导入用）"""
+        with self._transaction():
+            self._conn.executemany(
+                "UPDATE characters SET cn_name=? WHERE id=?",
+                [(cn_name, char_id) for char_id, cn_name in updates]
+            )
+
+    @_auto_reconnect
     def update_character_cn_name(self, display_name: str, cn_name: str,
                                  variable: str = None):
         """更新角色中文名（优先按变量名定位，避免同名角色互相覆盖）"""

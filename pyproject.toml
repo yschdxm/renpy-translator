@@ -7,8 +7,10 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.137.1",
     "openai>=2.41.1",
+    "openpyxl>=3.1.5",
     "pillow>=12.3.0",
     "pystray>=0.19.5",
+    "python-docx>=1.2.0",
     "python-multipart>=0.0.32",
     "pythonnet>=3.1.0 ; sys_platform == 'win32'",
     "pywebview>=6.2.1",

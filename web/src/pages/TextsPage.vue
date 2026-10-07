@@ -6,10 +6,12 @@ import {
   NText, NInputGroup, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, DataTableSortState } from 'naive-ui'
-import { BookOutline, CodeSlashOutline, LanguageOutline, LocateOutline, RefreshOutline, SparklesOutline, WarningOutline } from '@vicons/ionicons5'
+import { BookOutline, CodeSlashOutline, DownloadOutline, LanguageOutline, LocateOutline, RefreshOutline, ShareOutline, SparklesOutline, WarningOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
+import ExportTextsDialog from '../components/ExportTextsDialog.vue'
 import FailedBatchesDialog from '../components/FailedBatchesDialog.vue'
+import ImportTextsDialog from '../components/ImportTextsDialog.vue'
 import { useJobTask } from '../composables/useJobTask'
 import { useSessionStore } from '../stores/session'
 
@@ -167,6 +169,35 @@ async function replaceTexts(apply = false) {
   } finally {
     replacing.value = false
   }
+}
+
+// ---- 导出翻译文本（快照当前筛选，避免导出期间改动造成歧义） ----
+const exportVisible = ref(false)
+const importVisible = ref(false)
+const exportFilter = ref<{
+  content_type: 'dialogue' | 'ui'; filter_mode: string; search: string; character: string
+} | null>(null)
+function openExport() {
+  exportFilter.value = {
+    content_type: props.contentType,
+    filter_mode: query.filter_mode,
+    search: query.search,
+    character: query.character,
+  }
+  exportVisible.value = true
+}
+function openImport() {
+  exportFilter.value = {
+    content_type: props.contentType,
+    filter_mode: query.filter_mode,
+    search: query.search,
+    character: query.character,
+  }
+  importVisible.value = true
+}
+async function onImported() {
+  await load()
+  await session.refresh()
 }
 
 // ---- 服务端排序（单列受控） ----
@@ -343,6 +374,8 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
       <n-button size="small" type="primary" :render-icon="renderIcon(LanguageOutline)" @click="translateAll">全部翻译</n-button>
       <n-button size="small" @click="translatePage">翻译本页</n-button>
       <n-button size="small" @click="replacePreview = null; replaceVisible = true">查找并替换译文</n-button>
+      <n-button size="small" :render-icon="renderIcon(ShareOutline)" @click="openExport">导出</n-button>
+      <n-button size="small" :render-icon="renderIcon(DownloadOutline)" @click="openImport">导入</n-button>
       <n-button
         v-if="failedBatchCount > 0" size="small" type="warning"
         :render-icon="renderIcon(WarningOutline)" @click="failedDialogVisible = true"
@@ -458,6 +491,18 @@ watch(() => [query.filter_mode, query.character], () => { query.page = 0; load()
         </div>
       </div>
     </n-modal>
+
+    <!-- 导出翻译文本对话框 -->
+    <export-texts-dialog
+      v-model:show="exportVisible" :preset-types="[contentType]"
+      :filter-scope="exportFilter"
+    />
+
+    <!-- 导入翻译文本对话框 -->
+    <import-texts-dialog
+      v-model:show="importVisible" :preset-types="[contentType]"
+      :filter-scope="exportFilter" @imported="onImported"
+    />
 
     <!-- 失败批次核验对话框 -->
     <failed-batches-dialog

@@ -6,9 +6,11 @@ import {
   NPopconfirm, NSelect, NSpace, NTag, NText, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, DataTableSortState } from 'naive-ui'
-import { AddOutline, RefreshOutline } from '@vicons/ionicons5'
+import { AddOutline, DownloadOutline, RefreshOutline, ShareOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
+import ExportTextsDialog from '../components/ExportTextsDialog.vue'
+import ImportTextsDialog from '../components/ImportTextsDialog.vue'
 import { useInlineEdit } from '../composables/useInlineEdit'
 
 const message = useMessage()
@@ -24,6 +26,8 @@ interface Row {
 const rows = ref<Row[]>([])
 const total = ref(0)
 const loading = ref(false)
+const exportVisible = ref(false)
+const importVisible = ref(false)
 const query = reactive({
   page: 0, size: 50, search: '', source: '',
   sort_by: 'en_term', sort_order: 'asc' as 'asc' | 'desc',
@@ -206,6 +210,8 @@ watch(() => query.source, () => { query.page = 0; load() })
     <n-space align="center" style="margin-bottom: 12px" wrap>
       <h2 style="margin: 0">术语表</h2>
       <n-button size="small" type="primary" :render-icon="renderIcon(AddOutline)" @click="openCreate">新增术语</n-button>
+      <n-button size="small" :render-icon="renderIcon(ShareOutline)" @click="exportVisible = true">导出</n-button>
+      <n-button size="small" :render-icon="renderIcon(DownloadOutline)" @click="importVisible = true">导入</n-button>
       <span style="flex: 1" />
       <n-button size="small" quaternary :render-icon="renderIcon(RefreshOutline)" @click="load">刷新</n-button>
     </n-space>
@@ -244,6 +250,12 @@ watch(() => query.source, () => { query.page = 0; load() })
         @update:page="(p: number) => { query.page = p - 1; load() }"
       />
     </n-space>
+
+    <!-- 导出翻译文本对话框 -->
+    <export-texts-dialog v-model:show="exportVisible" :preset-types="['glossary']" />
+
+    <!-- 导入翻译文本对话框 -->
+    <import-texts-dialog v-model:show="importVisible" :preset-types="['glossary']" @imported="load" />
 
     <!-- 新增术语 -->
     <n-modal v-model:show="createVisible" preset="card" title="新增术语" style="width: 480px">

@@ -14,6 +14,9 @@
 #   - PIL / pillow      图标与图片处理按需导入
 #   - pystray           托盘模式才导入（server 模式不加载）
 #   - webview(pywebview) 桌面窗口模式才导入（平台后端见 hiddenimports）
+#   - openpyxl / python-docx  文本导出首次使用才导入；python-docx 依赖包内
+#                       docx/templates/default.docx 数据文件（静态分析收集不到，
+#                       下方 collect_all 整体收集），漏收则 Document() 冻结后必崩
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 import sys
@@ -43,7 +46,7 @@ if sys.platform == 'win32':
 # pythonnet/clr_loader 仅 Windows（pywebview winforms 后端）；
 # tiktoken/pystray/pillow 的动态部分整体收集
 for pkg in (['pythonnet', 'clr_loader'] if sys.platform == 'win32' else []) \
-        + ['tiktoken', 'tiktoken_ext', 'pystray', 'PIL']:
+        + ['tiktoken', 'tiktoken_ext', 'pystray', 'PIL', 'docx']:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
