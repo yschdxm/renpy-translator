@@ -17,6 +17,18 @@ router = APIRouter(tags=['system'])
 APP_CHANNEL = '_app'
 
 
+def _arm_exit_watchdog(seconds: float = 25):
+    """优雅退出的最后防线：SIGINT 已发出但 uvicorn/lifespan 偶发悬挂
+    （半开连接、残留线程、关库阻塞）时，超时硬退保证进程不残留。
+    正常关停（含迁移重启的 finally 链）几秒内完成，进程已退、
+    该 daemon 线程随之消失，不会误伤。"""
+    def _watchdog():
+        time.sleep(seconds)
+        import os
+        os._exit(0)
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+
 def schedule_restart(state: AppState):
     """延迟自动重启服务（迁移后清理占用文件用）。
 
@@ -38,6 +50,7 @@ def schedule_restart(state: AppState):
             signal.raise_signal(signal.SIGINT)
 
         threading.Thread(target=_raise, daemon=True).start()
+        _arm_exit_watchdog()
 
     asyncio.get_event_loop().create_task(_restart())
 
@@ -60,6 +73,7 @@ async def shutdown(state: AppState = Depends(get_state)):
         signal.raise_signal(signal.SIGINT)
 
     threading.Thread(target=_raise, daemon=True).start()
+    _arm_exit_watchdog()
     return {'ok': True, 'message': '服务正在停止'}
 
 

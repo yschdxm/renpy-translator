@@ -338,6 +338,9 @@ def run_server(port: int, detached: bool = False):
         "server.app:create_app", factory=True,
         host="127.0.0.1", port=port, log_level="info",
         access_log=False,  # 请求日志由 server.app 中间件按状态码分级
+        # 优雅关闭的连接等待上限：SSE 长连接/半开 TCP 可能永不关闭，
+        # 不设上限 uvicorn 会卡在 "Shutting down"（进程残留、控制台不关）
+        timeout_graceful_shutdown=5,
     )
     try:
         uvicorn.Server(config).run()
