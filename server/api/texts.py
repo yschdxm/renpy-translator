@@ -184,12 +184,24 @@ def _make_translate_job(state: AppState, content_type: str, items: list):
         scope_ids = {it['id'] for it in items}
         done = 0
         stashed = 0
+        consecutive_empty = 0  # 连续整批失败计数（熔断用）
         job.emit_log(f'共 {total_items} 条，分 {len(batches)} 批')
         for i, batch in enumerate(batches):
             job.check_cancelled()
             results = await service.translate_batch(batch, content_type)
             stashed += len(batch) - len(results)
             done += len(batch)
+            # 连续整批失败熔断：每批内部已重试 3 次，连续 5 批全灭
+            # （≈15 次连败）不可能是网络抖动——继续只会把全部剩余条目
+            # 暂存成垃圾失败记录。中止任务，未翻译条目下次自动拾起
+            consecutive_empty = consecutive_empty + 1 if not results else 0
+            if consecutive_empty >= 5:
+                from translator import FatalAPIError
+                raise FatalAPIError(
+                    503,
+                    f'连续 {consecutive_empty} 批翻译全部失败（每批已自动重试 '
+                    '3 次），已中止。请检查模型配置/余额/网络后重新翻译，'
+                    '未翻译条目会自动拾起。')
             job.emit_progress(done / total_items,
                               f'已处理 {done}/{total_items}，成功 {done - stashed}，'
                               f'待重试 {stashed}（第 {i+1}/{len(batches)} 批）')
@@ -365,8 +377,13 @@ async def _prune_failed_batches(state: AppState, content_type: str) -> list:
 
 @router.get('/texts/{content_type}/failed-batches')
 async def list_failed_items(content_type: str,
-                            state: AppState = Depends(require_project)):
-    """暂存的未译出条目（扁平列表；已译/已删的条目自动剔除）"""
+                            state: AppState = Depends(require_project),
+                            page: int = 0, size: int = 50):
+    """暂存的未译出条目（分页扁平列表；已译/已删的条目自动剔除）
+
+    大失败量（数万条）必须分页：全量返回+全量渲染会把前端卡死。
+    count=总条数（分页导航/全部重试用），items 仅当前页。
+    """
     _check_ct(content_type)
     recs = await _prune_failed_batches(state, content_type)
     items = []
@@ -381,7 +398,10 @@ async def list_failed_items(content_type: str,
                 'rejected': it.get('rejected', ''),
                 'created_at': rec['created_at'],
             })
-    return {'items': items, 'count': len(items), 'batch_count': len(recs)}
+    page = max(0, page)
+    size = max(1, min(size, 200))
+    return {'items': items[page * size:(page + 1) * size],
+            'count': len(items), 'batch_count': len(recs)}
 
 
 @router.get('/texts/{content_type}/failed-batches/count')

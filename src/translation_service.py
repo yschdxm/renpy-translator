@@ -36,6 +36,7 @@ class TranslationService:
         self._cancel_event = asyncio.Event()
         self._running = False
         self._executor = ThreadPoolExecutor(max_workers=max_concurrent)
+        self._closed = False
 
     def set_model_config(self, max_context_k: int, max_tokens: Optional[int],
                          batch_lines: int = None):
@@ -51,7 +52,19 @@ class TranslationService:
         项目关闭/切换时由 state 调用；不 shutdown 的话 ThreadPoolExecutor
         线程只能靠 GC 回收，反复开关项目会持续累积线程。
         """
+        self._closed = True
         self._executor.shutdown(wait=False)
+
+    def _check_open(self):
+        """executor 关闭后继续翻译是全局不可恢复错误（项目切换/服务停止
+        后旧任务仍在跑）——必须当中止任务的致命错误抛出，否则后续每批
+        都炸 'cannot schedule new futures after shutdown'，把全部剩余条目
+        暂存成垃圾失败记录（实测 57,952 条）"""
+        if self._closed:
+            raise FatalAPIError(
+                503,
+                '翻译服务已关闭（项目切换或服务停止）。请重新启动翻译，'
+                '未翻译条目会自动拾起。')
 
     def _calc_context_count(self, glossary_text: str = "", character_profile: str = "") -> int:
         """根据模型上下文能力和提示词实际大小动态计算上下文行数
@@ -288,6 +301,7 @@ class TranslationService:
         """
         if not items:
             return {}
+        self._check_open()
         loop = asyncio.get_event_loop()
 
         # 翻译模式开关：关闭的注入项直接置空，[[?token]] 可选段整段消失
@@ -354,6 +368,13 @@ class TranslationService:
                 # 继续无意义，向上传递以中止批量任务
                 raise
             except Exception as e:
+                if 'cannot schedule new futures' in str(e):
+                    # executor 已被关闭（状态竞争兜底）——同 _check_open，
+                    # 致命错误上抛中止任务，不再整批暂存
+                    raise FatalAPIError(
+                        503,
+                        '翻译服务已关闭（项目切换或服务停止）。请重新启动翻译，'
+                        '未翻译条目会自动拾起。') from e
                 # 整批失败不中断任务：整批暂存（批量任务收尾会自动重试
                 # 一轮），返回空结果让后续批次继续
                 reason = f'整批异常（已重试 {self.translator.MAX_RETRIES} 次）: {e}'

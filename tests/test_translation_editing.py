@@ -258,3 +258,34 @@ async def test_cancel_after_batch_preserves_results_and_skips_final_retry(db):
     assert db.get_ui_text(items[0]['id'])['translated_text'] == '一'
     assert db.count_failed_items('ui') == 1
     assert '成功 1' in progress[-1] and '待重试 1' in progress[-1]
+
+
+def test_failed_batches_pagination(db):
+    """失败条目分页：大失败量（数万条）全量返回+渲染会卡死前端。
+    items 仅当前页，count 始终是总条数；无参数默认 50 条/页"""
+    from types import SimpleNamespace
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from server.api.texts import router
+    from server.errors import register_error_handlers
+
+    async def db_call(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    app = FastAPI()
+    app.state.app_state = SimpleNamespace(db=db, db_call=db_call)
+    app.include_router(router, prefix='/api')
+    register_error_handlers(app)
+    db.insert_dialogues([dict(original_text=f'L{i}') for i in range(120)])
+    db.add_failed_batch('dialogue', db.get_all_dialogues())
+    with TestClient(app) as client:
+        base = '/api/current/texts/dialogue/failed-batches'
+        data = client.get(f'{base}?page=0&size=50').json()
+        assert data['count'] == 120 and len(data['items']) == 50
+        assert len(client.get(f'{base}?page=1&size=50').json()['items']) == 50
+        assert len(client.get(f'{base}?page=2&size=50').json()['items']) == 20
+        # 无参数默认 50 条/页（旧前端全量渲染的入口也不再卡死）
+        assert len(client.get(base).json()['items']) == 50
+        # 页码越界返回空页，总数不变
+        empty = client.get(f'{base}?page=99').json()
+        assert empty['items'] == [] and empty['count'] == 120

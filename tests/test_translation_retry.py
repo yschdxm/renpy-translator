@@ -251,6 +251,74 @@ async def test_service_fatal_api_error_reraises(translator, db, monkeypatch):
         await svc.translate_batch(db.get_all_dialogues(), 'dialogue')
 
 
+async def test_service_closed_raises_fatal(translator, db):
+    """executor 关闭（项目切换/服务停止）后翻译 = 致命错误中止任务，
+    不再整批暂存（防数万条垃圾失败记录）"""
+    from llm_client import FatalAPIError
+    svc = TranslationService(translator, db, TranslationLogger())
+    svc.close()
+    with pytest.raises(FatalAPIError, match='翻译服务已关闭'):
+        await svc.translate_batch(db.get_all_dialogues(), 'dialogue')
+    assert db.list_failed_batches('dialogue') == []
+
+
+async def test_service_executor_shutdown_error_fatal(translator, db, monkeypatch):
+    """状态竞争兜底：executor RuntimeError 也转 FatalAPIError 而非暂存"""
+    from llm_client import FatalAPIError
+
+    def boom(*a, **k):
+        raise RuntimeError('cannot schedule new futures after shutdown')
+
+    monkeypatch.setattr(translator, 'translate_batch', boom)
+    svc = TranslationService(translator, db, TranslationLogger())
+    try:
+        with pytest.raises(FatalAPIError, match='翻译服务已关闭'):
+            await svc.translate_batch(db.get_all_dialogues(), 'dialogue')
+        assert db.list_failed_batches('dialogue') == []
+    finally:
+        svc.close()
+
+
+async def test_translate_job_circuit_breaker(db):
+    """连续 5 批整批失败 → 熔断中止（不继续把剩余条目全部暂存）"""
+    from llm_client import FatalAPIError
+    from server.api.texts import _make_translate_job
+
+    db.insert_ui_texts([dict(original_text=f'T{i}') for i in range(60)])
+    items = db.get_all_ui_texts()
+
+    class _EmptyService:
+        def __init__(self):
+            self.calls = 0
+
+        async def prepare_batches(self, items, ct):
+            return [items[i:i + 10] for i in range(0, len(items), 10)]
+
+        async def translate_batch(self, batch, ct, stash_on_failure=True):
+            self.calls += 1
+            return {}
+
+    class _Job:
+        def emit_log(self, *a):
+            pass
+
+        def emit_progress(self, *a):
+            pass
+
+        def check_cancelled(self):
+            pass
+
+    async def db_call(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    svc = _EmptyService()
+    state = SimpleNamespace(translation_service=svc, db=db, db_call=db_call)
+    body = _make_translate_job(state, 'ui', items)
+    with pytest.raises(FatalAPIError, match='连续 5 批'):
+        await body(_Job())
+    assert svc.calls == 5  # 第 5 批连败即中止，第 6 批不再跑
+
+
 # ---- service 层：匹配落库 + 未译出暂存 ----
 
 # ---- prompt 缓存命中率优化 ----

@@ -4,7 +4,7 @@
  *  点「采用」或按 Enter 才落库——不自动保存，改错了关掉也不会误写。 */
 import { ref, watch } from 'vue'
 import {
-  NButton, NEmpty, NInput, NInputNumber, NModal, NPopconfirm, NSpace, NTag,
+  NButton, NEmpty, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NSpace, NTag,
   NText, useMessage,
 } from 'naive-ui'
 import { api, toastError, toastOk } from '../api/client'
@@ -35,13 +35,23 @@ const loading = ref(false)
 const chunkSize = ref(10)
 const translatingIds = ref<Set<number>>(new Set())
 const savingIds = ref<Set<number>>(new Set())
+// 分页：失败量可达数万条，全量渲染（每条带 textarea）会卡死对话框
+const page = ref(1)
+const PAGE_SIZE = 50
+const total = ref(0)
 
 async function load() {
   loading.value = true
   try {
     const data = await api.get<{ items: FailedItem[]; count: number }>(
-      `/api/current/texts/${props.contentType}/failed-batches`)
+      `/api/current/texts/${props.contentType}/failed-batches?page=${page.value - 1}&size=${PAGE_SIZE}`)
+    total.value = data.count
     items.value = data.items.map((it) => ({ ...it, draft: it.rejected || '' }))
+    // 当前页被清空且还有前页 → 回退一页
+    if (!items.value.length && page.value > 1 && total.value > 0) {
+      page.value--
+      await load()
+    }
   } catch (e) {
     toastError(message, e)
   } finally {
@@ -49,11 +59,14 @@ async function load() {
   }
 }
 
-watch(() => props.show, (v) => { if (v) load() })
+watch(() => props.show, (v) => { if (v) { page.value = 1; load() } })
+watch(page, () => { if (props.show) load() })
 
 /** 条目已译出（单翻/采用/重试成功）后从列表移除并通知父页刷新 */
 function onItemDone(id: number) {
   items.value = items.value.filter((it) => it.id !== id)
+  total.value = Math.max(0, total.value - 1)
+  if (!items.value.length && page.value > 1) { page.value--; load() }
   emit('changed')
 }
 
@@ -101,7 +114,8 @@ function adoptableCount(): number {
   return items.value.filter((it) => it.draft.trim()).length
 }
 
-// ---- 全部采用：把所有非空译文框的内容落库（逐条复用采用逻辑） ----
+// ---- 采用本页：把当前页非空译文框的内容落库（逐条复用采用逻辑） ----
+// 全部重试/清空暂存由后端全量处理；采用是逐条 PATCH，只作用于当前页
 async function adoptAll() {
   for (const it of [...items.value]) {
     if (it.draft.trim()) await commitEdit(it)
@@ -135,22 +149,22 @@ async function clearAll() {
     <n-space align="center" style="margin-bottom: 10px" wrap>
       <n-text depth="3" style="font-size: 12px">每批</n-text>
       <n-input-number v-model:value="chunkSize" size="small" :min="1" :max="50" style="width: 90px" />
-      <n-button size="small" type="primary" :disabled="items.length === 0" @click="retryAll">
-        全部重试（{{ items.length }} 条）
+      <n-button size="small" type="primary" :disabled="total === 0" @click="retryAll">
+        全部重试（{{ total }} 条）
       </n-button>
       <n-button size="small" type="primary" secondary :disabled="adoptableCount() === 0" @click="adoptAll">
-        全部采用（{{ adoptableCount() }} 条）
+        采用本页（{{ adoptableCount() }} 条）
       </n-button>
       <n-popconfirm @positive-click="clearAll">
         <template #trigger>
-          <n-button size="small" quaternary :disabled="items.length === 0">清空暂存</n-button>
+          <n-button size="small" quaternary :disabled="total === 0">清空暂存</n-button>
         </template>
         清空后这些条目保持未翻译，可被下次「全部翻译」重新拾起。确定清空？
       </n-popconfirm>
       <n-button size="small" quaternary @click="load">刷新</n-button>
     </n-space>
 
-    <n-empty v-if="!loading && items.length === 0" description="没有翻译失败的条目" />
+    <n-empty v-if="!loading && total === 0" description="没有翻译失败的条目" />
 
     <div class="modal-scroll">
       <div v-for="it in items" :key="it.id"
@@ -182,5 +196,10 @@ async function clearAll() {
         />
       </div>
     </div>
+    <n-pagination
+      v-if="total > PAGE_SIZE" v-model:page="page"
+      :item-count="total" :page-size="PAGE_SIZE"
+      size="small" style="margin-top: 8px; justify-content: center"
+    />
   </n-modal>
 </template>
