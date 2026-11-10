@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 应用主体（在 message/dialog provider 内，可用 useMessage） */
-import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NBadge, NLayout, NLayoutHeader, NLayoutSider, NLayoutContent, NMenu, NModal,
@@ -17,6 +17,7 @@ import UploadProgressDialog from './components/UploadProgressDialog.vue'
 import EmbeddedReviewDialog from './components/EmbeddedReviewDialog.vue'
 import { api, toastError } from './api/client'
 import { openUrl } from './api/native'
+import { SCROLL_EL_KEY, clearPageScrollPositions, recordScrollPosition } from './composables/usePageScroll'
 
 const message = useMessage()
 const session = useSessionStore()
@@ -25,6 +26,40 @@ const jobsStore = useJobsStore()
 const uploadsStore = useUploadsStore()
 const route = useRoute()
 const router = useRouter()
+
+// ---- 页面状态保留（keep-alive 全页面） ----
+// key = path + 项目 + 项目epoch：/strings 与 /dialogue 各自缓存实例；
+// 切项目重挂载且 epoch 递增（A→B→A 不取回 A 的旧缓存）
+const projectEpoch = ref(0)
+watch(() => session.currentProject, () => {
+  projectEpoch.value++
+  clearPageScrollPositions()
+})
+const pageInstanceKey = computed(
+  () => `${route.path}|${session.currentProject}|${projectEpoch.value}`)
+
+// 滚动容器（共享 n-layout-content）：provide 给各页 usePageScroll 按路由存取
+const contentRef = ref()
+function getScrollEl(): HTMLElement | null {
+  const root = contentRef.value?.$el as HTMLElement | undefined
+  if (!root) return null
+  // 实际滚动元素是 .n-layout-scroll-container（overflow:auto）；
+  // 必须先于 .n-scrollbar-container——后者会命中表格等组件内部的
+  // 非滚动容器（scrollTop 恒 0，存了也白存）
+  return (root.querySelector(':scope > .n-layout-scroll-container') as HTMLElement)
+    || (root.querySelector('.n-layout-scroll-container') as HTMLElement)
+    || (root.querySelector('.n-scrollbar-container') as HTMLElement)
+    || root
+}
+provide(SCROLL_EL_KEY, getScrollEl)
+
+// 路由离开前（DOM 未变）保存滚动位置——onDeactivated 时新页面已挂载，
+// 共享容器 scrollTop 可能已被钳 0
+router.beforeEach((to, from) => {
+  const el = getScrollEl()
+  if (el && from.path !== to.path) recordScrollPosition(from.path, el.scrollTop)
+  return true
+})
 
 /** 侧栏三段式分组：流程 / 分析 / 设置；无项目时流程组退化为单个「项目库」入口 */
 const menuOptions = computed<MenuOption[]>(() => {
@@ -395,11 +430,15 @@ onUnmounted(() => {
           @update:value="onMenu"
         />
       </n-layout-sider>
-      <n-layout-content content-style="padding: 16px; padding-bottom: 40px">
-        <!-- key=path+项目：/strings 与 /dialogue 共用 TextsPage 组件，
-             不加 key 切换路由时组件实例被复用，表格不会重新加载；
-             同理，切换当前项目后页面也必须重挂载以加载新项目数据 -->
-        <router-view :key="$route.path + '|' + session.currentProject" />
+      <n-layout-content ref="contentRef" content-style="padding: 16px; padding-bottom: 40px">
+        <!-- keep-alive 全页面：切走保留页码/筛选/滚动位置，返回时按当前查询
+             后台刷新（usePageScroll）；key=path+项目+epoch 保证 /strings 与
+             /dialogue 各自实例、切项目重挂载；max 限制缓存内存增长 -->
+        <router-view v-slot="{ Component }">
+          <keep-alive :max="12">
+            <component :is="Component" :key="pageInstanceKey" />
+          </keep-alive>
+        </router-view>
       </n-layout-content>
     </n-layout>
 

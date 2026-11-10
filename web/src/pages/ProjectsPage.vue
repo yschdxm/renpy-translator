@@ -19,6 +19,7 @@ import ProgressLine from '../components/ProgressLine.vue'
 import PageHelp from '../components/PageHelp.vue'
 import SetupChecklist from '../components/SetupChecklist.vue'
 import UpdateReportDialog from '../components/UpdateReportDialog.vue'
+import { usePageScroll } from '../composables/usePageScroll'
 
 
 const message = useMessage()
@@ -309,6 +310,7 @@ onMounted(async () => {
   await store.refresh()
   for (const p of store.list) await loadPackages(p.name)
 })
+usePageScroll(() => store.refresh())
 
 // 顶栏项目菜单的「新建/导入…」经 ?dialog=create|import 触发本页弹窗
 watch(() => route.query.dialog, (v) => {

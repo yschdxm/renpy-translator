@@ -126,6 +126,22 @@ class EmbeddedRepo:
         return dict(row) if row else None
 
     @_auto_reconnect
+    def update_embedded_apply_paths(self, paths: dict):
+        """批量补写应用路径 {row_id: apply_path}（人工勾选未决行时）
+
+        只更新 apply_path，不动 AI 判定/理由/审计日志——人工选择不是
+        AI 判定。调用方保证只传原本 apply_path 为空的行。
+        """
+        if not paths:
+            return
+        now = datetime.now().isoformat()
+        with self._transaction():
+            self._conn.executemany(
+                "UPDATE embedded_candidates SET apply_path=?, updated_at=? "
+                "WHERE id=?",
+                [(p, now, rid) for rid, p in paths.items()])
+
+    @_auto_reconnect
     def set_embedded_status(self, row_ids: list, status: str):
         """批量设置候选状态（pending/skipped/marked）"""
         if not row_ids:

@@ -11,6 +11,7 @@ import PageHeader from '../components/PageHeader.vue'
 import ContextHint from '../components/ContextHint.vue'
 import { useJobsStore } from '../stores/jobs'
 import { useSessionStore } from '../stores/session'
+import { usePageScroll } from '../composables/usePageScroll'
 
 const message = useMessage()
 const jobsStore = useJobsStore()
@@ -72,6 +73,7 @@ async function revealExports() {
 }
 
 onMounted(load)
+usePageScroll(load)
 </script>
 
 <template>

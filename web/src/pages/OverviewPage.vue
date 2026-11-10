@@ -17,6 +17,7 @@ import {
 } from '../composables/onboarding'
 import { useJobsStore } from '../stores/jobs'
 import { useSessionStore } from '../stores/session'
+import { usePageScroll } from '../composables/usePageScroll'
 
 const session = useSessionStore()
 const jobsStore = useJobsStore()
@@ -60,6 +61,7 @@ async function loadSideData() {
 }
 
 onMounted(loadSideData)
+usePageScroll(loadSideData)
 // 切换项目后重载侧数据
 watch(() => session.currentProject, loadSideData)
 

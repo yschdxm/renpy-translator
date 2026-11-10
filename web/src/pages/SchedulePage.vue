@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 定时任务：倒计时 / 时间点 / 时间段（循环独立设置），指定项目独立执行 */
-import { computed, h, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
   NButton, NCheckbox, NDataTable, NDatePicker, NDivider, NEmpty, NInput,
   NInputNumber, NModal, NPopconfirm, NRadioButton, NRadioGroup, NSelect,
@@ -17,6 +17,7 @@ import {
   KIND_META, REPEAT_OPTIONS, defaultParams, kindLabel, type ParamKind,
   type ScheduleType,
 } from '../lib/scheduledKinds'
+import { usePageScroll } from '../composables/usePageScroll'
 
 interface SchedTask {
   id: string
@@ -66,14 +67,22 @@ async function load(silent = false) {
 
 onMounted(() => {
   void load()
+})
+// keep-alive：定时器随激活启停（隐藏页不后台轮询）
+onActivated(() => {
   ticker = window.setInterval(() => { nowMs.value = Date.now() }, 15000)
   // 与后端30s调度周期同步：任务触发/停用后列表状态自动可见
   autoTimer = window.setInterval(() => { void load(true) }, 30000)
+})
+onDeactivated(() => {
+  window.clearInterval(ticker)
+  window.clearInterval(autoTimer)
 })
 onUnmounted(() => {
   window.clearInterval(ticker)
   window.clearInterval(autoTimer)
 })
+usePageScroll(() => load(true))
 
 function scheduleSummary(t: SchedTask): string {
   if (t.schedule_type === 'delay') {

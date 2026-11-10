@@ -8,6 +8,7 @@ import { CopyOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
 import PageHeader from '../components/PageHeader.vue'
+import { usePageScroll } from '../composables/usePageScroll'
 
 const message = useMessage()
 
@@ -81,6 +82,7 @@ async function copyText(text: string) {
 }
 
 onMounted(refresh)
+usePageScroll(refresh)
 </script>
 
 <template>

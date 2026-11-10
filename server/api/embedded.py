@@ -1,5 +1,6 @@
 """内嵌文本提取 API：扫描任务（含复核 ask/重判循环）、单句精判、源码查看"""
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 
 from ..deps import require_project
 from ..errors import ApiError
@@ -7,6 +8,12 @@ from ..jobs import JobCancelled
 from ..state import AppState
 
 router = APIRouter(prefix='/current/embedded', tags=['embedded'])
+
+
+class EmbeddedScanRequest(BaseModel):
+    # 跳过 AI 预筛：只做零 token 规则分流，未决项交人工复核
+    # （无模型也可用；复核界面可再按需精判）
+    skip_ai_prescreen: bool = False
 
 
 def _pipeline(state: AppState):
@@ -34,17 +41,20 @@ def _row_payload(r: dict) -> dict:
         'ai_keep': r['ai_keep'], 'ai_reason': reason, 'ai_danger': danger,
         'ai_evidence': r.get('ai_evidence', ''),
         'apply_path': r.get('apply_path', ''),
-        # 判定来源：rule=静态规则确定，ai=模型判定（前端显示不同标识）
-        'source': 'rule' if reason.startswith(RULE_REASON_PREFIX) else 'ai',
+        # 判定来源：rule=静态规则确定，ai=模型判定，pending=未判定
+        # （跳过预筛/未决行不算 AI 判定，前端筛选不混入）
+        'source': ('rule' if reason.startswith(RULE_REASON_PREFIX)
+                   else 'pending' if r['ai_keep'] == -1 else 'ai'),
         'status': r.get('status', 'pending'),
     }
 
 
-async def start_embedded_scan(state):
+async def start_embedded_scan(state, skip_ai_prescreen: bool = False):
     """内嵌文本提取全管线任务（state 可为 AppState 或项目运行时）：
-    扫描→AI预筛→ask 复核(重判循环)→标记→SDK→入库"""
-    if not state.translator:
-        raise ApiError(409, 'NO_TRANSLATOR', 'AI 预筛需要翻译器，请先配置模型')
+    扫描→AI预筛(可跳过)→ask 复核(重判循环)→标记→SDK→入库"""
+    if not skip_ai_prescreen and not state.translator:
+        raise ApiError(409, 'NO_TRANSLATOR', 'AI 预筛需要翻译器，请先配置模型'
+                       '（或勾选「跳过 AI 预筛」零 token 纯扫描）')
     pipe = _pipeline(state)
 
     async def body(job):
@@ -58,16 +68,21 @@ async def start_embedded_scan(state):
         # 由 registry 统一归一化为 cancelled
         while True:
             job.check_cancelled()
-            # AI 预筛（只判未决；失败即任务失败，不降级）
+            # AI 预筛（只判未决；失败即任务失败，不降级）；
+            # skip 模式只做零 token 规则分流，unknown 保持未决交人工
+            prescreen_label = ('正在规则分流（零 token）' if skip_ai_prescreen
+                               else '正在 AI 预筛')
             await pipe.screen_undecided(
                 rows,
                 on_progress=lambda phase, done, total: job.emit_progress(
                     done / max(total, 1) * 0.9,
-                    f'正在 AI 预筛（{phase}）... ({done}/{total})'),
-                cancel_event=job.cancel_event)
+                    f'{prescreen_label}（{phase}）... ({done}/{total})'),
+                cancel_event=job.cancel_event,
+                skip_ai_prescreen=skip_ai_prescreen)
 
             answer = await job.ask('embedded_review', {
                 'rows': [_row_payload(r) for r in rows],
+                'ai_prescreen_run': not skip_ai_prescreen,
             })
             action = answer.get('action')
 
@@ -76,6 +91,9 @@ async def start_embedded_scan(state):
                 ids = set(answer.get('row_ids') or [])
                 return [r for r in rows if r['id'] in ids] if ids else rows
 
+            if action in ('recheck', 'refine_all') and not state.translator:
+                raise ApiError(409, 'NO_TRANSLATOR',
+                               'AI 复核/精判需要翻译器，请先配置模型')
             if action == 'recheck':
                 target = _target_rows()
                 job.emit_log(f'灰区复核 {len(target)} 条（锚定上轮判定，'
@@ -115,8 +133,10 @@ async def start_embedded_scan(state):
 
 
 @router.post('/scan')
-async def scan(state: AppState = Depends(require_project)):
-    return await start_embedded_scan(state)
+async def scan(req: EmbeddedScanRequest | None = None,
+               state: AppState = Depends(require_project)):
+    return await start_embedded_scan(
+        state, skip_ai_prescreen=bool(req and req.skip_ai_prescreen))
 
 
 @router.post('/refine/{row_id}')

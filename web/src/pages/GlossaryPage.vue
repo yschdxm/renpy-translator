@@ -13,6 +13,8 @@ import ExportTextsDialog from '../components/ExportTextsDialog.vue'
 import ImportTextsDialog from '../components/ImportTextsDialog.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { useInlineEdit } from '../composables/useInlineEdit'
+import { usePageScroll } from '../composables/usePageScroll'
+import { hasActiveTextSelection } from '../lib/textSelection'
 
 const message = useMessage()
 
@@ -167,7 +169,7 @@ const columns = computed<DataTableColumns<Row>>(() => [
       return h('span', {
         class: r.cn_term ? undefined : 'rt-t3',
         style: 'cursor: text; display: block; min-height: 20px',
-        onClick: () => startEdit(r),
+        onClick: () => { if (!hasActiveTextSelection()) startEdit(r) },
       }, r.cn_term || '（点击输入译文）')
     },
   },
@@ -203,13 +205,14 @@ const columns = computed<DataTableColumns<Row>>(() => [
 ])
 
 onMounted(load)
+usePageScroll(load)  // keep-alive：返回保留页码/筛选并后台刷新
 
 watch(() => query.source, () => { query.page = 0; load() })
 </script>
 
 <template>
   <div>
-    <n-space align="center" style="width: 100%; margin-bottom: 12px" wrap>
+    <n-space align="center" class="rt-page-toolbar" style="width: 100%; margin-bottom: 12px" wrap>
       <page-header title="术语表" help-section="7,8" />
       <n-button size="small" type="primary" :render-icon="renderIcon(AddOutline)" @click="openCreate">新增术语</n-button>
       <n-button size="small" :render-icon="renderIcon(ShareOutline)" @click="exportVisible = true">导出</n-button>
@@ -244,7 +247,7 @@ watch(() => query.source, () => { query.page = 0; load() })
       @update:sorter="onSorterChange"
     />
 
-    <n-space justify="end" style="margin-top: 10px">
+    <n-space justify="end" class="rt-page-pager" style="margin-top: 10px">
       <n-pagination
         :page="query.page + 1"
         :item-count="total"

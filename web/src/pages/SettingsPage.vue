@@ -10,6 +10,7 @@ import { AddOutline, RefreshOutline } from '@vicons/ionicons5'
 import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
 import PageHeader from '../components/PageHeader.vue'
+import { usePageScroll } from '../composables/usePageScroll'
 
 const message = useMessage()
 const route = useRoute()
@@ -123,6 +124,7 @@ async function testConnection() {
 }
 
 onMounted(refresh)
+usePageScroll(refresh)
 </script>
 
 <template>

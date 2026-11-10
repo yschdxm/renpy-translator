@@ -56,10 +56,10 @@ def _grayzone_rows(rows: list, flip_ids: set) -> list:
 class EmbeddedPipeline:
     def __init__(self, db: ProjectDatabase, translator,
                  project_dir: str, sdk_path: str, logger: TranslationLogger):
-        if not translator:
-            raise RuntimeError('AI 预筛需要翻译器，请先配置模型')
         from embedded_strings import resolve_source_root
         self.db = db
+        # translator 可为 None：纯扫描/规则分流/人工标记零 token 可用；
+        # AI 动作（预筛/灰区复核/精判）各自经 _require_translator 门禁
         self.translator = translator
         self.project_dir = Path(project_dir)
         self.game_root = self.project_dir / 'game'
@@ -68,6 +68,11 @@ class EmbeddedPipeline:
         self.base_dir = resolve_source_root(self.game_root)
         self.sdk_path = sdk_path
         self.logger = logger
+
+    def _require_translator(self):
+        if not self.translator:
+            raise RuntimeError('AI 判定需要翻译器，请先配置模型'
+                               '（纯扫描与人工标记不需要模型）')
 
     # ---- 步骤 1: 扫描 + 合并持久化 ----
 
@@ -105,14 +110,19 @@ class EmbeddedPipeline:
 
     # ---- 步骤 2: AI 预筛（只判未决，失败上抛） ----
 
-    async def screen_undecided(self, rows, on_progress=None, cancel_event=None):
-        """对 ai_keep==-1 的候选跑 AI 预筛并保存判定到 db。
+    async def screen_undecided(self, rows, on_progress=None, cancel_event=None,
+                               skip_ai_prescreen: bool = False):
+        """对 ai_keep==-1 的候选跑预筛并保存判定到 db。
 
+        skip_ai_prescreen=True：只做零 token 规则分流（静态 keep/drop
+        照常入库，unknown 保持未决交人工），不调用任何模型。
         on_progress(phase, done, total)：异步轮询友好（从事件循环线程调用）。
         cancel_event: 可选 threading.Event（任务取消信号），置位时中止
             预筛并抛 ScreeningCancelled（不写库，未决行保持未决）。
         """
         from ai_screener import AIScreener, ScreeningCancelled
+        if not skip_ai_prescreen:
+            self._require_translator()
         loop = asyncio.get_event_loop()
 
         undecided = [r for r in rows if r['ai_keep'] == -1]
@@ -124,7 +134,8 @@ class EmbeddedPipeline:
                     'finished': False}
         targets = [r['candidate'] for r in undecided]
         screen_task = loop.run_in_executor(
-            None, screener.screen_all, targets, progress, cancel_event)
+            None, screener.screen_all, targets, progress, cancel_event,
+            skip_ai_prescreen)
         try:
             while not progress.get('finished'):
                 if cancel_event is not None and cancel_event.is_set():
@@ -172,6 +183,7 @@ class EmbeddedPipeline:
         from ai_screener import AIScreener, ScreeningCancelled
         from source_tree import SourceTree
         from usage_rules import UsageAnalyzer, decide_apply_path
+        self._require_translator()
         loop = asyncio.get_event_loop()
 
         flip_ids = set(await loop.run_in_executor(
@@ -250,6 +262,7 @@ class EmbeddedPipeline:
         from ai_screener import AIScreener, ScreeningCancelled
         from source_tree import SourceTree
         from usage_rules import UsageAnalyzer
+        self._require_translator()
         loop = asyncio.get_event_loop()
         if not rows:
             return
@@ -318,6 +331,7 @@ class EmbeddedPipeline:
         from ai_screener import AIScreener
         from source_tree import SourceTree
         from usage_rules import UsageAnalyzer, decide_apply_path
+        self._require_translator()
         loop = asyncio.get_event_loop()
         c = row['candidate']
         # 静态分析与精审工具共用同一源码缓存（单句也免两次全树扫描）
@@ -393,6 +407,21 @@ class EmbeddedPipeline:
             return {'tabled': 0, 'wrapped': 0, 'skipped': 0, 'inserted': 0}
 
         chosen_ids = {r['id'] for r in chosen_rows}
+
+        # 人工勾选的未决行可能没有 apply_path（跳过 AI 预筛/历史人工行）：
+        # 导出按 apply_path 查询 wrap/fstring 源码变换，缺失会漏变换。
+        # 只补路径——不伪造 AI 判定（ai_keep/reason/verdict_log 不动），
+        # 已有非空路径（AI/精审判定给出的）不覆盖。
+        from usage_rules import decide_apply_path
+        paths_to_save = {}
+        for r in chosen_rows:
+            if not r.get('apply_path'):
+                path = decide_apply_path(r['candidate'])
+                r['apply_path'] = path
+                paths_to_save[r['id']] = path
+        if paths_to_save:
+            await loop.run_in_executor(
+                None, self.db.update_embedded_apply_paths, paths_to_save)
 
         # ---- 统一标记 + strings 表重生成（table/wrap 同路） ----
         _stage('正在写入内嵌翻译表...')

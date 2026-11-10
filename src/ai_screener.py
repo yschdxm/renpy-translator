@@ -59,6 +59,29 @@ _TOOLS = [
 # 模板正文在 prompt_store（可自定义），三变体须保持互异
 _COARSE_IDS = ('screener.coarse_a', 'screener.coarse_b', 'screener.coarse_c')
 
+# 粗筛 reason 枚举码 → 中文文案（码表经 12,649 条真实判定实证校验）。
+# 模型只输出单字母码（自由文本理由平均 28.8 字，是粗筛输出 token 大头），
+# 中文在 _coarse_vote 解析处映射回，入库/展示/复核链路不变。
+# 未知码、旧版自由文本、自定义提示词输出原样保留（不丢信息）。
+_COARSE_REASON_CN = {
+    'V': '界面文本',            # 界面/按钮/菜单选项/列表项
+    'M': '消息/叙事文本',        # 对话/旁白/通知/帖子
+    'H': '提示/帮助文本',        # tooltip/条件不足/不可用原因/输入提示
+    'T': '标题/显示名称',        # 角色名/称号/物品/房间/职位/章节标题
+    'D': '描述文本',            # 物品/技能/属性说明 description
+    'K': '键名/内部标识',        # 字典/映射键、参数值标识（姿势/话题键）
+    'P': '路径/资源名称',        # 文件路径/图像标签/图标/音频资源名
+    'F': '格式模板/代码标记',    # 非显示格式串/变量占位
+    'N': '纯数字/时间/符号',     # 纯数字/时间标记/纯符号
+    'C': '代码/技术字符串',      # 代码表达式/逻辑条件串/配置/日志
+}
+
+
+def _coarse_reason_cn(value: str) -> str:
+    """粗筛 reason 码 → 中文；未知值（旧中文/自由文本/空串）原样保留"""
+    raw = str(value)
+    return _COARSE_REASON_CN.get(raw.strip().upper(), raw)
+
 
 class ScreeningCancelled(Exception):
     """AI 预筛/精审被取消（cancel_event 置位）"""
@@ -108,19 +131,23 @@ class AIScreener:
 
     # ========== 总入口 ==========
 
-    def screen_all(self, candidates: list, progress: dict, cancel_event=None):
+    def screen_all(self, candidates: list, progress: dict, cancel_event=None,
+                   static_only: bool = False):
         """规则分流 → 粗筛 → 精审全流程（同步，在线程池中调用）
 
         progress: 共享进度字典 {phase, done, total, finished}
         cancel_event: 可选 threading.Event，批次间检查，置位则抛
             ScreeningCancelled（已写入的判定保留在候选对象上，由调用方
             决定是否入库）
+        static_only=True：只做零 token 规则分流（「跳过 AI 预筛」选项）——
+            静态 unknown 候选保持未决，交人工复核或按需精判；
+            translator 可为 None。
         结果写回候选的 ai_keep / ai_confident / ai_reason。
         """
         self._cancel_event = cancel_event
         try:
             targets = self._static_screen(candidates, progress)
-            if targets:
+            if targets and not static_only:
                 self._check_cancel()
                 self._coarse_screen(targets, progress)
                 self._check_cancel()
@@ -330,8 +357,9 @@ class AIScreener:
         verdicts = {}
         for entry in parsed:
             if isinstance(entry, dict) and 'id' in entry:
-                verdicts[entry['id']] = (bool(entry.get('keep', True)),
-                                         str(entry.get('reason', '')))
+                verdicts[entry['id']] = (
+                    bool(entry.get('keep', True)),
+                    _coarse_reason_cn(str(entry.get('reason', ''))))
         if not verdicts:
             raise ValueError('粗筛返回为空')
         return verdicts

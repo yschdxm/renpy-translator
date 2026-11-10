@@ -21,6 +21,7 @@ import { MiniMap, makeChart } from '../components/echarts-utils'
 import PageHelp from '../components/PageHelp.vue'
 import ProgressLine from '../components/ProgressLine.vue'
 import { useJobsStore } from '../stores/jobs'
+import { usePageScroll } from '../composables/usePageScroll'
 
 interface ApiScene {
   scene_id: string
@@ -996,6 +997,8 @@ watch(search, () => {
 watch([search, fileFilter, showUnresolved, expanded, hasGraph], renderGraph,
   { flush: 'post' })
 onMounted(load)
+// keep-alive：图数据/缩放视口保留（不刷新重建），仅恢复页面滚动
+usePageScroll()
 onBeforeUnmount(() => {
   cancelAnimationFrame(labelRaf)
   minimap?.dispose()

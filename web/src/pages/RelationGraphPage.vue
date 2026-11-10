@@ -22,6 +22,7 @@ import {
 import { MiniMap, makeChart } from '../components/echarts-utils'
 import PageHelp from '../components/PageHelp.vue'
 import { useJobsStore } from '../stores/jobs'
+import { usePageScroll } from '../composables/usePageScroll'
 
 interface Character {
   key: string
@@ -730,6 +731,8 @@ function onChartClick(params: any) {
 
 watch([data, showCooccur, hasGraph], renderGraph, { flush: 'post' })
 onMounted(load)
+// keep-alive：图数据/缩放视口保留（不刷新重建），仅恢复页面滚动
+usePageScroll()
 onBeforeUnmount(() => {
   minimap?.dispose()
   chart?.dispose()

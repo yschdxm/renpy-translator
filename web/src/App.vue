@@ -78,4 +78,30 @@ document.head.appendChild(styleEl)
   max-height: 60vh;
   overflow-y: auto;
 }
+
+/* 页面工具栏吸顶 / 分页吸底：长列表滚动时功能菜单与翻页始终可见。
+   不透明背景防表格内容透出；祖先不得新增 overflow（sticky 会失效）；
+   z-index 远低于 Naive 弹出层与全局状态栏(200)。
+   分页 bottom:26px = 状态栏高度，吸附时停在状态栏上方。 */
+.rt-page-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background: var(--rt-surface0);
+  border-bottom: 1px solid var(--rt-border);
+  padding: 8px 0;
+  /* 实体阴影延伸背景：上盖滚动容器 16px padding 区、下盖 margin 间隙，
+     否则滚动内容会从这些缝隙透出 */
+  box-shadow: 0 -16px 0 var(--rt-surface0), 0 12px 0 var(--rt-surface0);
+}
+.rt-page-pager {
+  position: sticky;
+  bottom: 26px;
+  z-index: 25;
+  background: var(--rt-surface0);
+  border-top: 1px solid var(--rt-border);
+  padding: 8px 0;
+  /* 上盖 margin 间隙、下盖容器底部 padding 区（状态栏 z-index 更高不受影响） */
+  box-shadow: 0 -10px 0 var(--rt-surface0), 0 40px 0 var(--rt-surface0);
+}
 </style>

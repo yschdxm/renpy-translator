@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 文本翻译页（UI 字符串 / 对话共用，contentType 区分） */
-import { computed, h, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton, NCard, NCheckbox, NDataTable, NDropdown, NEmpty, NInput, NModal,
@@ -19,7 +19,9 @@ import ImportTextsDialog from '../components/ImportTextsDialog.vue'
 import PageHeader from '../components/PageHeader.vue'
 import ContextHint from '../components/ContextHint.vue'
 import { useJobTask } from '../composables/useJobTask'
+import { usePageScroll } from '../composables/usePageScroll'
 import { useSessionStore } from '../stores/session'
+import { hasActiveTextSelection } from '../lib/textSelection'
 
 const props = defineProps<{ contentType: 'ui' | 'dialogue' }>()
 const message = useMessage()
@@ -482,7 +484,7 @@ function onMoreMenu(key: string) {
   if (key === 'style') openStyleGuide()
   else if (key === 'replace') { replacePreview.value = null; replaceVisible.value = true }
   else if (key === 'hints') void rebuildHints()
-  else if (key === 'embedded') void extractEmbedded()
+  else if (key === 'embedded') openEmbeddedDialog()
 }
 
 // ---- 行内「更多」（上下文/清空；选区态下行内动作整体隐藏） ----
@@ -614,9 +616,20 @@ async function rebuildHints() {
 }
 
 // ---- 提取内嵌文本（UI 字符串） ----
+const embeddedDialogVisible = ref(false)
+const skipAiPrescreen = ref(false)
+
+function openEmbeddedDialog() {
+  // 无模型时只能纯扫描：默认勾选跳过预筛且禁取消
+  skipAiPrescreen.value = !session.hasTranslator
+  embeddedDialogVisible.value = true
+}
+
 async function extractEmbedded() {
+  embeddedDialogVisible.value = false
   await runJob(
-    () => api.post('/api/current/embedded/scan'),
+    () => api.post('/api/current/embedded/scan',
+                   { skip_ai_prescreen: skipAiPrescreen.value }),
     () => load())
 }
 
@@ -689,7 +702,7 @@ const columns = computed<DataTableColumns<Row>>(() => {
       return h('span', {
         class: r.translated_text ? undefined : 'rt-t3',
         style: 'cursor: text; display: block; min-height: 20px; white-space: pre-wrap',
-        onClick: () => startEdit(r),
+        onClick: () => { if (!hasActiveTextSelection()) startEdit(r) },
       }, r.translated_text || '（点击输入译文）')
     },
   })
@@ -717,8 +730,18 @@ onMounted(() => {
   load()
   loadCharacters()
   void loadTranslateOptions()
+})
+
+// keep-alive 生命周期：隐藏页不得响应 Esc（会清掉不可见的跨页选择）；
+// 失活解绑监听/清防抖，激活重新注册并后台刷新当前页（查询状态不动）
+onActivated(() => {
   window.addEventListener('keydown', onGlobalKeydown)
 })
+onDeactivated(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
+  window.clearTimeout(searchTimer)
+})
+usePageScroll(load)
 
 watch(() => [query.filter_mode, query.character], () => {
   query.page = 0
@@ -729,7 +752,7 @@ watch(() => [query.filter_mode, query.character], () => {
 
 <template>
   <div>
-    <n-space align="center" style="width: 100%; margin-bottom: 12px" wrap>
+    <n-space align="center" class="rt-page-toolbar" style="width: 100%; margin-bottom: 12px" wrap>
       <page-header :title="title" :help-section="isDialogue ? '6,8' : '5,8'" />
 
       <!-- L4 选区态：整组动作替换为上下文条（Esc 可清除） -->
@@ -885,7 +908,7 @@ watch(() => [query.filter_mode, query.character], () => {
       @update:sorter="onSorterChange"
     />
 
-    <n-space justify="end" style="margin-top: 10px">
+    <n-space justify="end" class="rt-page-pager" style="margin-top: 10px">
       <n-pagination
         :page="query.page + 1"
         :item-count="total"
@@ -893,6 +916,28 @@ watch(() => [query.filter_mode, query.character], () => {
         @update:page="(p: number) => { query.page = p - 1; load() }"
       />
     </n-space>
+
+    <n-modal v-model:show="embeddedDialogVisible" preset="card" title="提取内嵌文本"
+             style="width: min(480px, 96vw)">
+      <n-space vertical>
+        <n-text depth="3" style="font-size: 12px">
+          扫描源码中未包翻译标记的字符串（界面文字、脚本文本、f-string 等）。
+          扫描本身零 token；AI 预筛自动判定哪些该翻译，判定结果可人工复核。
+        </n-text>
+        <n-checkbox v-model:checked="skipAiPrescreen" :disabled="!session.hasTranslator">
+          跳过 AI 预筛（零 token，仅规则分流，未判定项交人工复核）
+        </n-checkbox>
+        <n-text v-if="!session.hasTranslator" depth="3" style="font-size: 12px">
+          未配置模型，仅可纯扫描；复核后如需 AI 精判请先配置模型。
+        </n-text>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="embeddedDialogVisible = false">取消</n-button>
+          <n-button type="primary" @click="extractEmbedded">开始扫描</n-button>
+        </n-space>
+      </template>
+    </n-modal>
 
     <n-modal v-model:show="roleModalVisible" preset="card" title="翻译指定角色"
              style="width: min(420px, 96vw)">

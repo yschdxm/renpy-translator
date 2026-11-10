@@ -9,6 +9,7 @@ import { NButton, NCheckbox, NInput, NPagination, NSelect, NSpace, NTag, useMess
 import { CodeOutline, SparklesOutline } from '@vicons/ionicons5'
 import { api, toastError } from '../api/client'
 import { useJobsStore, type JobView } from '../stores/jobs'
+import { useSessionStore } from '../stores/session'
 import { renderIcon } from './icons'
 import CodeSnippet from './CodeSnippet.vue'
 
@@ -26,7 +27,7 @@ export interface EmbeddedRow {
   ai_danger: number // 1 = 静态分析发现比较/键名/资源等非显示用途
   ai_evidence: string // AI 判决引用的代码位置（file:line）
   apply_path: string  // 'table' = 写入翻译表（不改源码）, 'wrap' = 源码包 _()
-  source: string    // 'rule' = 静态规则判定, 'ai' = 模型判定
+  source: string    // 'rule' = 静态规则判定, 'ai' = 模型判定, 'pending' = 未判定
   status: string
 }
 
@@ -34,6 +35,7 @@ const props = defineProps<{ job: JobView; question: { question_id: string; paylo
 
 const message = useMessage()
 const jobsStore = useJobsStore()
+const session = useSessionStore()
 
 const rows = ref<EmbeddedRow[]>([])
 const chosen = ref<Set<number>>(new Set())
@@ -42,16 +44,21 @@ const snippetFor = ref<number | null>(null)
 const reasonFor = ref<number | null>(null)
 const answering = ref(false)
 const page = ref(1)
+// 本次扫描是否运行了 AI 预筛（跳过预筛时未决项交人工，不冒充 AI 建议）
+const aiPrescreenRun = ref(true)
 
 function defaultChecked(r: EmbeddedRow): boolean {
   if (r.ai_keep !== -1) return !!r.ai_keep
+  // 跳过 AI 预筛：未决行不默认勾选——高置信启发式不是 AI 建议
+  if (!aiPrescreenRun.value) return false
   return r.confidence === 'high'
 }
 
 // 新问题（重判后再问）→ 重置本地状态
 watch(() => props.question.question_id, () => {
-  rows.value = (props.question.payload as { rows: EmbeddedRow[] }).rows
-    .map((r) => ({ ...r }))
+  const payload = props.question.payload as { rows: EmbeddedRow[]; ai_prescreen_run?: boolean }
+  aiPrescreenRun.value = payload.ai_prescreen_run !== false
+  rows.value = payload.rows.map((r) => ({ ...r }))
   chosen.value = new Set(rows.value.filter(defaultChecked).map((r) => r.id))
   snippetFor.value = null
   reasonFor.value = null
@@ -96,6 +103,7 @@ const sourceOptions = [
   { label: '全部来源', value: 'all' },
   { label: '规则判定', value: 'rule' },
   { label: 'AI 判定', value: 'ai' },
+  { label: '未判定', value: 'pending' },
 ]
 const kindOptions = [
   { label: '全部类型', value: 'all' },
@@ -209,7 +217,7 @@ function truncate(s: string, n: number): string {
       <n-tag size="small">已选 {{ chosenCount }}/{{ rows.length }}</n-tag>
       <n-button size="tiny" quaternary @click="setAll(true)">全选</n-button>
       <n-button size="tiny" quaternary @click="setAll(false)">全不选</n-button>
-      <n-button size="tiny" quaternary @click="setAi">仅选 AI 建议</n-button>
+      <n-button size="tiny" quaternary @click="setAi">{{ aiPrescreenRun ? '仅选 AI 建议' : '仅选保留建议' }}</n-button>
     </n-space>
     <n-space align="center" style="margin-bottom: 8px" wrap size="small">
       <n-input
@@ -224,6 +232,9 @@ function truncate(s: string, n: number): string {
         筛出 {{ filteredRows.length }} 条
       </span>
     </n-space>
+    <div v-if="!aiPrescreenRun" class="rt-fs12 rt-info" style="margin-bottom: 8px">
+      本次未运行 AI 预筛，仅完成零 token 规则分流；未判定项需人工确认（默认不勾选），「精判」只作用于你选择的行。
+    </div>
     <div class="rt-fs12 rt-warning" style="margin-bottom: 8px">
       ✓/✗ 为级联判定结论（规则=静态分析确定，AI=模型多票判定），已判定的条目默认冻结不再重筛；
       ⚠ 表示该字符串另有比较/键名/资源用途。「复核灰区」只针对判定与证据冲突的条目做锚定纠错。最终以你的勾选为准。<br>
@@ -262,6 +273,8 @@ function truncate(s: string, n: number): string {
           >理由</n-button>
           <n-button
             size="tiny" quaternary :loading="refining.has(r.id)"
+            :disabled="!session.hasTranslator"
+            :title="session.hasTranslator ? '' : 'AI 精判需要先配置模型'"
             :render-icon="renderIcon(SparklesOutline)" @click="refineOne(r)"
           >精判</n-button>
           <n-button
@@ -295,13 +308,15 @@ function truncate(s: string, n: number): string {
     <n-space justify="end" style="margin-top: 10px">
       <n-button size="small" :disabled="answering" @click="answer({ action: 'cancel' })">取消</n-button>
       <n-button
-        size="small" type="warning" :disabled="answering || !filteredRows.length"
+        size="small" type="warning" :disabled="answering || !filteredRows.length || !session.hasTranslator"
+        :title="session.hasTranslator ? '' : 'AI 复核需要先配置模型'"
         @click="answer({ action: 'recheck', row_ids: filteredRows.map((r) => r.id) })"
       >
         复核灰区 {{ filteredRows.length }} 条
       </n-button>
       <n-button
-        size="small" type="warning" :disabled="answering || !filteredRows.length"
+        size="small" type="warning" :disabled="answering || !filteredRows.length || !session.hasTranslator"
+        :title="session.hasTranslator ? '' : 'AI 精判需要先配置模型'"
         @click="answer({ action: 'refine_all', row_ids: filteredRows.map((r) => r.id) })"
       >
         精判筛出的 {{ filteredRows.length }} 条

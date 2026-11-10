@@ -10,6 +10,7 @@ import { api, toastError, toastOk } from '../api/client'
 import { renderIcon } from '../components/icons'
 import PageHelp from '../components/PageHelp.vue'
 import { useSessionStore } from '../stores/session'
+import { usePageScroll } from '../composables/usePageScroll'
 
 const message = useMessage()
 const session = useSessionStore()
@@ -172,6 +173,7 @@ const sourceTag = (p: PromptItem) => ({
 })[p.source]
 
 onMounted(load)
+usePageScroll(load)
 </script>
 
 <template>

@@ -116,14 +116,46 @@ class TestDeterministicTemperature:
     def test_coarse_uses_zero_temperature(self, tmp_path):
         tr = FakeTranslator([])
         tr.analyze_reply = json.dumps(
-            [{'id': 0, 'keep': True, 'reason': '界面文本'}],
+            [{'id': 0, 'keep': True, 'reason': 'V'}],
             ensure_ascii=False)
         s = _mk_screener(tr, tmp_path)
         verdicts = s._coarse_vote(
             [{'id': 0, 'text': 'Settings', 'hint': '界面',
               'kind': 'screen', 'rel_file': 'a.rpy', 'line': 1}], 0)
-        assert verdicts[0] == (True, '界面文本')
+        assert verdicts[0] == (True, '界面文本')  # 枚举码映射回中文
         assert tr.analyze_temps == [0]
+
+
+class TestCoarseReasonMapping:
+    """粗筛 reason 枚举码 → 中文：省输出 token，入库/展示链路不变。
+    未知码与旧版自由文本原样保留（自定义提示词兼容）。"""
+
+    def _vote(self, tmp_path, reason):
+        tr = FakeTranslator([])
+        tr.analyze_reply = json.dumps(
+            [{'id': 0, 'keep': True, 'reason': reason}], ensure_ascii=False)
+        s = _mk_screener(tr, tmp_path)
+        return s._coarse_vote(
+            [{'id': 0, 'text': 'x', 'hint': 'h', 'kind': 'python',
+              'rel_file': 'a.rpy', 'line': 1}], 0)[0][1]
+
+    def test_code_mapped(self, tmp_path):
+        assert self._vote(tmp_path, 'K') == '键名/内部标识'
+
+    def test_lowercase_code_mapped(self, tmp_path):
+        assert self._vote(tmp_path, 'v') == '界面文本'
+
+    def test_code_with_whitespace(self, tmp_path):
+        assert self._vote(tmp_path, ' M ') == '消息/叙事文本'
+
+    def test_unknown_code_passthrough(self, tmp_path):
+        assert self._vote(tmp_path, 'Z') == 'Z'
+
+    def test_legacy_chinese_passthrough(self, tmp_path):
+        assert self._vote(tmp_path, '界面按钮文字') == '界面按钮文字'
+
+    def test_empty_reason(self, tmp_path):
+        assert self._vote(tmp_path, '') == ''
 
 
 class TestBatchFailureNotFatal:

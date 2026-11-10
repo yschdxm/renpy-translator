@@ -87,7 +87,8 @@ def _progress():
 
 
 def _reply(*id_keep):
-    return json.dumps([{'id': i, 'keep': k, 'reason': f'r{i}'}
+    # 粗筛 reason 为枚举码（keep→V / drop→K），解析时映射回中文
+    return json.dumps([{'id': i, 'keep': k, 'reason': 'V' if k else 'K'}
                        for i, k in id_keep], ensure_ascii=False)
 
 
@@ -103,6 +104,8 @@ class TestCoarseCascade:
         s._coarse_screen(cands, _progress())
         assert len(tr.analyze_prompts) == 2
         assert all(c.ai_keep is True and c.ai_confident for c in cands)
+        # 枚举码在 _coarse_vote 解析处已映射回中文（入库/展示链路不变）
+        assert all(c.ai_reason == '界面文本' for c in cands)
 
     def test_two_votes_split_escalates(self, tmp_path):
         """前两票分裂 → 升级精审（ai_confident=False），不投第三票"""

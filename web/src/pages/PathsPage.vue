@@ -11,6 +11,7 @@ import { renderIcon } from '../components/icons'
 import PageHeader from '../components/PageHeader.vue'
 import { nativeReady, pickDirectory } from '../api/native'
 import { useJobTask } from '../composables/useJobTask'
+import { usePageScroll } from '../composables/usePageScroll'
 import { useSessionStore } from '../stores/session'
 
 const message = useMessage()
@@ -89,6 +90,7 @@ onMounted(async () => {
   guiMode.value = await nativeReady()
   await refresh()
 })
+usePageScroll(refresh)
 </script>
 
 <template>

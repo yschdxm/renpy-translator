@@ -6,13 +6,14 @@
  * token 用量、耗时、请求/响应；消息按 role 展示，JSON 可切原始视图。
  * 跟随尾部：跑批期间自动刷到最新并选中最新一条，手动选中旧记录后暂停跟随。
  */
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from 'vue'
 import {
   NButton, NEmpty, NSelect, NSpace, NSwitch, NTag, NText, NTooltip,
   useMessage,
 } from 'naive-ui'
 import { api, toastError, toastOk } from '../api/client'
 import PageHelp from '../components/PageHelp.vue'
+import { usePageScroll } from '../composables/usePageScroll'
 
 interface ApiLogEntry {
   id: number
@@ -206,12 +207,18 @@ const toolCalls = computed(() => {
 
 onMounted(() => {
   void refresh(true)
+})
+// keep-alive：轮询随激活启停（隐藏页不后台刷新）
+onActivated(() => {
   timer = window.setInterval(() => { void refresh(true) }, 2500)
 })
-
+onDeactivated(() => {
+  if (timer) window.clearInterval(timer)
+})
 onUnmounted(() => {
   if (timer) window.clearInterval(timer)
 })
+usePageScroll()  // 数据由轮询刷新，滚动位置仍按路由保留
 </script>
 
 <template>
